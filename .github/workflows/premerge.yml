@@ -1,7 +1,8 @@
 name: Premerge
 
 on:
-  workflow_call:
+  pull_request:
+    - **/**
 
   jobs:
     build:
