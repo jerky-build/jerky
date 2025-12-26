@@ -2,42 +2,42 @@ name: Premerge
 
 on: pull_request
 
-  jobs:
-    build:
-      runs-on: ubuntu-latest
-      strategy:
-        matrix:
-          triple: [
-            x86_64-unknown-linux-gnu,
-            aarch64-unknown-linux-gnu,
-            x86_64-pc-windows-msvc,
-            x86_64-pc-windows-gnu,
-            aarch64-apple-darwin,
-            x86_64-apple-darwin
-          ]
-      steps:
-        - uses: actions/checkout@5
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        triple: [
+          x86_64-unknown-linux-gnu,
+          aarch64-unknown-linux-gnu,
+          x86_64-pc-windows-msvc,
+          x86_64-pc-windows-gnu,
+          aarch64-apple-darwin,
+          x86_64-apple-darwin
+        ]
+    steps:
+      - uses: actions/checkout@5
 
-        - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
 
-        - run: cargo build --target ${{ matrix.triple }}
+      - run: cargo build --target ${{ matrix.triple }}
 
-    test:
-      runs-on: ubuntu-latest
-      steps:
-        - uses: actions/checkout@5
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@5
 
-        - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
 
-        - run: cargo test
+      - run: cargo test
 
-    formatting:
-      runs-on: ubuntu-latest
-      steps:
-        - uses: actions/checkout@5
+  formatting:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@5
 
-        - uses: actions-rust-lang/setup-rust-toolchain@v1
-          with:
-            components: rustfmt
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: rustfmt
 
-        - uses: actions-rust-lang/rustfmt@v1
+      - uses: actions-rust-lang/rustfmt@v1
