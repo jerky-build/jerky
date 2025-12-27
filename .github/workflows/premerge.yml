@@ -6,64 +6,17 @@ jobs:
   build:
     strategy:
       matrix:
-        runner: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
-        arch: [x86_64, aarch64]
-        vendor: [apple, pc-windows, unknown-linux]
-        toolchain: [gnu, msvc, darwin]
-        exclude:
-          - runner: windows-latest
-            arch: aarch64
-
-          - runner: windows-latest
-            vendor: apple
-
-          - runner: windows-latest
-            vendor: unknown-linux
-
+        include:
           - runner: ubuntu-latest
-            vendor: pc-windows
-
-          - runner: ubuntu-latest
-            vendor: apple
-
+            target: x86_64-unknown-linux-gnu
           - runner: ubuntu-24.04-arm
-            vendor: pc-windows
-
-          - runner: ubuntu-24.04-arm
-            vendor: apple
-
+            target: aarch64-unknown-linux-gnu
           - runner: macos-latest
-            vendor: pc-windows
-
+            target: x86_64-apple-darwin
           - runner: macos-latest
-            vendor: unknown-linux
-
-          - runner: ubuntu-latest
-            arch: aarch64
-
-          - runner: ubuntu-24.04-arm
-            arch: x86_64
-
-          - runner: macos-latest
-            toolchain: gnu
-
-          - runner: macos-latest
-            toolchain: msvc
-
-          - runner: ubuntu-latest
-            toolchain: darwin
-
-          - runner: ubuntu-latest
-            toolchain: msvc
-
-          - runner: ubuntu-24.04-arm
-            toolchain: darwin
-
-          - runner: ubuntu-24.04-arm
-            toolchain: msvc
-
+            target: aarch64-apple-darwin
           - runner: windows-latest
-            toolchain: darwin
+            target: x86_64-pc-windows-msvc
 
     runs-on: ${{ matrix.runner }}
 
@@ -99,5 +52,3 @@ jobs:
           components: rustfmt
 
       - uses: actions-rust-lang/rustfmt@v1
-        env:
-          RUSTFLAGS: '-D warnings'

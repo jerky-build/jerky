@@ -8,7 +8,7 @@ fn it_runs_help() {
 }
 
 #[test]
-fn it_errors_on_non_existant_flag() {
+fn it_errors_on_non_existent_flag() {
     let mut cmd = cargo::cargo_bin_cmd!("jerky");
     cmd.arg("--fake-flag-123")
         .assert()
