@@ -4,25 +4,57 @@ on: pull_request
 
 jobs:
   build:
-    runs-on: ubuntu-latest
     strategy:
       matrix:
-        triple: [
-          x86_64-unknown-linux-gnu,
-          aarch64-unknown-linux-gnu,
-          x86_64-pc-windows-msvc,
-          x86_64-pc-windows-gnu,
-          aarch64-apple-darwin,
-          x86_64-apple-darwin
-        ]
+        runner: [ubuntu-latest, macos-latest, windows-latest]
+        arch: [x86_64, aarch64]
+        vendor: [apple, pc-windows, unknown]
+        toolchain: [gnu, msvc, darwin]
+        exclude:
+          - runner: windows-latest
+            arch: aarch64
+
+          - runner: windows-latest
+            vendor: apple
+
+          - runner: windows-latest
+            vendor: unknown
+
+          - runner: ubuntu-latest
+            vendor: pc-windows
+
+          - runner: ubuntu-latest
+            vendor: apple
+
+          - runner: macos-latest
+            vendor: pc-windows
+
+          - runner: macos-latest
+            vendor: unknown
+
+          - runner: macos-latest
+            toolchain: gnu
+
+          - runner: macos-latest
+            toolchain: msvc
+
+          - runner: ubuntu-latest
+            toolchain: darwin
+
+          - runner: ubuntu-latest
+            toolchain: msvc
+
+          - runner: windows-latest
+            toolchain: darwin
+
+    runs-on: ${{ matrix.runner }}
+
     steps:
       - uses: actions/checkout@v6
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
 
-      - run: rustup target add ${{ matrix.triple }}
-
-      - run: cargo build --target ${{ matrix.triple }}
+      - run: cargo build --target ${{ matrix.arch }}-${{ matrix.vendor }}-${{ matrix.toolchain }}
 
   test:
     runs-on: ubuntu-latest
