@@ -1,4 +1,4 @@
-use assert_cmd::cargo;
+use assert_cmd::{Command, cargo};
 use predicates::prelude::predicate;
 
 #[test]
