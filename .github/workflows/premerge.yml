@@ -25,9 +25,9 @@ jobs:
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
 
-      - run: rustup target add ${{ matrix.arch }}-${{ matrix.vendor }}-${{ matrix.toolchain }}
+      - run: rustup target add ${{ matrix.target }}
 
-      - run: cargo build --target ${{ matrix.arch }}-${{ matrix.vendor }}-${{ matrix.toolchain }}
+      - run: cargo build --target ${{ matrix.target }}
         env:
           RUSTFLAGS: '-D warnings'
 
