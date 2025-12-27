@@ -8,7 +8,7 @@ jobs:
       matrix:
         runner: [ubuntu-latest, macos-latest, windows-latest]
         arch: [x86_64, aarch64]
-        vendor: [apple, pc-windows, unknown]
+        vendor: [apple, pc-windows, unknown-linux]
         toolchain: [gnu, msvc, darwin]
         exclude:
           - runner: windows-latest
@@ -18,7 +18,7 @@ jobs:
             vendor: apple
 
           - runner: windows-latest
-            vendor: unknown
+            vendor: unknown-linux
 
           - runner: ubuntu-latest
             vendor: pc-windows
@@ -30,7 +30,7 @@ jobs:
             vendor: pc-windows
 
           - runner: macos-latest
-            vendor: unknown
+            vendor: unknown-linux
 
           - runner: macos-latest
             toolchain: gnu
