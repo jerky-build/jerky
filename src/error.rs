@@ -2,6 +2,7 @@ use thiserror::Error;
 
 use crate::archive::ArchiveError;
 use crate::cli::CliError;
+use crate::commands::install::InstallError;
 use crate::integrity::IntegrityError;
 use crate::linker::LinkError;
 use crate::manifest::ManifestError;
@@ -24,8 +25,10 @@ pub enum JerkyError {
     Link(#[from] LinkError),
     #[error(transparent)]
     Registry(#[from] RegistryError),
+    #[error(transparent)]
+    Install(#[from] InstallError),
     #[error("could not determine the current directory")]
     Cwd(#[source] std::io::Error),
-    #[error("`jerky {0}` is not implemented yet")]
-    NotImplemented(&'static str),
+    #[error("could not determine the home directory for the package store")]
+    NoHomeDirectory,
 }
