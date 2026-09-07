@@ -1,0 +1,228 @@
+use std::path::{Path, PathBuf};
+
+use serde_json::{Map, Value};
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum ManifestError {
+    #[error("no package.json found in {0}")]
+    NotFound(PathBuf),
+    #[error("package.json already exists at {0}")]
+    AlreadyExists(PathBuf),
+    #[error("package.json at {path} is not valid JSON")]
+    Malformed {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("package.json at {0} must contain a JSON object")]
+    NotAnObject(PathBuf),
+    #[error("could not determine a package name from {0}")]
+    UnnameableDirectory(PathBuf),
+    #[error("failed to access {path}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+/// An order-preserving view of a `package.json`.
+///
+/// Backed by `serde_json::Map`, which is an `IndexMap` because the crate is
+/// built with the `preserve_order` feature. Without that feature this type
+/// would silently reshuffle the user's file on every save.
+#[derive(Debug)]
+pub struct Manifest {
+    path: PathBuf,
+    value: Map<String, Value>,
+}
+
+impl Manifest {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn load(project_dir: &Path) -> Result<Self, ManifestError> {
+        let path = project_dir.join("package.json");
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                return Err(ManifestError::NotFound(project_dir.to_path_buf()));
+            }
+            Err(source) => return Err(ManifestError::Io { path, source }),
+        };
+
+        let value: Value =
+            serde_json::from_str(&raw).map_err(|source| ManifestError::Malformed {
+                path: path.clone(),
+                source,
+            })?;
+
+        match value {
+            Value::Object(value) => Ok(Self { path, value }),
+            _ => Err(ManifestError::NotAnObject(path)),
+        }
+    }
+
+    pub fn create_default(project_dir: &Path) -> Result<Self, ManifestError> {
+        let path = project_dir.join("package.json");
+        if path.exists() {
+            return Err(ManifestError::AlreadyExists(path));
+        }
+
+        let name = project_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| ManifestError::UnnameableDirectory(project_dir.to_path_buf()))?;
+
+        let mut value = Map::new();
+        value.insert("name".into(), Value::String(name.to_string()));
+        value.insert("version".into(), Value::String("1.0.0".into()));
+        value.insert("main".into(), Value::String("index.js".into()));
+        value.insert("scripts".into(), Value::Object(Map::new()));
+        value.insert("license".into(), Value::String("ISC".into()));
+
+        Ok(Self { path, value })
+    }
+
+    pub fn add_dependency(&mut self, name: &str, version: &str) {
+        let deps = self
+            .value
+            .entry("dependencies")
+            .or_insert_with(|| Value::Object(Map::new()));
+
+        if !deps.is_object() {
+            *deps = Value::Object(Map::new());
+        }
+
+        deps.as_object_mut()
+            .expect("dependencies was just forced to an object")
+            .insert(name.to_string(), Value::String(version.to_string()));
+    }
+
+    pub fn save(&self) -> Result<(), ManifestError> {
+        let mut serialized = serde_json::to_string_pretty(&Value::Object(self.value.clone()))
+            .expect("a JSON object is always serializable");
+        serialized.push('\n');
+
+        std::fs::write(&self.path, serialized).map_err(|source| ManifestError::Io {
+            path: self.path.clone(),
+            source,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn write(dir: &Path, contents: &str) {
+        std::fs::write(dir.join("package.json"), contents).unwrap();
+    }
+
+    #[test]
+    fn create_default_uses_the_directory_name() {
+        let dir = TempDir::new().unwrap();
+        let project = dir.path().join("my-app");
+        std::fs::create_dir(&project).unwrap();
+
+        let manifest = Manifest::create_default(&project).unwrap();
+        manifest.save().unwrap();
+
+        let raw = std::fs::read_to_string(project.join("package.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed["name"], "my-app");
+        assert_eq!(parsed["version"], "1.0.0");
+        assert_eq!(parsed["main"], "index.js");
+        assert_eq!(parsed["license"], "ISC");
+        assert!(parsed["scripts"].is_object());
+    }
+
+    #[test]
+    fn create_default_refuses_to_overwrite() {
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), r#"{"name":"existing"}"#);
+
+        assert!(matches!(
+            Manifest::create_default(dir.path()),
+            Err(ManifestError::AlreadyExists(_))
+        ));
+    }
+
+    #[test]
+    fn load_reports_a_missing_manifest() {
+        let dir = TempDir::new().unwrap();
+        assert!(matches!(
+            Manifest::load(dir.path()),
+            Err(ManifestError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn load_reports_malformed_json() {
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "{ not json");
+        assert!(matches!(
+            Manifest::load(dir.path()),
+            Err(ManifestError::Malformed { .. })
+        ));
+    }
+
+    #[test]
+    fn round_trip_preserves_unknown_fields_and_key_order() {
+        let dir = TempDir::new().unwrap();
+        // Byte-identical to what `to_string_pretty` emits, so a byte comparison
+        // isolates ordering and field retention from whitespace. Arrays are
+        // expanded one element per line because that is the only form the
+        // serializer produces; re-indenting to match the input file is #24.
+        let original = concat!(
+            "{\n",
+            "  \"name\": \"demo\",\n",
+            "  \"zzz\": \"last\",\n",
+            "  \"aaa\": [\n",
+            "    1,\n",
+            "    2\n",
+            "  ],\n",
+            "  \"version\": \"1.0.0\"\n",
+            "}\n",
+        );
+        write(dir.path(), original);
+
+        let manifest = Manifest::load(dir.path()).unwrap();
+        manifest.save().unwrap();
+
+        let after = std::fs::read_to_string(dir.path().join("package.json")).unwrap();
+        assert_eq!(after, original, "save() must not reorder or drop fields");
+    }
+
+    #[test]
+    fn add_dependency_inserts_into_a_new_dependencies_object() {
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "{\n  \"name\": \"demo\"\n}\n");
+
+        let mut manifest = Manifest::load(dir.path()).unwrap();
+        manifest.add_dependency("lodash", "4.17.21");
+        manifest.save().unwrap();
+
+        let raw = std::fs::read_to_string(dir.path().join("package.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed["dependencies"]["lodash"], "4.17.21");
+        assert_eq!(parsed["name"], "demo");
+    }
+
+    #[test]
+    fn add_dependency_replaces_an_existing_entry() {
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), r#"{"dependencies":{"lodash":"3.0.0"}}"#);
+
+        let mut manifest = Manifest::load(dir.path()).unwrap();
+        manifest.add_dependency("lodash", "4.17.21");
+        manifest.save().unwrap();
+
+        let raw = std::fs::read_to_string(dir.path().join("package.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed["dependencies"]["lodash"], "4.17.21");
+    }
+}
