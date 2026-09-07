@@ -4,4 +4,5 @@ pub mod commands;
 pub mod error;
 pub mod integrity;
 pub mod manifest;
+pub mod store;
 pub mod testing;
