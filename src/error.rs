@@ -3,6 +3,7 @@ use thiserror::Error;
 use crate::archive::ArchiveError;
 use crate::cli::CliError;
 use crate::integrity::IntegrityError;
+use crate::linker::LinkError;
 use crate::manifest::ManifestError;
 use crate::store::StoreError;
 
@@ -18,6 +19,8 @@ pub enum JerkyError {
     Archive(#[from] ArchiveError),
     #[error(transparent)]
     Store(#[from] StoreError),
+    #[error(transparent)]
+    Link(#[from] LinkError),
     #[error("could not determine the current directory")]
     Cwd(#[source] std::io::Error),
     #[error("`jerky {0}` is not implemented yet")]

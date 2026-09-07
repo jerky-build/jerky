@@ -3,6 +3,7 @@ pub mod cli;
 pub mod commands;
 pub mod error;
 pub mod integrity;
+pub mod linker;
 pub mod manifest;
 pub mod store;
 pub mod testing;

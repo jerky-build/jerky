@@ -197,7 +197,7 @@ only module aware of more than one of the others. `integrity`, `archive`,
 <project>/node_modules/.jerky/lodash@4.17.21/node_modules/lodash/
     virtual store; hard links to the store entry
 
-<project>/node_modules/lodash -> ../.jerky/lodash@4.17.21/node_modules/lodash
+<project>/node_modules/lodash -> .jerky/lodash@4.17.21/node_modules/lodash
     relative symlink for each direct dependency
 ```
 
@@ -214,7 +214,9 @@ as base64 (`sha512-Ab3x...`), but macOS filesystems are case-insensitive by
 default, so base64 keys can collide. Hex-encoding the raw digest avoids it.
 
 **Symlinks are relative**, so moving or copying a project does not break every
-link.
+link. The target carries no leading `../`: it is resolved relative to
+`node_modules/`, the directory holding the link. pnpm uses `../` only for
+links *inside* the virtual store, which sit one level deeper.
 
 ## 6. Data flow and types
 
