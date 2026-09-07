@@ -235,7 +235,7 @@ impl RegistryClient for HttpRegistry {
 mod tests {
     use super::*;
 
-    const ABC_SHA512_SSRI: &str = "sha512-3a81oZNherrMQXNJriBBMRLm+k6JqX6iCp7u5ktV05ohkpkqJ0/BqDa6PCOj/uu9RU1EI2Q86A4qmslPpUyknw==";
+    use crate::testing::ABC_SHA512_SSRI;
 
     #[test]
     fn dist_prefers_the_integrity_field() {

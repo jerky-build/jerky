@@ -1,13 +1,13 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use thiserror::Error;
+
+use crate::staging::StagingDir;
 
 /// Bumped when the on-disk store format changes. Package-level content
 /// addressing is `v1`; a future file-level CAS would write `v2` and leave
 /// old stores ignorable rather than corrupt.
 const STORE_VERSION: &str = "v1";
-const STAGING_DIR: &str = ".staging";
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -39,43 +39,6 @@ pub enum StoreError {
 #[derive(Debug, Clone)]
 pub struct Store {
     root: PathBuf,
-}
-
-/// A staging directory that deletes itself on drop unless kept.
-///
-/// Hand-rolled rather than using `tempfile::TempDir` because the directory has
-/// to be *moved* on success, and disabling `TempDir`'s cleanup for that is an
-/// API that has churned across tempfile versions.
-struct StagingDir {
-    path: PathBuf,
-    keep: bool,
-}
-
-impl StagingDir {
-    fn keep(&mut self) -> PathBuf {
-        self.keep = true;
-        self.path.clone()
-    }
-}
-
-impl Drop for StagingDir {
-    fn drop(&mut self) {
-        if !self.keep {
-            let _ = std::fs::remove_dir_all(&self.path);
-        }
-    }
-}
-
-/// A name unique among concurrent processes and within this one, without
-/// pulling in a random number generator.
-fn unique_suffix() -> String {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    format!("{}-{}-{}", std::process::id(), nanos, n)
 }
 
 impl Store {
@@ -124,23 +87,14 @@ impl Store {
 
         // The staging directory lives inside the store root so the rename below
         // never crosses a filesystem boundary.
-        let staging_root = self.versioned_root().join(STAGING_DIR);
-        std::fs::create_dir_all(&staging_root).map_err(|source| StoreError::StagingFailed {
-            path: staging_root.clone(),
-            source,
+        let mut staging = StagingDir::create_under(&self.versioned_root()).map_err(|err| {
+            StoreError::StagingFailed {
+                path: err.path,
+                source: err.source,
+            }
         })?;
 
-        let staging_path = staging_root.join(unique_suffix());
-        std::fs::create_dir(&staging_path).map_err(|source| StoreError::StagingFailed {
-            path: staging_path.clone(),
-            source,
-        })?;
-        let mut staging = StagingDir {
-            path: staging_path,
-            keep: false,
-        };
-
-        populate(&staging.path).map_err(|source| StoreError::Populate {
+        populate(staging.path()).map_err(|source| StoreError::Populate {
             key: key.to_string(),
             source: Box::new(source),
         })?;

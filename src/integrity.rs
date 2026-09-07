@@ -131,10 +131,7 @@ impl Integrity {
 mod tests {
     use super::*;
 
-    // sha512 of the three bytes "abc", base64-encoded, as npm would report it.
-    // Regenerated per the plan's note: the constant it shipped shared a prefix
-    // with the real digest but diverged partway through.
-    const ABC_SHA512_SSRI: &str = "sha512-3a81oZNherrMQXNJriBBMRLm+k6JqX6iCp7u5ktV05ohkpkqJ0/BqDa6PCOj/uu9RU1EI2Q86A4qmslPpUyknw==";
+    use crate::testing::ABC_SHA512_SSRI;
 
     #[test]
     fn parses_a_sha512_ssri_string() {

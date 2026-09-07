@@ -1,14 +1,14 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use thiserror::Error;
+
+use crate::staging::StagingDir;
 
 /// `EXDEV`, "cross-device link". Both Linux and macOS use 18.
 /// `io::ErrorKind::CrossesDevices` would be cleaner but is still unstable.
 const EXDEV: i32 = 18;
 
 const VIRTUAL_STORE_DIR: &str = ".jerky";
-const STAGING_DIR: &str = ".staging";
 
 #[derive(Debug, Error)]
 pub enum LinkError {
@@ -27,16 +27,6 @@ pub enum LinkError {
     },
     #[error("{path} already exists and is not a symlink jerky can replace")]
     ConflictingEntry { path: PathBuf },
-}
-
-fn unique_suffix() -> String {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    format!("{}-{}-{}", std::process::id(), nanos, n)
 }
 
 /// Hard-link one file, falling back to a copy across filesystems.
@@ -145,20 +135,20 @@ pub fn populate_virtual_store(
         return Ok(target);
     }
 
-    let staging_root = virtual_root.join(STAGING_DIR);
-    std::fs::create_dir_all(&staging_root).map_err(|source| LinkError::Access {
-        path: staging_root.clone(),
-        source,
+    // The guard deletes the staging tree on any exit that is not an explicit
+    // keep — including a panic partway through linking, which the previous
+    // hand-rolled unwind here could not cover.
+    let mut staging = StagingDir::create_under(&virtual_root).map_err(|err| LinkError::Access {
+        path: err.path,
+        source: err.source,
     })?;
 
-    let staged = staging_root.join(unique_suffix());
-    let result = hard_link_tree(store_entry, &staged.join("node_modules").join(pkg_name));
+    hard_link_tree(
+        store_entry,
+        &staging.path().join("node_modules").join(pkg_name),
+    )?;
 
-    if let Err(err) = result {
-        let _ = std::fs::remove_dir_all(&staged);
-        return Err(err);
-    }
-
+    let staged = staging.keep();
     match std::fs::rename(&staged, &target) {
         Ok(()) => Ok(target),
         Err(source) => {

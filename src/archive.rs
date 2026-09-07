@@ -77,7 +77,14 @@ pub fn extract(tarball: &[u8], dest: &Path) -> Result<(), ArchiveError> {
 
 /// Drop the first path component and reject anything that could escape.
 fn strip_prefix_component(raw: &Path, display: &str) -> Result<PathBuf, ArchiveError> {
-    let mut components = raw.components();
+    let mut components = raw.components().peekable();
+
+    // A leading `./` is noise: GNU tar emits it when archiving a directory.
+    // Skipping it before the prefix check keeps ordinary tarballs installable
+    // without weakening the check, since `CurDir` cannot move up a level.
+    while matches!(components.peek(), Some(Component::CurDir)) {
+        components.next();
+    }
 
     // The first component must be a plain directory name — the `package/`
     // prefix. Anything else is already an escape attempt.
@@ -141,6 +148,21 @@ mod tests {
 
         let contents = std::fs::read_to_string(dir.path().join("index.js")).unwrap();
         assert_eq!(contents, "hello");
+    }
+
+    #[test]
+    fn accepts_a_leading_current_directory_component() {
+        // GNU tar writes `./package/...` when archiving a directory, so a
+        // leading `./` is ordinary output from a common packer, not an escape.
+        let tarball = build_tarball(&[TarEntry::file("./package/index.js", "hello")]);
+        let dir = TempDir::new().unwrap();
+
+        extract(&tarball, dir.path()).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("index.js")).unwrap(),
+            "hello"
+        );
     }
 
     #[test]

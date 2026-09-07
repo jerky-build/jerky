@@ -191,7 +191,7 @@ only module aware of more than one of the others. `integrity`, `archive`,
 ### Path scheme
 
 ```
-~/.jerky/store/v1/<hex-sha512>/
+~/.jerky/store/v1/sha512-<hex>/
     global content-addressed store
 
 <project>/node_modules/.jerky/lodash@4.17.21/node_modules/lodash/
@@ -311,7 +311,7 @@ the final store path. A killed process leaves a stray staging directory
 rather than a half-extracted package.
 
 This matters because the store is content-addressed, so the existence check
-is "does `~/.jerky/store/v1/<hex>/` exist?". A partial directory at that path
+is "does `~/.jerky/store/v1/sha512-<hex>/` exist?". A partial directory at that path
 means "present and verified" to every subsequent install, which would then
 hard-link a truncated package into a project. That is silent corruption which
 persists until someone clears the store manually, with a symptom — a module
@@ -321,7 +321,7 @@ missing half its files — that looks nothing like its cause.
 
 ```
 ~/.jerky/store/v1/.staging/<random>/     extract here
-~/.jerky/store/v1/<hex-sha512>/          rename here
+~/.jerky/store/v1/sha512-<hex>/          rename here
 ```
 
 `rename(2)` is atomic only within a single filesystem and fails with `EXDEV`

@@ -10,6 +10,11 @@ use std::io::Write as _;
 use flate2::Compression;
 use flate2::write::GzEncoder;
 
+/// sha512 of the three bytes `abc`, base64-encoded, as npm reports it in
+/// `dist.integrity`. Verified independently against `sha512sum` rather than
+/// produced by the code it is used to test.
+pub const ABC_SHA512_SSRI: &str = "sha512-3a81oZNherrMQXNJriBBMRLm+k6JqX6iCp7u5ktV05ohkpkqJ0/BqDa6PCOj/uu9RU1EI2Q86A4qmslPpUyknw==";
+
 /// One entry in a generated tarball.
 pub enum TarEntry<'a> {
     /// A regular file at `path` with `contents`.

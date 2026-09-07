@@ -6,5 +6,6 @@ pub mod integrity;
 pub mod linker;
 pub mod manifest;
 pub mod registry;
+mod staging;
 pub mod store;
 pub mod testing;
