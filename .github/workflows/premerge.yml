@@ -32,7 +32,13 @@ jobs:
           RUSTFLAGS: '-D warnings'
 
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, macos-latest]
+
+    runs-on: ${{ matrix.runner }}
+
     steps:
       - uses: actions/checkout@v6
 
@@ -62,4 +68,4 @@ jobs:
         with:
           components: clippy
 
-      - run: cargo clippy -- -D warnings
+      - run: cargo clippy --all-targets -- -D warnings

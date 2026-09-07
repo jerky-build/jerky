@@ -67,7 +67,12 @@ impl Manifest {
 
     pub fn create_default(project_dir: &Path) -> Result<Self, ManifestError> {
         let path = project_dir.join("package.json");
-        if path.exists() {
+        // `symlink_metadata` rather than `exists`: `exists` follows symlinks and
+        // reports false for a dangling one, so a `package.json` symlinked at a
+        // missing target would look absent here and then be written *through*,
+        // landing the manifest outside the project. Anything at this path at
+        // all, of any kind, means refuse.
+        if path.symlink_metadata().is_ok() {
             return Err(ManifestError::AlreadyExists(path));
         }
 
@@ -149,6 +154,25 @@ mod tests {
             Manifest::create_default(dir.path()),
             Err(ManifestError::AlreadyExists(_))
         ));
+    }
+
+    #[test]
+    fn create_default_refuses_a_symlinked_manifest() {
+        let dir = TempDir::new().unwrap();
+        let outside = dir.path().join("outside.json");
+        let project = dir.path().join("proj");
+        std::fs::create_dir(&project).unwrap();
+
+        // A dangling symlink: `exists()` follows it, finds no target, and
+        // reports false. Writing through it would land the manifest at the
+        // link target, outside the project directory entirely.
+        std::os::unix::fs::symlink(&outside, project.join("package.json")).unwrap();
+
+        assert!(matches!(
+            Manifest::create_default(&project),
+            Err(ManifestError::AlreadyExists(_))
+        ));
+        assert!(!outside.exists(), "must not write through the symlink");
     }
 
     #[test]
