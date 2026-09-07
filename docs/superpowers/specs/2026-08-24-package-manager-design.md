@@ -542,3 +542,11 @@ must be verified before spec 2 commits to one.
 **File-level content addressing.** Whether to upgrade the store from
 package-level to file-level CAS, and when. The `v1/` path segment keeps this
 open.
+
+**`package.json` reformatting.** `Manifest::save` re-serializes with
+`serde_json::to_string_pretty`, which always emits two-space indentation and
+expands arrays one element per line. npm detects and preserves the file's
+existing indentation. A project using tabs or four spaces will see its
+`package.json` reformatted on first install. Key order and unknown fields are
+already preserved, so this is purely about whitespace. Not blocking for spec 1;
+tracked as #24.
