@@ -86,3 +86,119 @@ pub fn build_tarball(entries: &[TarEntry<'_>]) -> Vec<u8> {
     encoder.write_all(&tar).expect("in-memory gzip cannot fail");
     encoder.finish().expect("in-memory gzip cannot fail")
 }
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use crate::integrity::Integrity;
+use crate::registry::{Dist, RegistryClient, RegistryError, VersionMetadata};
+
+/// An in-memory registry for tests.
+///
+/// Counts its calls so tests can prove the store-hit path was taken rather
+/// than a redundant download that happened to produce the same result.
+#[derive(Default)]
+pub struct FixtureRegistry {
+    versions: HashMap<(String, String), VersionMetadata>,
+    tarballs: HashMap<String, Vec<u8>>,
+    metadata_calls: AtomicUsize,
+    tarball_calls: AtomicUsize,
+}
+
+impl FixtureRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a package version, deriving a self-consistent integrity hash
+    /// from the tarball bytes so the happy path verifies by construction.
+    /// Also registers it under the `latest` tag.
+    pub fn with_package(mut self, name: &str, version: &str, tarball: Vec<u8>) -> Self {
+        let url = format!("https://fixture.test/{name}/-/{name}-{version}.tgz");
+        let integrity = Integrity {
+            algo: crate::integrity::Algo::Sha512,
+            digest: <sha2::Sha512 as sha2::Digest>::digest(&tarball).to_vec(),
+        };
+
+        let metadata = VersionMetadata {
+            name: name.to_string(),
+            version: version.to_string(),
+            dist: Dist {
+                tarball: url.clone(),
+                integrity: Some(integrity.to_ssri()),
+                shasum: None,
+            },
+        };
+
+        self.tarballs.insert(url, tarball);
+        self.versions
+            .insert((name.to_string(), version.to_string()), metadata.clone());
+        self.versions
+            .insert((name.to_string(), "latest".to_string()), metadata);
+        self
+    }
+
+    /// Register a package whose advertised integrity does not match its bytes.
+    pub fn with_corrupt_package(mut self, name: &str, version: &str, tarball: Vec<u8>) -> Self {
+        let url = format!("https://fixture.test/{name}/-/{name}-{version}.tgz");
+        let wrong = Integrity {
+            algo: crate::integrity::Algo::Sha512,
+            digest: <sha2::Sha512 as sha2::Digest>::digest(b"not these bytes").to_vec(),
+        };
+
+        let metadata = VersionMetadata {
+            name: name.to_string(),
+            version: version.to_string(),
+            dist: Dist {
+                tarball: url.clone(),
+                integrity: Some(wrong.to_ssri()),
+                shasum: None,
+            },
+        };
+
+        self.tarballs.insert(url, tarball);
+        self.versions
+            .insert((name.to_string(), version.to_string()), metadata.clone());
+        self.versions
+            .insert((name.to_string(), "latest".to_string()), metadata);
+        self
+    }
+
+    pub fn metadata_calls(&self) -> usize {
+        self.metadata_calls.load(Ordering::Relaxed)
+    }
+
+    pub fn tarball_calls(&self) -> usize {
+        self.tarball_calls.load(Ordering::Relaxed)
+    }
+
+    fn knows_package(&self, name: &str) -> bool {
+        self.versions.keys().any(|(n, _)| n == name)
+    }
+}
+
+impl RegistryClient for FixtureRegistry {
+    fn version_metadata(
+        &self,
+        name: &str,
+        version: &str,
+    ) -> Result<VersionMetadata, RegistryError> {
+        self.metadata_calls.fetch_add(1, Ordering::Relaxed);
+        match self.versions.get(&(name.to_string(), version.to_string())) {
+            Some(metadata) => Ok(metadata.clone()),
+            None if self.knows_package(name) => Err(RegistryError::VersionNotFound {
+                name: name.to_string(),
+                version: version.to_string(),
+            }),
+            None => Err(RegistryError::PackageNotFound(name.to_string())),
+        }
+    }
+
+    fn fetch_tarball(&self, url: &str) -> Result<Vec<u8>, RegistryError> {
+        self.tarball_calls.fetch_add(1, Ordering::Relaxed);
+        self.tarballs
+            .get(url)
+            .cloned()
+            .ok_or_else(|| RegistryError::PackageNotFound(url.to_string()))
+    }
+}

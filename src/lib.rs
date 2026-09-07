@@ -5,5 +5,6 @@ pub mod error;
 pub mod integrity;
 pub mod linker;
 pub mod manifest;
+pub mod registry;
 pub mod store;
 pub mod testing;
