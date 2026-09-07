@@ -70,6 +70,167 @@ pub trait RegistryClient {
     fn fetch_tarball(&self, url: &str) -> Result<Vec<u8>, RegistryError>;
 }
 
+pub const DEFAULT_REGISTRY: &str = "https://registry.npmjs.org";
+
+const MAX_ATTEMPTS: u32 = 3;
+
+/// ureq caps response bodies at 10 MB by default and *truncates* past it
+/// rather than erroring, so both limits are set explicitly. A version manifest
+/// is a few KB; the generous ceiling is for pathological ones. Tarballs
+/// routinely exceed 10 MB, and a silently truncated tarball would fail its
+/// integrity check with a baffling message.
+const MAX_METADATA_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_TARBALL_BYTES: u64 = 512 * 1024 * 1024;
+
+/// The npm registry over HTTP.
+pub struct HttpRegistry {
+    base_url: String,
+    agent: ureq::Agent,
+}
+
+impl Default for HttpRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+enum Retry {
+    Yes,
+    No,
+}
+
+impl HttpRegistry {
+    pub fn new() -> Self {
+        Self::with_base_url(DEFAULT_REGISTRY)
+    }
+
+    pub fn with_base_url(base_url: impl Into<String>) -> Self {
+        let config = ureq::Agent::config_builder()
+            .user_agent(concat!("jerky/", env!("CARGO_PKG_VERSION")))
+            .build();
+
+        Self {
+            base_url: base_url.into().trim_end_matches('/').to_string(),
+            agent: config.into(),
+        }
+    }
+
+    /// Scoped names carry a `/` that must be escaped in a path segment:
+    /// `@types/node` is requested as `@types%2fnode`.
+    fn encode_name(name: &str) -> String {
+        name.replace('/', "%2f")
+    }
+
+    /// Run an idempotent read, retrying transport failures and 5xx responses.
+    ///
+    /// `Retry::No` results short-circuit: a 404 is a definite answer, and
+    /// retrying it only makes the tool slow at being wrong.
+    fn with_retries<T>(
+        mut attempt: impl FnMut() -> Result<T, (RegistryError, Retry)>,
+    ) -> Result<T, RegistryError> {
+        let mut last = None;
+        for n in 0..MAX_ATTEMPTS {
+            match attempt() {
+                Ok(value) => return Ok(value),
+                Err((err, Retry::No)) => return Err(err),
+                Err((err, Retry::Yes)) => {
+                    last = Some(err);
+                    if n + 1 < MAX_ATTEMPTS {
+                        std::thread::sleep(std::time::Duration::from_millis(100 * 2_u64.pow(n)));
+                    }
+                }
+            }
+        }
+        Err(last.expect("at least one attempt ran"))
+    }
+
+    /// Does this package exist at all? Used only on the error path, to turn a
+    /// 404 into either `PackageNotFound` or `VersionNotFound`.
+    fn package_exists(&self, name: &str) -> bool {
+        let url = format!("{}/{}", self.base_url, Self::encode_name(name));
+        self.agent.get(&url).call().is_ok()
+    }
+}
+
+impl RegistryClient for HttpRegistry {
+    fn version_metadata(
+        &self,
+        name: &str,
+        version: &str,
+    ) -> Result<VersionMetadata, RegistryError> {
+        let url = format!("{}/{}/{}", self.base_url, Self::encode_name(name), version);
+
+        let body = Self::with_retries(|| match self.agent.get(&url).call() {
+            Ok(mut response) => response
+                .body_mut()
+                .with_config()
+                .limit(MAX_METADATA_BYTES)
+                .read_to_string()
+                .map_err(|source| {
+                    (
+                        RegistryError::MalformedResponse {
+                            url: url.clone(),
+                            source: Box::new(source),
+                        },
+                        Retry::Yes,
+                    )
+                }),
+            Err(ureq::Error::StatusCode(404)) => {
+                let err = if self.package_exists(name) {
+                    RegistryError::VersionNotFound {
+                        name: name.to_string(),
+                        version: version.to_string(),
+                    }
+                } else {
+                    RegistryError::PackageNotFound(name.to_string())
+                };
+                Err((err, Retry::No))
+            }
+            Err(source) => Err((
+                RegistryError::Network {
+                    url: url.clone(),
+                    source: Box::new(source),
+                },
+                Retry::Yes,
+            )),
+        })?;
+
+        serde_json::from_str(&body).map_err(|source| RegistryError::MalformedResponse {
+            url,
+            source: Box::new(source),
+        })
+    }
+
+    fn fetch_tarball(&self, url: &str) -> Result<Vec<u8>, RegistryError> {
+        Self::with_retries(|| match self.agent.get(url).call() {
+            Ok(mut response) => response
+                .body_mut()
+                .with_config()
+                .limit(MAX_TARBALL_BYTES)
+                .read_to_vec()
+                .map_err(|source| {
+                    (
+                        RegistryError::Network {
+                            url: url.to_string(),
+                            source: Box::new(source),
+                        },
+                        Retry::Yes,
+                    )
+                }),
+            Err(ureq::Error::StatusCode(404)) => {
+                Err((RegistryError::PackageNotFound(url.to_string()), Retry::No))
+            }
+            Err(source) => Err((
+                RegistryError::Network {
+                    url: url.to_string(),
+                    source: Box::new(source),
+                },
+                Retry::Yes,
+            )),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
