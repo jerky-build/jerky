@@ -22,6 +22,15 @@ pub enum RangeError {
 /// Carries the registry's original spelling alongside the parsed form. The
 /// parsed form drives comparison; the string is what reaches `package.json`
 /// and the lockfile, so a round trip never normalises what the registry said.
+///
+/// **Equality is semantic, not textual.** Build metadata is ignored in
+/// comparison, per the semver spec, so `1.2.3+a == 1.2.3` while their
+/// `as_str` differ. Two such versions are interchangeable for selection but
+/// not for display, and which spelling `max_satisfying` returns among equals
+/// is unspecified. This is theoretical against a real registry — a packument
+/// cannot hold two version keys differing only by build metadata, because
+/// they would be the same key — but it is the kind of thing worth knowing
+/// before relying on the pair.
 #[derive(Debug, Clone)]
 pub struct Version {
     parsed: js_semver::Version,

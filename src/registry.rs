@@ -200,6 +200,53 @@ impl HttpRegistry {
         Err(last.expect("at least one attempt ran"))
     }
 
+    /// Fetch a JSON body, applying the retry policy and the size limit.
+    ///
+    /// The two metadata endpoints differ only in their URL, whether they ask
+    /// for the abbreviated form, and what a 404 means, so everything else —
+    /// retries, limits, error mapping — lives here rather than twice.
+    fn get_json(
+        &self,
+        url: &str,
+        abbreviated: bool,
+        not_found: impl Fn() -> RegistryError,
+    ) -> Result<String, RegistryError> {
+        Self::with_retries(|| {
+            let mut request = self.agent.get(url);
+            if abbreviated {
+                // The unabbreviated document for a popular package is
+                // megabytes of every version ever published, so this is not
+                // an optimisation.
+                request = request.header("Accept", "application/vnd.npm.install-v1+json");
+            }
+
+            match request.call() {
+                Ok(mut response) => response
+                    .body_mut()
+                    .with_config()
+                    .limit(MAX_METADATA_BYTES)
+                    .read_to_string()
+                    .map_err(|source| {
+                        (
+                            RegistryError::MalformedResponse {
+                                url: url.to_string(),
+                                source: Box::new(source),
+                            },
+                            Retry::Yes,
+                        )
+                    }),
+                Err(ureq::Error::StatusCode(404)) => Err((not_found(), Retry::No)),
+                Err(source) => Err((
+                    RegistryError::Network {
+                        url: url.to_string(),
+                        source: Box::new(source),
+                    },
+                    Retry::Yes,
+                )),
+            }
+        })
+    }
+
     /// Does this package exist at all? Used only on the error path, to turn a
     /// 404 into either `PackageNotFound` or `VersionNotFound`.
     fn package_exists(&self, name: &str) -> bool {
@@ -216,39 +263,17 @@ impl RegistryClient for HttpRegistry {
     ) -> Result<VersionMetadata, RegistryError> {
         let url = format!("{}/{}/{}", self.base_url, Self::encode_name(name), version);
 
-        let body = Self::with_retries(|| match self.agent.get(&url).call() {
-            Ok(mut response) => response
-                .body_mut()
-                .with_config()
-                .limit(MAX_METADATA_BYTES)
-                .read_to_string()
-                .map_err(|source| {
-                    (
-                        RegistryError::MalformedResponse {
-                            url: url.clone(),
-                            source: Box::new(source),
-                        },
-                        Retry::Yes,
-                    )
-                }),
-            Err(ureq::Error::StatusCode(404)) => {
-                let err = if self.package_exists(name) {
-                    RegistryError::VersionNotFound {
-                        name: name.to_string(),
-                        version: version.to_string(),
-                    }
-                } else {
-                    RegistryError::PackageNotFound(name.to_string())
-                };
-                Err((err, Retry::No))
+        // A 404 here is ambiguous: the package may not exist, or it may exist
+        // without this version. Only the error path pays for the distinction.
+        let body = self.get_json(&url, false, || {
+            if self.package_exists(name) {
+                RegistryError::VersionNotFound {
+                    name: name.to_string(),
+                    version: version.to_string(),
+                }
+            } else {
+                RegistryError::PackageNotFound(name.to_string())
             }
-            Err(source) => Err((
-                RegistryError::Network {
-                    url: url.clone(),
-                    source: Box::new(source),
-                },
-                Retry::Yes,
-            )),
         })?;
 
         serde_json::from_str(&body).map_err(|source| RegistryError::MalformedResponse {
@@ -260,41 +285,8 @@ impl RegistryClient for HttpRegistry {
     fn packument(&self, name: &str) -> Result<Packument, RegistryError> {
         let url = format!("{}/{}", self.base_url, Self::encode_name(name));
 
-        let body = Self::with_retries(|| {
-            match self
-                .agent
-                .get(&url)
-                // The abbreviated form. The unabbreviated document for a
-                // popular package is megabytes of every version ever
-                // published, so this is not an optimisation.
-                .header("Accept", "application/vnd.npm.install-v1+json")
-                .call()
-            {
-                Ok(mut response) => response
-                    .body_mut()
-                    .with_config()
-                    .limit(MAX_METADATA_BYTES)
-                    .read_to_string()
-                    .map_err(|source| {
-                        (
-                            RegistryError::MalformedResponse {
-                                url: url.clone(),
-                                source: Box::new(source),
-                            },
-                            Retry::Yes,
-                        )
-                    }),
-                Err(ureq::Error::StatusCode(404)) => {
-                    Err((RegistryError::PackageNotFound(name.to_string()), Retry::No))
-                }
-                Err(source) => Err((
-                    RegistryError::Network {
-                        url: url.clone(),
-                        source: Box::new(source),
-                    },
-                    Retry::Yes,
-                )),
-            }
+        let body = self.get_json(&url, true, || {
+            RegistryError::PackageNotFound(name.to_string())
         })?;
 
         serde_json::from_str(&body).map_err(|source| RegistryError::MalformedResponse {

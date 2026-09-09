@@ -44,6 +44,10 @@ fn matches_npm_semver_on_every_recorded_case() {
         "oracle contains no invalid ranges, so it cannot catch a permissive parser"
     );
 
+    // Comparison below is order-sensitive: `satisfying` lists were recorded by
+    // walking `versions` in the order the fixture stores it, so filtering in
+    // that same order is what makes the vectors comparable. Both come from one
+    // file, which is why the version list is embedded rather than duplicated.
     let versions: Vec<Version> = oracle
         .versions
         .iter()
