@@ -535,11 +535,14 @@ becomes a real need it is an offline-mode feature, not a cache.
 
 ## 12. Open questions
 
-**An npm-flavoured semver crate for spec 2.** Rust's well-known `semver` crate
-is Cargo-flavoured, and npm's range semantics differ in real ways — `^`
-behaviour on `0.x`, `x`/`*` wildcards, hyphen ranges, `||` unions. An
-npm-compatible implementation is needed; which crate, and whether it is sound,
-must be verified before spec 2 commits to one.
+**~~An npm-flavoured semver crate for spec 2.~~ Answered 2026-09-08.** Use
+`js-semver`. Differential testing against npm's own `semver` 7.8.5 over 531
+ranges put it at 531/531, against 515 for `nodejs-semver` and 431 for Cargo's
+`semver`. The hypothesis that the Cargo crate is unusable is confirmed and is
+worse than expected: 45 of its 100 failures are silent wrong answers on
+prerelease ranges rather than refusals to parse. Full data, the residual risk
+that `js-semver` is pre-1.0, and the reproducible harness are in
+`docs/superpowers/research/2026-09-08-npm-semver-crate-selection.md`.
 
 **File-level content addressing.** Whether to upgrade the store from
 package-level to file-level CAS, and when. The `v1/` path segment keeps this
