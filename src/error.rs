@@ -6,6 +6,7 @@ use crate::commands::install::InstallError;
 use crate::integrity::IntegrityError;
 use crate::linker::LinkError;
 use crate::manifest::ManifestError;
+use crate::range::RangeError;
 use crate::registry::RegistryError;
 use crate::store::StoreError;
 
@@ -23,6 +24,8 @@ pub enum JerkyError {
     Store(#[from] StoreError),
     #[error(transparent)]
     Link(#[from] LinkError),
+    #[error(transparent)]
+    Range(#[from] RangeError),
     #[error(transparent)]
     Registry(#[from] RegistryError),
     #[error(transparent)]

@@ -593,6 +593,7 @@ dependencies = [
  "clap",
  "dirs",
  "flate2",
+ "js-semver",
  "predicates",
  "serde",
  "serde_json",
@@ -604,6 +605,12 @@ dependencies = [
  "tiny_http",
  "ureq",
 ]
+
+[[package]]
+name = "js-semver"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "022d2577accd01e7b1e65fd0545007bbc23b27840431977ef9931637c51c4842"
 
 [[package]]
 name = "libc"

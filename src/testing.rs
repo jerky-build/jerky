@@ -92,11 +92,12 @@ pub fn build_tarball(entries: &[TarEntry<'_>]) -> Vec<u8> {
     encoder.finish().expect("in-memory gzip cannot fail")
 }
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::integrity::Integrity;
-use crate::registry::{Dist, RegistryClient, RegistryError, VersionMetadata};
+use crate::registry::{Dist, Packument, RegistryClient, RegistryError, VersionMetadata};
 
 /// An in-memory registry for tests.
 ///
@@ -105,9 +106,11 @@ use crate::registry::{Dist, RegistryClient, RegistryError, VersionMetadata};
 #[derive(Default)]
 pub struct FixtureRegistry {
     versions: HashMap<(String, String), VersionMetadata>,
+    packuments: BTreeMap<String, Packument>,
     tarballs: HashMap<String, Vec<u8>>,
     metadata_calls: AtomicUsize,
     tarball_calls: AtomicUsize,
+    packument_calls: Mutex<BTreeMap<String, usize>>,
 }
 
 impl FixtureRegistry {
@@ -133,17 +136,60 @@ impl FixtureRegistry {
                 integrity: Some(integrity.to_ssri()),
                 shasum: None,
             },
+            dependencies: BTreeMap::new(),
         };
 
         self.tarballs.insert(url, tarball);
-        self.versions
-            .insert((name.to_string(), version.to_string()), metadata.clone());
-        self.versions
-            .insert((name.to_string(), "latest".to_string()), metadata);
+        self.register(name, version, metadata);
+        self
+    }
+
+    /// Register several versions of one package, each with its own
+    /// dependencies, as a registry would report them in one packument.
+    ///
+    /// Each entry is `(version, &[(dep_name, dep_range)])`. Tarballs are
+    /// generated and hashed so every version verifies by construction, and
+    /// `latest` resolves to the highest version given.
+    ///
+    /// This is what lets a test express a dependency *edge*: `with_package`
+    /// alone can only register leaves.
+    pub fn with_packument(mut self, name: &str, versions: &[(&str, &[(&str, &str)])]) -> Self {
+        for (version, dependencies) in versions {
+            let tarball = build_tarball(&[TarEntry::file(
+                "package/package.json",
+                &format!(r#"{{"name":"{name}","version":"{version}"}}"#),
+            )]);
+            let url = format!("https://fixture.test/{name}/-/{name}-{version}.tgz");
+            let integrity = Integrity {
+                algo: crate::integrity::Algo::Sha512,
+                digest: <sha2::Sha512 as sha2::Digest>::digest(&tarball).to_vec(),
+            };
+
+            let metadata = VersionMetadata {
+                name: name.to_string(),
+                version: version.to_string(),
+                dist: Dist {
+                    tarball: url.clone(),
+                    integrity: Some(integrity.to_ssri()),
+                    shasum: None,
+                },
+                dependencies: dependencies
+                    .iter()
+                    .map(|(n, r)| (n.to_string(), r.to_string()))
+                    .collect(),
+            };
+
+            self.tarballs.insert(url, tarball);
+            self.register(name, version, metadata);
+        }
         self
     }
 
     /// Register a package whose advertised integrity does not match its bytes.
+    ///
+    /// Note that `latest` resolves to the *highest* version registered, so if
+    /// a higher intact version of the same package is also registered, `latest`
+    /// will not reach this one. Request it by exact version in that case.
     pub fn with_corrupt_package(mut self, name: &str, version: &str, tarball: Vec<u8>) -> Self {
         let url = format!("https://fixture.test/{name}/-/{name}-{version}.tgz");
         let wrong = Integrity {
@@ -159,14 +205,53 @@ impl FixtureRegistry {
                 integrity: Some(wrong.to_ssri()),
                 shasum: None,
             },
+            dependencies: BTreeMap::new(),
         };
 
         self.tarballs.insert(url, tarball);
+        self.register(name, version, metadata);
+        self
+    }
+
+    /// Record one version in both the per-version map and the packument.
+    ///
+    /// `latest` is the *highest* version registered, not the most recent call,
+    /// so registering versions out of order still behaves like a registry.
+    fn register(&mut self, name: &str, version: &str, metadata: VersionMetadata) {
         self.versions
             .insert((name.to_string(), version.to_string()), metadata.clone());
+
+        let packument = self
+            .packuments
+            .entry(name.to_string())
+            .or_insert_with(|| Packument {
+                name: name.to_string(),
+                versions: BTreeMap::new(),
+                dist_tags: BTreeMap::new(),
+            });
+        packument
+            .versions
+            .insert(version.to_string(), metadata.clone());
+
+        let highest = packument
+            .versions_sorted()
+            .last()
+            .map(|v| v.as_str().to_string())
+            .unwrap_or_else(|| version.to_string());
+        packument
+            .dist_tags
+            .insert("latest".to_string(), highest.clone());
+
+        // Spec 1's single-version path resolves `latest` through this map.
+        // `highest` is always a key of `versions` — it came from sorting them —
+        // so this lookup cannot miss.
+        let latest_metadata = packument
+            .versions
+            .get(&highest)
+            .cloned()
+            .expect("highest came from these versions");
         self.versions
-            .insert((name.to_string(), "latest".to_string()), metadata);
-        self
+            .insert((name.to_string(), "latest".to_string()), latest_metadata);
     }
 
     pub fn metadata_calls(&self) -> usize {
@@ -175,6 +260,21 @@ impl FixtureRegistry {
 
     pub fn tarball_calls(&self) -> usize {
         self.tarball_calls.load(Ordering::Relaxed)
+    }
+
+    pub fn packument_calls(&self) -> usize {
+        self.packument_calls.lock().unwrap().values().sum()
+    }
+
+    /// How many times one package's version list was fetched. Proves the
+    /// packument cache works, which an identical resolved graph cannot.
+    pub fn packument_calls_for(&self, name: &str) -> usize {
+        self.packument_calls
+            .lock()
+            .unwrap()
+            .get(name)
+            .copied()
+            .unwrap_or(0)
     }
 
     fn knows_package(&self, name: &str) -> bool {
@@ -199,11 +299,92 @@ impl RegistryClient for FixtureRegistry {
         }
     }
 
+    fn packument(&self, name: &str) -> Result<Packument, RegistryError> {
+        *self
+            .packument_calls
+            .lock()
+            .unwrap()
+            .entry(name.to_string())
+            .or_insert(0) += 1;
+
+        self.packuments
+            .get(name)
+            .cloned()
+            .ok_or_else(|| RegistryError::PackageNotFound(name.to_string()))
+    }
+
     fn fetch_tarball(&self, url: &str) -> Result<Vec<u8>, RegistryError> {
         self.tarball_calls.fetch_add(1, Ordering::Relaxed);
         self.tarballs
             .get(url)
             .cloned()
             .ok_or_else(|| RegistryError::PackageNotFound(url.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::registry::RegistryClient;
+
+    #[test]
+    fn with_packument_registers_versions_and_their_edges() {
+        let registry = FixtureRegistry::new().with_packument(
+            "a",
+            &[("1.0.0", &[("b", "^1.0.0")]), ("1.2.0", &[("b", "^2.0.0")])],
+        );
+
+        let p = registry.packument("a").unwrap();
+        assert_eq!(p.versions.len(), 2);
+        assert_eq!(
+            p.resolve_tag("latest"),
+            Some("1.2.0"),
+            "latest is the highest"
+        );
+        assert_eq!(p.versions["1.0.0"].dependencies["b"], "^1.0.0");
+        assert_eq!(p.versions["1.2.0"].dependencies["b"], "^2.0.0");
+    }
+
+    #[test]
+    fn fixture_versions_verify_against_their_own_tarballs() {
+        // The point of deriving integrity from the generated bytes: the happy
+        // path must verify by construction, or every install test is testing
+        // the failure path by accident.
+        let registry = FixtureRegistry::new().with_packument("a", &[("1.0.0", &[])]);
+
+        let p = registry.packument("a").unwrap();
+        let metadata = &p.versions["1.0.0"];
+        let bytes = registry.fetch_tarball(&metadata.dist.tarball).unwrap();
+
+        assert!(metadata.dist.integrity().unwrap().verify(&bytes).is_ok());
+    }
+
+    #[test]
+    fn latest_is_the_highest_version_not_the_last_registered() {
+        // Registered out of order on purpose: a registry does not care which
+        // order a test happened to declare things in.
+        let registry = FixtureRegistry::new()
+            .with_packument("a", &[("2.0.0", &[])])
+            .with_packument("a", &[("1.0.0", &[])]);
+
+        assert_eq!(
+            registry.packument("a").unwrap().resolve_tag("latest"),
+            Some("2.0.0")
+        );
+    }
+
+    #[test]
+    fn packument_calls_are_counted_per_package() {
+        let registry = FixtureRegistry::new()
+            .with_packument("a", &[("1.0.0", &[])])
+            .with_packument("b", &[("1.0.0", &[])]);
+
+        registry.packument("a").unwrap();
+        registry.packument("a").unwrap();
+        registry.packument("b").unwrap();
+
+        assert_eq!(registry.packument_calls_for("a"), 2);
+        assert_eq!(registry.packument_calls_for("b"), 1);
+        assert_eq!(registry.packument_calls(), 3, "the total is the sum");
     }
 }
