@@ -74,11 +74,19 @@ pub const DEFAULT_REGISTRY: &str = "https://registry.npmjs.org";
 
 const MAX_ATTEMPTS: u32 = 3;
 
-/// ureq caps response bodies at 10 MB by default and *truncates* past it
-/// rather than erroring, so both limits are set explicitly. A version manifest
-/// is a few KB; the generous ceiling is for pathological ones. Tarballs
-/// routinely exceed 10 MB, and a silently truncated tarball would fail its
-/// integrity check with a baffling message.
+/// ureq's `read_to_vec`/`read_to_string` default to a 10 MB cap, which many
+/// real tarballs exceed, so both limits are raised explicitly. A version
+/// manifest is a few KB; the generous ceiling is for pathological ones.
+///
+/// Exceeding the limit is an error (`BodyExceedsLimit`), not a truncation, so
+/// the failure mode of leaving these at the default would be a loud refusal to
+/// install a large package rather than a corrupted one. The caps stay because
+/// an unbounded read lets a hostile registry exhaust memory.
+///
+/// Note that ureq rejects a body of *exactly* the limit: its `LimitReader`
+/// errors once the remaining allowance reaches zero rather than when it would
+/// go negative. Harmless at these sizes, but it is why the ceilings are round
+/// numbers well clear of any real payload rather than tight fits.
 const MAX_METADATA_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_TARBALL_BYTES: u64 = 512 * 1024 * 1024;
 
