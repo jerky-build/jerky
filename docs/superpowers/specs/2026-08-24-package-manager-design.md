@@ -97,7 +97,7 @@ Each of these is deferred to a named later spec, not forgotten.
 |---|---|
 | Transitive dependency resolution | Spec 2 |
 | Semver range parsing and selection | Spec 2 |
-| `jerky.lock` | Spec 2 |
+| `jerky-lock.json` | Spec 2 |
 | Bare `jerky install` from the manifest | Spec 3 |
 | `devDependencies` / `--save-dev` | Spec 3 |
 | Scoped packages (`@scope/name`) | Spec 3 |
@@ -109,7 +109,7 @@ Each of these is deferred to a named later spec, not forgotten.
 | Windows support | Later |
 | Interactive `jerky init` prompts | Not planned |
 
-**`jerky.lock` is deliberately absent from spec 1.** Its purpose is to make a
+**`jerky-lock.json` is deliberately absent from spec 1.** Its purpose is to make a
 later install reproduce an earlier resolution, but spec 1 pins exact versions
 into `package.json` and has no ranges and no graph, so reproducibility is
 already fully determined by the manifest. Nothing in spec 1 could read a
@@ -502,8 +502,11 @@ invisible on Linux.
 ## 11. Roadmap and issue remapping
 
 **Spec 2 — the resolver.** `jerky install express`: npm range parsing,
-transitive walk, virtual store wiring for nested dependencies, parallel
-downloads, and `jerky.lock`.
+transitive walk, virtual store wiring for nested dependencies, and
+`jerky-lock.json`. Designed in
+`docs/superpowers/specs/2026-09-08-resolver-and-lockfile-design.md`. Parallel
+downloads were dropped from that slice: spec 2 is already a resolver plus a
+lockfile format, and both are worth getting right before making fast.
 
 **Spec 3 — everyday use.** Bare `jerky install` from the manifest,
 `devDependencies`, scoped packages, and `node_modules/.bin` linking.
