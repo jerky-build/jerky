@@ -1,7 +1,10 @@
+use std::collections::BTreeMap;
+
 use serde::Deserialize;
 use thiserror::Error;
 
 use crate::integrity::{Integrity, IntegrityError};
+use crate::range::Version;
 
 #[derive(Debug, Error)]
 pub enum RegistryError {
@@ -30,6 +33,48 @@ pub struct VersionMetadata {
     pub name: String,
     pub version: String,
     pub dist: Dist,
+    /// Runtime dependencies only.
+    ///
+    /// There is deliberately no `devDependencies` field. A dependency's dev
+    /// dependencies must never be followed — doing so pulls in most of the
+    /// registry — and a field that exists is a field someone will read.
+    #[serde(default)]
+    pub dependencies: BTreeMap<String, String>,
+}
+
+/// Every published version of one package, in the registry's abbreviated form.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Packument {
+    pub name: String,
+    #[serde(default)]
+    pub versions: BTreeMap<String, VersionMetadata>,
+    #[serde(rename = "dist-tags", default)]
+    pub dist_tags: BTreeMap<String, String>,
+}
+
+impl Packument {
+    /// Every version that parses, in precedence order.
+    ///
+    /// Unparseable versions are dropped rather than fatal: the registry has
+    /// accumulated some genuinely malformed entries, and one of them must not
+    /// make an otherwise-fine package unresolvable.
+    ///
+    /// Sorting matters. The registry's own key order is lexical, which puts
+    /// `1.10.0` before `1.9.0`.
+    pub fn versions_sorted(&self) -> Vec<Version> {
+        let mut out: Vec<Version> = self
+            .versions
+            .keys()
+            .filter_map(|v| Version::parse(v).ok())
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Resolve a dist-tag such as `latest` to a concrete version.
+    pub fn resolve_tag(&self, tag: &str) -> Option<&str> {
+        self.dist_tags.get(tag).map(String::as_str)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -66,6 +111,9 @@ pub trait RegistryClient {
     /// dist-tag such as `latest`; the registry resolves both on this endpoint.
     fn version_metadata(&self, name: &str, version: &str)
     -> Result<VersionMetadata, RegistryError>;
+
+    /// Every published version of a package, for range resolution.
+    fn packument(&self, name: &str) -> Result<Packument, RegistryError>;
 
     fn fetch_tarball(&self, url: &str) -> Result<Vec<u8>, RegistryError>;
 }
@@ -209,6 +257,52 @@ impl RegistryClient for HttpRegistry {
         })
     }
 
+    fn packument(&self, name: &str) -> Result<Packument, RegistryError> {
+        let url = format!("{}/{}", self.base_url, Self::encode_name(name));
+
+        let body = Self::with_retries(|| {
+            match self
+                .agent
+                .get(&url)
+                // The abbreviated form. The unabbreviated document for a
+                // popular package is megabytes of every version ever
+                // published, so this is not an optimisation.
+                .header("Accept", "application/vnd.npm.install-v1+json")
+                .call()
+            {
+                Ok(mut response) => response
+                    .body_mut()
+                    .with_config()
+                    .limit(MAX_METADATA_BYTES)
+                    .read_to_string()
+                    .map_err(|source| {
+                        (
+                            RegistryError::MalformedResponse {
+                                url: url.clone(),
+                                source: Box::new(source),
+                            },
+                            Retry::Yes,
+                        )
+                    }),
+                Err(ureq::Error::StatusCode(404)) => {
+                    Err((RegistryError::PackageNotFound(name.to_string()), Retry::No))
+                }
+                Err(source) => Err((
+                    RegistryError::Network {
+                        url: url.clone(),
+                        source: Box::new(source),
+                    },
+                    Retry::Yes,
+                )),
+            }
+        })?;
+
+        serde_json::from_str(&body).map_err(|source| RegistryError::MalformedResponse {
+            url,
+            source: Box::new(source),
+        })
+    }
+
     fn fetch_tarball(&self, url: &str) -> Result<Vec<u8>, RegistryError> {
         Self::with_retries(|| match self.agent.get(url).call() {
             Ok(mut response) => response
@@ -280,6 +374,68 @@ mod tests {
             dist.integrity(),
             Err(crate::integrity::IntegrityError::Missing)
         ));
+    }
+
+    #[test]
+    fn packument_deserializes_a_registry_response() {
+        let raw = r#"{
+            "name": "lodash",
+            "dist-tags": { "latest": "4.17.21", "next": "5.0.0-beta.1" },
+            "versions": {
+                "4.17.20": { "name": "lodash", "version": "4.17.20",
+                    "dist": { "tarball": "https://r.test/a.tgz" } },
+                "4.17.21": { "name": "lodash", "version": "4.17.21",
+                    "dist": { "tarball": "https://r.test/b.tgz" } }
+            }
+        }"#;
+
+        let p: Packument = serde_json::from_str(raw).unwrap();
+        assert_eq!(p.name, "lodash");
+        assert_eq!(p.versions.len(), 2);
+        assert_eq!(p.resolve_tag("latest"), Some("4.17.21"));
+        assert_eq!(p.resolve_tag("nope"), None);
+    }
+
+    #[test]
+    fn packument_skips_versions_it_cannot_parse() {
+        // The registry has accumulated some genuinely malformed versions over
+        // the years. One bad entry must not make a package unresolvable.
+        let raw = r#"{
+            "name": "old",
+            "dist-tags": {},
+            "versions": {
+                "1.0.0":     { "name": "old", "version": "1.0.0",
+                    "dist": { "tarball": "https://r.test/a.tgz" } },
+                "not-a-ver": { "name": "old", "version": "not-a-ver",
+                    "dist": { "tarball": "https://r.test/b.tgz" } }
+            }
+        }"#;
+
+        let p: Packument = serde_json::from_str(raw).unwrap();
+        let sorted = p.versions_sorted();
+        assert_eq!(
+            sorted.len(),
+            1,
+            "the unparseable version is dropped, not fatal"
+        );
+        assert_eq!(sorted[0].as_str(), "1.0.0");
+    }
+
+    #[test]
+    fn packument_versions_come_back_in_precedence_order() {
+        // Registry key order is lexical, which puts 1.10.0 before 1.9.0.
+        let raw = r#"{
+            "name": "p", "dist-tags": {},
+            "versions": {
+                "1.9.0":  { "name": "p", "version": "1.9.0",  "dist": { "tarball": "https://r.test/a.tgz" } },
+                "1.10.0": { "name": "p", "version": "1.10.0", "dist": { "tarball": "https://r.test/b.tgz" } }
+            }
+        }"#;
+
+        let p: Packument = serde_json::from_str(raw).unwrap();
+        let sorted = p.versions_sorted();
+        let order: Vec<&str> = sorted.iter().map(|v| v.as_str()).collect();
+        assert_eq!(order, ["1.9.0", "1.10.0"]);
     }
 
     #[test]

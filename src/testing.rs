@@ -92,11 +92,12 @@ pub fn build_tarball(entries: &[TarEntry<'_>]) -> Vec<u8> {
     encoder.finish().expect("in-memory gzip cannot fail")
 }
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::integrity::Integrity;
-use crate::registry::{Dist, RegistryClient, RegistryError, VersionMetadata};
+use crate::registry::{Dist, Packument, RegistryClient, RegistryError, VersionMetadata};
 
 /// An in-memory registry for tests.
 ///
@@ -105,9 +106,12 @@ use crate::registry::{Dist, RegistryClient, RegistryError, VersionMetadata};
 #[derive(Default)]
 pub struct FixtureRegistry {
     versions: HashMap<(String, String), VersionMetadata>,
+    packuments: BTreeMap<String, Packument>,
     tarballs: HashMap<String, Vec<u8>>,
     metadata_calls: AtomicUsize,
     tarball_calls: AtomicUsize,
+    packument_calls: AtomicUsize,
+    packument_calls_by_name: Mutex<BTreeMap<String, usize>>,
 }
 
 impl FixtureRegistry {
@@ -133,13 +137,11 @@ impl FixtureRegistry {
                 integrity: Some(integrity.to_ssri()),
                 shasum: None,
             },
+            dependencies: BTreeMap::new(),
         };
 
         self.tarballs.insert(url, tarball);
-        self.versions
-            .insert((name.to_string(), version.to_string()), metadata.clone());
-        self.versions
-            .insert((name.to_string(), "latest".to_string()), metadata);
+        self.register(name, version, metadata);
         self
     }
 
@@ -159,14 +161,51 @@ impl FixtureRegistry {
                 integrity: Some(wrong.to_ssri()),
                 shasum: None,
             },
+            dependencies: BTreeMap::new(),
         };
 
         self.tarballs.insert(url, tarball);
+        self.register(name, version, metadata);
+        self
+    }
+
+    /// Record one version in both the per-version map and the packument.
+    ///
+    /// `latest` is the *highest* version registered, not the most recent call,
+    /// so registering versions out of order still behaves like a registry.
+    fn register(&mut self, name: &str, version: &str, metadata: VersionMetadata) {
         self.versions
             .insert((name.to_string(), version.to_string()), metadata.clone());
+
+        let packument = self
+            .packuments
+            .entry(name.to_string())
+            .or_insert_with(|| Packument {
+                name: name.to_string(),
+                versions: BTreeMap::new(),
+                dist_tags: BTreeMap::new(),
+            });
+        packument
+            .versions
+            .insert(version.to_string(), metadata.clone());
+
+        let highest = packument
+            .versions_sorted()
+            .last()
+            .map(|v| v.as_str().to_string())
+            .unwrap_or_else(|| version.to_string());
+        packument
+            .dist_tags
+            .insert("latest".to_string(), highest.clone());
+
+        // Spec 1's single-version path resolves `latest` through this map.
+        let latest_metadata = packument
+            .versions
+            .get(&highest)
+            .cloned()
+            .unwrap_or(metadata);
         self.versions
-            .insert((name.to_string(), "latest".to_string()), metadata);
-        self
+            .insert((name.to_string(), "latest".to_string()), latest_metadata);
     }
 
     pub fn metadata_calls(&self) -> usize {
@@ -175,6 +214,21 @@ impl FixtureRegistry {
 
     pub fn tarball_calls(&self) -> usize {
         self.tarball_calls.load(Ordering::Relaxed)
+    }
+
+    pub fn packument_calls(&self) -> usize {
+        self.packument_calls.load(Ordering::Relaxed)
+    }
+
+    /// How many times one package's version list was fetched. Proves the
+    /// packument cache works, which an identical resolved graph cannot.
+    pub fn packument_calls_for(&self, name: &str) -> usize {
+        self.packument_calls_by_name
+            .lock()
+            .unwrap()
+            .get(name)
+            .copied()
+            .unwrap_or(0)
     }
 
     fn knows_package(&self, name: &str) -> bool {
@@ -197,6 +251,21 @@ impl RegistryClient for FixtureRegistry {
             }),
             None => Err(RegistryError::PackageNotFound(name.to_string())),
         }
+    }
+
+    fn packument(&self, name: &str) -> Result<Packument, RegistryError> {
+        self.packument_calls.fetch_add(1, Ordering::Relaxed);
+        *self
+            .packument_calls_by_name
+            .lock()
+            .unwrap()
+            .entry(name.to_string())
+            .or_insert(0) += 1;
+
+        self.packuments
+            .get(name)
+            .cloned()
+            .ok_or_else(|| RegistryError::PackageNotFound(name.to_string()))
     }
 
     fn fetch_tarball(&self, url: &str) -> Result<Vec<u8>, RegistryError> {
