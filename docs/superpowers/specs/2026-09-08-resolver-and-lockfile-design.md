@@ -71,6 +71,14 @@ This is a user-visible behaviour change and needs a changelog note. It also
 means the manifest now contains ranges the resolver must handle, so the root
 project is just another node with ranges, not a special case.
 
+**The lockfile is named `jerky-lock.json`.** #11 called it `jerky.lock`, by
+analogy with `Cargo.lock` and `yarn.lock`. Since the format is JSON, the
+extension is worth having: editors syntax-highlight it, `jq` and every other
+JSON tool work on it without being told what it is, and a reviewer opening it
+in a diff gets folding and structure for free. `package-lock.json` is the
+closer precedent anyway. Deciding this now is cheap; deciding it after anyone
+has committed one is a migration.
+
 **Parallel downloads are deferred.** Spec 1's design placed them here, but
 spec 2 is already a transitive resolver plus a lockfile format, and both are
 things worth getting right before making fast. Resolution is serial in this
@@ -86,7 +94,7 @@ follow-up lands. That is acceptable for a spec whose job is correctness.
 - Abbreviated packument fetching, so a package's full version list is available
 - Transitive dependency resolution: walk the graph, dedupe, handle cycles
 - Virtual store wiring for nested dependencies — each package sees its own deps
-- `jerky.lock`: deterministic, diffable, versioned, integrity-bearing
+- `jerky-lock.json`: deterministic, diffable, versioned, integrity-bearing
 - Reading the lockfile back to skip re-resolution when it is still valid
 - `jerky install <pkg>` recording a caret range
 
@@ -128,7 +136,7 @@ resolved 57 packages
 added express@4.21.2
 ```
 
-`package.json` gains `"express": "^4.21.2"`. `jerky.lock` gains 57 entries.
+`package.json` gains `"express": "^4.21.2"`. `jerky-lock.json` gains 57 entries.
 `node_modules/express` symlinks into the virtual store as before, and each of
 the 57 packages gets its own virtual store directory with its own dependencies
 linked as siblings.
@@ -141,7 +149,7 @@ Three new modules, and one existing module gains a method.
 src/
   range.rs        jerky's range type, wrapping js-semver
   resolver.rs     the transitive walk; produces a ResolvedGraph
-  lockfile.rs     ResolvedGraph <-> jerky.lock
+  lockfile.rs     ResolvedGraph <-> jerky-lock.json
   registry.rs     + packument() for the full version list
   commands/
     install.rs    orchestration, now over a graph rather than one package
@@ -430,7 +438,5 @@ trivial once bare install can read the lockfile this spec writes.
 jerky has no `uninstall` command yet, so there is no operation that would
 trigger it. Deferred until one exists.
 
-**Should `jerky.lock` be `jerky.lock` or `jerky-lock.json`?** It is JSON, and
-an extension would let editors syntax-highlight it. #11 names it `jerky.lock`
-and this spec keeps that, but it is a cheap change before anyone has committed
-one and worth deciding deliberately rather than by inertia.
+*(The lockfile filename was an open question here and is now settled — see
+§2.)*
