@@ -502,8 +502,11 @@ invisible on Linux.
 ## 11. Roadmap and issue remapping
 
 **Spec 2 — the resolver.** `jerky install express`: npm range parsing,
-transitive walk, virtual store wiring for nested dependencies, parallel
-downloads, and `jerky.lock`.
+transitive walk, virtual store wiring for nested dependencies, and
+`jerky.lock`. Designed in
+`docs/superpowers/specs/2026-09-08-resolver-and-lockfile-design.md`. Parallel
+downloads were dropped from that slice: spec 2 is already a resolver plus a
+lockfile format, and both are worth getting right before making fast.
 
 **Spec 3 — everyday use.** Bare `jerky install` from the manifest,
 `devDependencies`, scoped packages, and `node_modules/.bin` linking.
