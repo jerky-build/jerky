@@ -21,13 +21,29 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<(), JerkyError> {
+    let project_dir = std::env::current_dir().map_err(JerkyError::Cwd)?;
+
     match cli.command {
         Command::Init => {
-            let project_dir = std::env::current_dir().map_err(JerkyError::Cwd)?;
             let path = jerky::commands::init::init(&project_dir)?;
             println!("wrote {}", path.display());
             Ok(())
         }
-        Command::Install { .. } => Err(JerkyError::NotImplemented("install")),
+        Command::Install { spec } => {
+            let spec = jerky::cli::parse_package_spec(&spec)?;
+            let store = jerky::store::Store::new(store_root()?);
+            let registry = jerky::registry::HttpRegistry::new();
+            let installed =
+                jerky::commands::install::install(&project_dir, &store, &registry, &spec)?;
+            println!("added {}@{}", installed.name, installed.version);
+            Ok(())
+        }
     }
+}
+
+/// `main` is the only place allowed to read `$HOME`; everything below it takes
+/// paths as parameters so tests never touch a developer's real store.
+fn store_root() -> Result<std::path::PathBuf, JerkyError> {
+    let home = dirs::home_dir().ok_or(JerkyError::NoHomeDirectory)?;
+    Ok(home.join(".jerky").join("store"))
 }

@@ -191,13 +191,13 @@ only module aware of more than one of the others. `integrity`, `archive`,
 ### Path scheme
 
 ```
-~/.jerky/store/v1/<hex-sha512>/
+~/.jerky/store/v1/sha512-<hex>/
     global content-addressed store
 
 <project>/node_modules/.jerky/lodash@4.17.21/node_modules/lodash/
     virtual store; hard links to the store entry
 
-<project>/node_modules/lodash -> ../.jerky/lodash@4.17.21/node_modules/lodash
+<project>/node_modules/lodash -> .jerky/lodash@4.17.21/node_modules/lodash
     relative symlink for each direct dependency
 ```
 
@@ -214,7 +214,9 @@ as base64 (`sha512-Ab3x...`), but macOS filesystems are case-insensitive by
 default, so base64 keys can collide. Hex-encoding the raw digest avoids it.
 
 **Symlinks are relative**, so moving or copying a project does not break every
-link.
+link. The target carries no leading `../`: it is resolved relative to
+`node_modules/`, the directory holding the link. pnpm uses `../` only for
+links *inside* the virtual store, which sit one level deeper.
 
 ## 6. Data flow and types
 
@@ -309,7 +311,7 @@ the final store path. A killed process leaves a stray staging directory
 rather than a half-extracted package.
 
 This matters because the store is content-addressed, so the existence check
-is "does `~/.jerky/store/v1/<hex>/` exist?". A partial directory at that path
+is "does `~/.jerky/store/v1/sha512-<hex>/` exist?". A partial directory at that path
 means "present and verified" to every subsequent install, which would then
 hard-link a truncated package into a project. That is silent corruption which
 persists until someone clears the store manually, with a symptom — a module
@@ -319,7 +321,7 @@ missing half its files — that looks nothing like its cause.
 
 ```
 ~/.jerky/store/v1/.staging/<random>/     extract here
-~/.jerky/store/v1/<hex-sha512>/          rename here
+~/.jerky/store/v1/sha512-<hex>/          rename here
 ```
 
 `rename(2)` is atomic only within a single filesystem and fails with `EXDEV`
