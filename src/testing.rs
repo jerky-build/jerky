@@ -160,7 +160,7 @@ impl FixtureRegistry {
     ///
     /// This is what lets a test express a dependency *edge*: `with_package`
     /// alone can only register leaves.
-    pub fn with_packument(mut self, name: &str, versions: &[(&str, &[(&str, &str)])]) -> Self {
+    pub fn with_packument(mut self, name: &str, versions: &[FixtureVersion<'_>]) -> Self {
         for (version, dependencies) in versions {
             let tarball = build_tarball(&[TarEntry::file(
                 "package/package.json",

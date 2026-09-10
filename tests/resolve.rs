@@ -222,3 +222,124 @@ fn resolution_is_deterministic() {
     };
     assert_eq!(ids(&first), ids(&second));
 }
+
+/// A registry that serves a packument built by hand, so tests can express
+/// shapes a well-behaved fixture cannot: a dist-tag pointing at nothing, or a
+/// tag whose name is itself valid range syntax.
+struct HandBuilt {
+    versions: Vec<&'static str>,
+    tags: Vec<(&'static str, &'static str)>,
+}
+
+impl jerky::registry::RegistryClient for HandBuilt {
+    fn version_metadata(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> Result<jerky::registry::VersionMetadata, jerky::registry::RegistryError> {
+        unreachable!("the resolver only fetches packuments")
+    }
+
+    fn packument(
+        &self,
+        name: &str,
+    ) -> Result<jerky::registry::Packument, jerky::registry::RegistryError> {
+        use jerky::registry::{Dist, Packument, VersionMetadata};
+
+        let versions = self
+            .versions
+            .iter()
+            .map(|v| {
+                (
+                    v.to_string(),
+                    VersionMetadata {
+                        name: name.to_string(),
+                        version: v.to_string(),
+                        dist: Dist {
+                            tarball: format!("https://hand.test/{name}-{v}.tgz"),
+                            // sha512 of the empty string; only needs to parse.
+                            integrity: Some(
+                                "sha512-z4PhNX7vuL3xVChQ1m2AB9Yg5AULVxXcg/SpIdNs6c5H0NE8XYXysP+DGNKHfuwvY7kxvUdBeoGlODJ6+SfaPg==".into(),
+                            ),
+                            shasum: None,
+                        },
+                        dependencies: BTreeMap::new(),
+                    },
+                )
+            })
+            .collect();
+
+        Ok(Packument {
+            name: name.to_string(),
+            versions,
+            dist_tags: self
+                .tags
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        })
+    }
+
+    fn fetch_tarball(&self, _: &str) -> Result<Vec<u8>, jerky::registry::RegistryError> {
+        unreachable!("the resolver never downloads")
+    }
+}
+
+#[test]
+fn a_dangling_dist_tag_is_an_error_not_a_panic() {
+    // Unpublishing a version leaves its dist-tag behind, so this is a shape the
+    // real registry produces. Trusting the tag's target would panic on lookup.
+    let registry = HandBuilt {
+        versions: vec!["1.0.0"],
+        tags: vec![("latest", "9.9.9")],
+    };
+
+    let err = resolve(&registry, &roots(&[("a", "latest")])).unwrap_err();
+
+    match err {
+        ResolveError::DanglingTag { name, tag, version } => {
+            assert_eq!(
+                (name.as_str(), tag.as_str(), version.as_str()),
+                ("a", "latest", "9.9.9")
+            );
+        }
+        other => panic!("wrong error: {other:?}"),
+    }
+}
+
+#[test]
+fn a_dist_tag_cannot_shadow_a_real_range() {
+    // Ranges are parsed before tags are consulted. Otherwise a registry could
+    // publish a tag literally named `^1.0.0` and redefine what that range
+    // selects — here, dragging a caret range up to a major it excludes.
+    let registry = HandBuilt {
+        versions: vec!["1.0.0", "1.5.0", "9.9.9"],
+        tags: vec![("^1.0.0", "9.9.9")],
+    };
+
+    let graph = resolve(&registry, &roots(&[("a", "^1.0.0")])).unwrap();
+
+    let chosen = &graph.packages.keys().next().unwrap().version;
+    assert_eq!(chosen, "1.5.0", "the tag overrode the range");
+}
+
+#[test]
+fn a_spec_that_is_neither_a_range_nor_a_tag_is_reported() {
+    let registry = HandBuilt {
+        versions: vec!["1.0.0"],
+        tags: vec![("latest", "1.0.0"), ("next", "1.0.0")],
+    };
+
+    let err = resolve(&registry, &roots(&[("a", "nonsense-spec")])).unwrap_err();
+
+    match err {
+        ResolveError::UnresolvableSpec { name, spec, tags } => {
+            assert_eq!(name, "a");
+            assert_eq!(spec, "nonsense-spec");
+            // The error names what it could have been, rather than only what it wasn't.
+            assert!(tags.contains(&"latest".to_string()));
+            assert!(tags.contains(&"next".to_string()));
+        }
+        other => panic!("wrong error: {other:?}"),
+    }
+}

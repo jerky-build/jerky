@@ -25,6 +25,20 @@ pub enum ResolveError {
         range: String,
         available: Vec<String>,
     },
+    #[error(
+        "`{name}` has a `{tag}` tag pointing at version `{version}`, which it does not publish"
+    )]
+    DanglingTag {
+        name: String,
+        tag: String,
+        version: String,
+    },
+    #[error("`{spec}` is neither a valid version range nor a dist-tag of `{name}` (tags: {})", tags.join(", "))]
+    UnresolvableSpec {
+        name: String,
+        spec: String,
+        tags: Vec<String>,
+    },
     #[error("`{name}@{version}` has no usable integrity hash")]
     Integrity {
         name: String,
@@ -122,10 +136,13 @@ pub fn resolve(
         let packument = packuments
             .get(&id.name)
             .expect("select fetched this packument");
+        // Both paths in `select` check membership before returning: the range
+        // path picks from `versions_sorted`, and the tag path rejects a
+        // dangling target. Neither can hand back a version that is absent.
         let metadata = packument
             .versions
             .get(&id.version)
-            .expect("select chose this version from this packument");
+            .expect("select verified this version is present");
 
         let integrity = metadata
             .dist
@@ -183,12 +200,12 @@ fn select(
     }
     let packument = &packuments[name];
 
-    // A dist-tag is not a range, so the tag table is consulted first. This is
-    // the same mechanism spec 1's single-version path uses for `latest`.
-    let version = match packument.resolve_tag(range) {
-        Some(tagged) => tagged.to_string(),
-        None => {
-            let parsed = Range::parse(range)?;
+    // Range syntax is tried first, and a dist-tag is only the fallback for a
+    // spec that is not a range at all. npm resolves in this order for a
+    // reason: were tags consulted first, a registry could publish a tag named
+    // `^1.0.0` and silently override what that range means.
+    let version = match Range::parse(range) {
+        Ok(parsed) => {
             let available = packument.versions_sorted();
             match parsed.max_satisfying(&available) {
                 Some(chosen) => chosen.as_str().to_string(),
@@ -201,6 +218,28 @@ fn select(
                 }
             }
         }
+        Err(_) => match packument.resolve_tag(range) {
+            Some(tagged) => {
+                // A tag is a pointer the registry maintains, and it can dangle:
+                // unpublishing a version leaves the tag behind. Trusting it
+                // blindly would panic on the lookup further down.
+                if !packument.versions.contains_key(tagged) {
+                    return Err(ResolveError::DanglingTag {
+                        name: name.to_string(),
+                        tag: range.to_string(),
+                        version: tagged.to_string(),
+                    });
+                }
+                tagged.to_string()
+            }
+            None => {
+                return Err(ResolveError::UnresolvableSpec {
+                    name: name.to_string(),
+                    spec: range.to_string(),
+                    tags: packument.dist_tags.keys().cloned().collect(),
+                });
+            }
+        },
     };
 
     let id = PackageId {
