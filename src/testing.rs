@@ -99,6 +99,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use crate::integrity::Integrity;
 use crate::registry::{Dist, Packument, RegistryClient, RegistryError, VersionMetadata};
 
+/// One version in a fixture: its number and the dependencies it declares.
+pub type FixtureVersion<'a> = (&'a str, &'a [(&'a str, &'a str)]);
+
+/// One entry in a fixture tree: a package name, a version, and its
+/// dependencies as `(name, range)` pairs.
+pub type FixtureEntry<'a> = (&'a str, &'a str, &'a [(&'a str, &'a str)]);
+
 /// An in-memory registry for tests.
 ///
 /// Counts its calls so tests can prove the store-hit path was taken rather
@@ -153,7 +160,7 @@ impl FixtureRegistry {
     ///
     /// This is what lets a test express a dependency *edge*: `with_package`
     /// alone can only register leaves.
-    pub fn with_packument(mut self, name: &str, versions: &[(&str, &[(&str, &str)])]) -> Self {
+    pub fn with_packument(mut self, name: &str, versions: &[FixtureVersion<'_>]) -> Self {
         for (version, dependencies) in versions {
             let tarball = build_tarball(&[TarEntry::file(
                 "package/package.json",
@@ -181,6 +188,27 @@ impl FixtureRegistry {
 
             self.tarballs.insert(url, tarball);
             self.register(name, version, metadata);
+        }
+        self
+    }
+
+    /// Register a whole dependency tree as a flat list of
+    /// `(name, version, &[(dep_name, dep_range)])`.
+    ///
+    /// Entries for the same name are collected into one packument, so a tree
+    /// can list several versions of a package the way a real registry holds
+    /// them. This reads as a tree at the call site, which is what the
+    /// resolver's tests are about:
+    ///
+    /// ```ignore
+    /// FixtureRegistry::new().with_tree(&[
+    ///     ("a", "1.0.0", &[("b", "^1.0.0")]),
+    ///     ("b", "1.0.0", &[]),
+    /// ]);
+    /// ```
+    pub fn with_tree(mut self, entries: &[FixtureEntry<'_>]) -> Self {
+        for (name, version, dependencies) in entries {
+            self = self.with_packument(name, &[(version, dependencies)]);
         }
         self
     }
@@ -386,5 +414,29 @@ mod tests {
         assert_eq!(registry.packument_calls_for("a"), 2);
         assert_eq!(registry.packument_calls_for("b"), 1);
         assert_eq!(registry.packument_calls(), 3, "the total is the sum");
+    }
+}
+
+#[cfg(test)]
+mod tree_tests {
+    use super::*;
+    use crate::registry::RegistryClient;
+
+    #[test]
+    fn with_tree_collects_repeated_names_into_one_packument() {
+        // Two versions of `d` listed separately must not clobber each other:
+        // a registry holds both, and the conflict test depends on it.
+        let registry = FixtureRegistry::new().with_tree(&[
+            ("d", "1.5.0", &[]),
+            ("d", "2.1.0", &[]),
+            ("a", "1.0.0", &[("d", "^1.0.0")]),
+        ]);
+
+        let d = registry.packument("d").unwrap();
+        assert_eq!(d.versions.len(), 2);
+        assert_eq!(d.resolve_tag("latest"), Some("2.1.0"));
+
+        let a = registry.packument("a").unwrap();
+        assert_eq!(a.versions["1.0.0"].dependencies["d"], "^1.0.0");
     }
 }
