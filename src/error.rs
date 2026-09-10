@@ -5,6 +5,7 @@ use crate::cli::CliError;
 use crate::commands::install::InstallError;
 use crate::integrity::IntegrityError;
 use crate::linker::LinkError;
+use crate::lockfile::LockfileError;
 use crate::manifest::ManifestError;
 use crate::range::RangeError;
 use crate::registry::RegistryError;
@@ -31,6 +32,8 @@ pub enum JerkyError {
     Registry(#[from] RegistryError),
     #[error(transparent)]
     Resolve(#[from] ResolveError),
+    #[error(transparent)]
+    Lockfile(#[from] LockfileError),
     #[error(transparent)]
     Install(#[from] InstallError),
     #[error("could not determine the current directory")]
