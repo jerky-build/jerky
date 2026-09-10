@@ -74,6 +74,10 @@ concrete version for a registry package, or `link:<path>` for a local one. So
 local and registry dependencies need no separate mechanism, and the top-level
 linker can read the resolved identity instead of re-deriving it.
 
+**Members are discovered from `package.json`'s `workspaces` field.** npm and
+yarn's mechanism, so an existing monorepo is a jerky workspace with no new file.
+§4 works through what that implies.
+
 **One virtual store, at the workspace root.** Every importer's `node_modules`
 holds symlinks into `<root>/node_modules/.jerky/`. Two projects depending on the
 same version share one hard-linked copy, which is the whole point of the store
@@ -105,35 +109,55 @@ are in the repo.
 | Task orchestration across the graph | #13, #18 — this spec is what unblocks them |
 | Nested workspaces | Rare, and pnpm does not support them either |
 
-## 4. Discovery — the one open decision
+## 4. Discovery
 
-Which directories are workspace members has three plausible answers, and they
-are not equivalent.
+**Members come from the `workspaces` field of the root `package.json`.**
 
-**(a) `package.json`'s `workspaces` field.** What npm and yarn read.
 ```json
 { "workspaces": ["packages/*", "apps/*"] }
 ```
-Its advantage is decisive for adoption: an existing npm or yarn monorepo is a
-jerky workspace with no new file. The design's stated ambition is "an
-npm-compatible package manager", and this is where compatibility is cheapest.
 
-**(b) A `jerky-workspace.json`.** pnpm's approach, with its own file. Cleaner
-separation, but it makes trying jerky on an existing repo a migration rather
-than a command.
+This is what npm and yarn read, and the reason to match them is adoption: an
+existing npm or yarn monorepo is a jerky workspace with no new file and no
+migration step. The stated ambition is "an npm-compatible package manager", and
+this is where compatibility is cheapest to keep. pnpm's own file was the
+alternative, and it was rejected for exactly that reason — it would make trying
+jerky on an existing repo a conversion rather than a command.
 
-**(c) jerky's config file, #12.** #12 exists to "describe a project and its
-targets", which is adjacent — the orchestrator needs to know the same
-directories.
+What that decision implies, spelled out so it is not re-derived per
+implementation:
 
-**Recommendation: (a) now, with (c) able to extend it later.** Read
-`workspaces` from the root `package.json`, treat its absence as a
-single-importer workspace, and let #12's config add orchestrator-only metadata
-about the same directories rather than redeclaring them. Two files disagreeing
-about which directories are members would be a bug generator, so whichever
-comes second must extend rather than duplicate.
+**Absence means a single-importer workspace.** A `package.json` with no
+`workspaces` field is a workspace of one, keyed `.`. Every mechanism in this
+spec applies unchanged, so there is no separate single-project code path to
+keep working — the common case is the degenerate case, which is the property
+worth having.
 
-This is the decision most worth challenging before implementation.
+**Patterns are globs, matched against directories, and each match must contain
+a `package.json`.** A glob matching a directory without one is skipped rather
+than an error: `packages/*` in a repo with a stray `packages/.cache` should not
+fail an install. A glob matching *nothing* is worth a warning, since it is
+usually a typo.
+
+**The root is always an importer, whether or not it declares dependencies.**
+Tooling-only dependencies commonly live at the root, and treating it as an
+ordinary member keyed `.` avoids a special case. This resolves the first of
+§10's open questions.
+
+**Membership is a set of directories, not names.** Two members declaring the
+same package name is invalid, and the error names both directories rather than
+complaining about a duplicate key — a name collision is found by looking at
+paths, so the paths are what the message should carry.
+
+**#12 extends, never redeclares.** jerky's config file describes projects and
+their targets, which is the same set of directories seen through a different
+lens. It may add orchestrator metadata to a member; it may not decide who the
+members are. Two files disagreeing about membership would be a bug generator,
+and the tie-break should never need to exist.
+
+**A member is not required to be published.** `"private": true` packages are
+ordinary members. Publishability is a property of a package, not of workspace
+membership.
 
 ## 5. Layout
 
@@ -289,11 +313,14 @@ class of change as the intra-store `../` correction they already carry.
 
 ## 10. Open questions
 
-**Does the root `package.json` also declare dependencies?** npm and pnpm both
-allow it, and tooling-only dependencies commonly live there. This spec assumes
-yes, with `.` as an ordinary importer, but a workspace whose root is purely a
-container is also a defensible convention.
+**How should a member outside the workspace root be handled?** npm allows a
+`workspaces` glob to escape the root with `../`. It is rare and arguably a
+misconfiguration, but silently including a directory outside the repo has the
+same shape as the tar-slip class spec 1 guards against, so it wants a decision
+rather than a default.
 
-**What happens when two members share a name?** It is invalid, but the error
-should name both directories rather than complaining about a duplicate key.
-Cheap to get right, easy to forget.
+**Should `jerky install <pkg>` in a non-member subdirectory be an error?**
+Standing in `packages/ui/src` clearly means the `packages/ui` importer, but
+standing in a directory that belongs to no member is ambiguous — it could mean
+the root, or it could mean the user is lost. Erroring is probably kinder than
+guessing.
