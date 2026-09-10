@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use jerky::lockfile::{self, LockfileError};
+use jerky::lockfile::{self, LOCKFILE_NAME, LockfileError};
 use jerky::resolver::resolve;
 use jerky::testing::FixtureRegistry;
 use tempfile::TempDir;
@@ -22,7 +22,7 @@ fn small_tree() -> FixtureRegistry {
 }
 
 fn read(dir: &TempDir) -> String {
-    std::fs::read_to_string(dir.path().join("jerky-lock.json")).unwrap()
+    std::fs::read_to_string(dir.path().join(LOCKFILE_NAME)).unwrap()
 }
 
 #[test]
@@ -155,7 +155,7 @@ fn an_unknown_lockfile_version_is_refused() {
     // not understand is how a tool silently installs the wrong tree.
     let dir = TempDir::new().unwrap();
     std::fs::write(
-        dir.path().join("jerky-lock.json"),
+        dir.path().join(LOCKFILE_NAME),
         r#"{"lockfileVersion": 99, "root": {}, "packages": {}}"#,
     )
     .unwrap();
@@ -169,7 +169,7 @@ fn an_unknown_lockfile_version_is_refused() {
 #[test]
 fn a_malformed_lockfile_is_refused_not_ignored() {
     let dir = TempDir::new().unwrap();
-    std::fs::write(dir.path().join("jerky-lock.json"), "{ not json").unwrap();
+    std::fs::write(dir.path().join(LOCKFILE_NAME), "{ not json").unwrap();
     assert!(matches!(
         lockfile::load(dir.path()),
         Err(LockfileError::Malformed { .. })
@@ -182,7 +182,7 @@ fn an_unusable_integrity_hash_is_refused() {
     // a lockfile carrying one jerky cannot parse is not usable.
     let dir = TempDir::new().unwrap();
     std::fs::write(
-        dir.path().join("jerky-lock.json"),
+        dir.path().join(LOCKFILE_NAME),
         r#"{"lockfileVersion": 1, "root": {},
             "packages": { "a@1.0.0": {
                 "version": "1.0.0",
@@ -202,7 +202,7 @@ fn an_unusable_integrity_hash_is_refused() {
 fn a_key_that_is_not_name_at_version_is_refused() {
     let dir = TempDir::new().unwrap();
     std::fs::write(
-        dir.path().join("jerky-lock.json"),
+        dir.path().join(LOCKFILE_NAME),
         r#"{"lockfileVersion": 1, "root": {},
             "packages": { "no-at-sign": {
                 "version": "1.0.0",
@@ -225,7 +225,7 @@ fn a_scoped_package_key_splits_on_the_last_at() {
     // yield the name `@types/node`, not `@types`.
     let dir = TempDir::new().unwrap();
     std::fs::write(
-        dir.path().join("jerky-lock.json"),
+        dir.path().join(LOCKFILE_NAME),
         r#"{"lockfileVersion": 1, "root": {},
             "packages": { "@types/node@20.1.0": {
                 "version": "20.1.0",
@@ -270,4 +270,112 @@ fn the_lockfile_records_edges_and_integrity() {
     assert_eq!(a["dependencies"]["b"], "1.0.0");
     // And the root records the range, which is what makes staleness detectable.
     assert_eq!(parsed["root"]["a"], "^1.0.0");
+}
+
+/// A valid sha512 SSRI string. Content is irrelevant; it only has to parse.
+const HASH: &str = "sha512-z4PhNX7vuL3xVChQ1m2AB9Yg5AULVxXcg/SpIdNs6c5H0NE8XYXysP+DGNKHfuwvY7kxvUdBeoGlODJ6+SfaPg==";
+
+fn write_raw(dir: &TempDir, body: &str) {
+    std::fs::write(dir.path().join(LOCKFILE_NAME), body).unwrap();
+}
+
+#[test]
+fn a_key_disagreeing_with_its_entry_is_refused() {
+    // Two distinct keys whose entries both claim 1.0.0. Taking the name from
+    // the key and the version from the entry would collapse them into one
+    // package, silently dropping a dependency and keeping the wrong tarball
+    // URL. Exactly what hand-editing a lockfile produces.
+    let dir = TempDir::new().unwrap();
+    write_raw(
+        &dir,
+        &format!(
+            r#"{{"lockfileVersion":1,"root":{{}},"packages":{{
+                "b@1.0.0": {{"version":"1.0.0","resolved":"https://r.test/u1.tgz","integrity":"{HASH}"}},
+                "b@2.0.0": {{"version":"1.0.0","resolved":"https://r.test/u2.tgz","integrity":"{HASH}"}}
+            }}}}"#
+        ),
+    );
+
+    assert!(matches!(
+        lockfile::load(dir.path()),
+        Err(LockfileError::KeyVersionMismatch { .. })
+    ));
+}
+
+#[test]
+fn an_edge_pointing_at_nothing_is_refused() {
+    // A graph with a dangling edge cannot be installed. Saying so beats
+    // discovering it halfway through linking.
+    let dir = TempDir::new().unwrap();
+    write_raw(
+        &dir,
+        &format!(
+            r#"{{"lockfileVersion":1,"root":{{}},"packages":{{
+                "a@1.0.0": {{"version":"1.0.0","resolved":"https://r.test/a.tgz","integrity":"{HASH}",
+                             "dependencies":{{"ghost":"9.9.9"}}}}
+            }}}}"#
+        ),
+    );
+
+    match lockfile::load(dir.path()) {
+        Err(LockfileError::DanglingEdge {
+            entry, dependency, ..
+        }) => {
+            assert_eq!(entry, "a@1.0.0");
+            assert_eq!(dependency, "ghost@9.9.9");
+        }
+        other => panic!("expected a dangling edge error, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_edge_resolved_later_in_the_file_is_accepted() {
+    // The dangling check must run after every node is known: `a` depends on
+    // `b`, which sorts after it. A per-entry check would reject this.
+    let dir = TempDir::new().unwrap();
+    write_raw(
+        &dir,
+        &format!(
+            r#"{{"lockfileVersion":1,"root":{{}},"packages":{{
+                "a@1.0.0": {{"version":"1.0.0","resolved":"https://r.test/a.tgz","integrity":"{HASH}",
+                             "dependencies":{{"b":"1.0.0"}}}},
+                "b@1.0.0": {{"version":"1.0.0","resolved":"https://r.test/b.tgz","integrity":"{HASH}"}}
+            }}}}"#
+        ),
+    );
+
+    let graph = lockfile::load(dir.path()).unwrap().unwrap();
+    assert_eq!(graph.packages.len(), 2);
+}
+
+#[test]
+fn a_future_format_says_upgrade_rather_than_malformed() {
+    // A plausible v2 with entirely different field names. It is valid JSON, so
+    // reporting a syntax error would send the user hunting for one.
+    let dir = TempDir::new().unwrap();
+    write_raw(
+        &dir,
+        r#"{"lockfileVersion":2,"importers":{},"snapshots":{}}"#,
+    );
+
+    match lockfile::load(dir.path()) {
+        Err(LockfileError::UnsupportedVersion {
+            found, supported, ..
+        }) => {
+            assert_eq!((found, supported), (2, lockfile::LOCKFILE_VERSION));
+        }
+        other => panic!("expected an upgrade message, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_file_without_a_version_field_is_malformed() {
+    // Distinct from an unknown version: there is nothing to act on.
+    let dir = TempDir::new().unwrap();
+    write_raw(&dir, r#"{"root":{},"packages":{}}"#);
+
+    assert!(matches!(
+        lockfile::load(dir.path()),
+        Err(LockfileError::Malformed { .. })
+    ));
 }

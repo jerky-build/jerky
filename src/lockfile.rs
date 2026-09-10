@@ -40,8 +40,25 @@ pub enum LockfileError {
     },
     #[error("{path} records `{entry}`, which is not a valid name@version key")]
     BadKey { path: PathBuf, entry: String },
+    #[error("{path} keys `{entry}` but records version `{declared}` inside it")]
+    KeyVersionMismatch {
+        path: PathBuf,
+        entry: String,
+        declared: String,
+    },
+    #[error("{path} has `{entry}` depending on `{dependency}`, which it does not record")]
+    DanglingEdge {
+        path: PathBuf,
+        entry: String,
+        dependency: String,
+    },
     #[error("{path} records an unusable integrity hash for `{entry}`")]
-    BadIntegrity { path: PathBuf, entry: String },
+    BadIntegrity {
+        path: PathBuf,
+        entry: String,
+        #[source]
+        source: crate::integrity::IntegrityError,
+    },
     #[error("failed to access {path}")]
     Io {
         path: PathBuf,
@@ -62,6 +79,13 @@ struct OnDisk {
     /// the graph would reindent every descendant when something deep changes;
     /// flat means adding a dependency appends a block and touches nothing else.
     packages: BTreeMap<String, Entry>,
+}
+
+/// Just enough of a lockfile to read its version, whatever else it holds.
+#[derive(Deserialize)]
+struct VersionProbe {
+    #[serde(rename = "lockfileVersion")]
+    lockfile_version: u32,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -134,33 +158,55 @@ pub fn load(project_dir: &Path) -> Result<Option<ResolvedGraph>, LockfileError> 
         Err(source) => return Err(LockfileError::Io { path, source }),
     };
 
+    // The version is read before the file is parsed as the *current* schema,
+    // and the order matters. A future format may be perfectly valid JSON while
+    // naming entirely different fields; deserializing first would report it as
+    // malformed, which is both wrong and unhelpful — the user needs to be told
+    // to upgrade jerky, not to go hunting for a syntax error.
+    let probe: VersionProbe =
+        serde_json::from_str(&raw).map_err(|source| LockfileError::Malformed {
+            path: path.clone(),
+            source,
+        })?;
+
+    if probe.lockfile_version != LOCKFILE_VERSION {
+        return Err(LockfileError::UnsupportedVersion {
+            path,
+            found: probe.lockfile_version,
+            supported: LOCKFILE_VERSION,
+        });
+    }
+
     let on_disk: OnDisk =
         serde_json::from_str(&raw).map_err(|source| LockfileError::Malformed {
             path: path.clone(),
             source,
         })?;
 
-    // Checked before anything else is trusted: a file from a future format may
-    // parse as JSON while meaning something entirely different.
-    if on_disk.lockfile_version != LOCKFILE_VERSION {
-        return Err(LockfileError::UnsupportedVersion {
-            path,
-            found: on_disk.lockfile_version,
-            supported: LOCKFILE_VERSION,
-        });
-    }
-
     let mut packages = BTreeMap::new();
     for (key, entry) in on_disk.packages {
-        let (name, _) = split_key(&key).ok_or_else(|| LockfileError::BadKey {
+        let (name, keyed_version) = split_key(&key).ok_or_else(|| LockfileError::BadKey {
             path: path.clone(),
             entry: key.clone(),
         })?;
 
+        // The key and the entry state the version twice, so they can disagree.
+        // Trusting one and ignoring the other lets two keys collapse into one
+        // package — silently dropping a dependency while keeping the wrong
+        // tarball URL — which is exactly what a hand-edited lockfile produces.
+        if keyed_version != entry.version {
+            return Err(LockfileError::KeyVersionMismatch {
+                path,
+                entry: key.clone(),
+                declared: entry.version.clone(),
+            });
+        }
+
         let integrity =
-            Integrity::parse(&entry.integrity).map_err(|_| LockfileError::BadIntegrity {
+            Integrity::parse(&entry.integrity).map_err(|source| LockfileError::BadIntegrity {
                 path: path.clone(),
                 entry: key.clone(),
+                source,
             })?;
 
         let id = PackageId {
@@ -191,6 +237,22 @@ pub fn load(project_dir: &Path) -> Result<Option<ResolvedGraph>, LockfileError> 
                 dependencies,
             },
         );
+    }
+
+    // Edges are checked only once every node is known, since a dependency may
+    // be recorded after its dependent. An edge pointing at nothing means the
+    // graph cannot be installed, and saying so beats discovering it halfway
+    // through linking.
+    for package in packages.values() {
+        for dependency in package.dependencies.values() {
+            if !packages.contains_key(dependency) {
+                return Err(LockfileError::DanglingEdge {
+                    path,
+                    entry: package.id.to_string(),
+                    dependency: dependency.to_string(),
+                });
+            }
+        }
     }
 
     Ok(Some(ResolvedGraph {
