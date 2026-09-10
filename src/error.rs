@@ -8,6 +8,7 @@ use crate::linker::LinkError;
 use crate::manifest::ManifestError;
 use crate::range::RangeError;
 use crate::registry::RegistryError;
+use crate::resolver::ResolveError;
 use crate::store::StoreError;
 
 #[derive(Debug, Error)]
@@ -28,6 +29,8 @@ pub enum JerkyError {
     Range(#[from] RangeError),
     #[error(transparent)]
     Registry(#[from] RegistryError),
+    #[error(transparent)]
+    Resolve(#[from] ResolveError),
     #[error(transparent)]
     Install(#[from] InstallError),
     #[error("could not determine the current directory")]

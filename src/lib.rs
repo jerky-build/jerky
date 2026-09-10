@@ -7,6 +7,7 @@ pub mod linker;
 pub mod manifest;
 pub mod range;
 pub mod registry;
+pub mod resolver;
 mod staging;
 pub mod store;
 pub mod testing;

@@ -389,6 +389,30 @@ mod tests {
     }
 
     #[test]
+    fn dev_dependencies_are_dropped_at_deserialization() {
+        // The abbreviated packument really does carry devDependencies — a live
+        // express version has them — so this is not hypothetical. Having no
+        // field for them is precisely the mechanism that drops them, and a
+        // dependency's dev dependencies must never be followed: doing so pulls
+        // in most of the registry.
+        let raw = r#"{
+            "name": "a", "version": "1.0.0",
+            "dist": { "tarball": "https://r.test/a.tgz" },
+            "dependencies": { "runtime-dep": "^1.0.0" },
+            "devDependencies": { "test-only-dep": "^2.0.0" }
+        }"#;
+
+        let metadata: VersionMetadata = serde_json::from_str(raw).unwrap();
+
+        assert_eq!(metadata.dependencies.len(), 1);
+        assert_eq!(metadata.dependencies["runtime-dep"], "^1.0.0");
+        assert!(
+            !metadata.dependencies.contains_key("test-only-dep"),
+            "a devDependency leaked into the runtime dependency map"
+        );
+    }
+
+    #[test]
     fn packument_skips_versions_it_cannot_parse() {
         // The registry has accumulated some genuinely malformed versions over
         // the years. One bad entry must not make a package unresolvable.
