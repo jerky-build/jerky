@@ -120,14 +120,29 @@ impl ImporterPath {
         if path.is_absolute() {
             return Err(ImporterPathError::Absolute(raw));
         }
+
+        // Rebuilt from its `Normal` components rather than stored verbatim.
+        // Refusing an escape is only half the job: `packages/ui`,
+        // `./packages/ui`, `packages//ui` and `packages/ui/` all name one
+        // directory, and keeping them as distinct keys would give that one
+        // directory several importers — and, once linking exists, several
+        // `node_modules`. This mirrors `archive::strip_prefix_component`,
+        // which rebuilds for the same reason.
+        let mut normalized = PathBuf::new();
         for component in path.components() {
             match component {
-                Component::Normal(_) | Component::CurDir => {}
+                Component::Normal(part) => normalized.push(part),
+                Component::CurDir => {}
                 _ => return Err(ImporterPathError::EscapesRoot(raw)),
             }
         }
 
-        Ok(ImporterPath(raw))
+        if normalized.as_os_str().is_empty() {
+            // Something like `./` or `.` that normalized away.
+            return Ok(ImporterPath::root());
+        }
+
+        Ok(ImporterPath(normalized.to_string_lossy().into_owned()))
     }
 
     pub fn as_str(&self) -> &str {
@@ -147,10 +162,8 @@ impl ImporterPath {
         if self.is_root() {
             0
         } else {
-            Path::new(&self.0)
-                .components()
-                .filter(|c| matches!(c, Component::Normal(_)))
-                .count()
+            // Normalized at construction, so every component is a plain name.
+            self.0.split('/').count()
         }
     }
 }

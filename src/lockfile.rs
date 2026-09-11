@@ -70,6 +70,15 @@ pub enum LockfileError {
         entry: String,
         dependency: String,
     },
+    #[error(
+        "{path} has importer `{importer}` linking `{name}` to `{target}`, which leaves the workspace"
+    )]
+    LinkEscapesWorkspace {
+        path: PathBuf,
+        importer: String,
+        name: String,
+        target: String,
+    },
     #[error("{path} records an unusable integrity hash for `{entry}`")]
     BadIntegrity {
         path: PathBuf,
@@ -114,9 +123,18 @@ struct OnDiskImporter {
 struct OnDiskDependency {
     /// What the manifest asked for, verbatim.
     specifier: String,
-    /// What it resolved to: a concrete version, or `link:<path>` for a
-    /// workspace member. The prefix is the only place `Resolution`'s two cases
-    /// are spelled rather than typed.
+    /// What it resolved to, in one of three forms:
+    ///
+    /// - `4.17.21` — a registry package whose name matches the key it is
+    ///   declared under, which is the overwhelmingly common case.
+    /// - `safe-execa@0.3.0` — a registry package whose name *differs* from the
+    ///   key, i.e. an alias. Without the name the package would be
+    ///   unidentifiable, since the key is the local name rather than the real
+    ///   one. This is pnpm's encoding, taken from its own lockfile.
+    /// - `link:../../packages/ui` — a workspace member, linked in place.
+    ///
+    /// The spelling exists only here; above this boundary it is a
+    /// `Resolution`, so consumers cannot forget a case.
     version: String,
 }
 
@@ -150,6 +168,34 @@ struct Entry {
 fn split_key(key: &str) -> Option<(&str, &str)> {
     key.rsplit_once('@')
         .filter(|(name, version)| !name.is_empty() && !version.is_empty())
+}
+
+/// Does a `link:` target, read relative to its importer, stay inside the
+/// workspace?
+///
+/// Walked rather than canonicalized because the directories need not exist
+/// yet: a lockfile is read before anything is linked.
+fn stays_within_workspace(importer: &ImporterPath, target: &Path) -> bool {
+    if target.is_absolute() {
+        return false;
+    }
+
+    let mut depth = importer.depth() as isize;
+    for component in target.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                depth -= 1;
+                if depth < 0 {
+                    return false;
+                }
+            }
+            std::path::Component::Normal(_) => depth += 1,
+            std::path::Component::CurDir => {}
+            // A prefix or root component means it was not relative after all.
+            _ => return false,
+        }
+    }
+    true
 }
 
 pub fn save(graph: &ResolvedGraph, project_dir: &Path) -> Result<(), LockfileError> {
@@ -189,7 +235,14 @@ pub fn save(graph: &ResolvedGraph, project_dir: &Path) -> Result<(), LockfileErr
                                 OnDiskDependency {
                                     specifier: dependency.specifier.clone(),
                                     version: match &dependency.resolution {
-                                        Resolution::Registry(id) => id.version.clone(),
+                                        // The name is written only when it
+                                        // differs from the key, so an ordinary
+                                        // dependency stays terse and an alias
+                                        // stays identifiable.
+                                        Resolution::Registry(id) if &id.name == name => {
+                                            id.version.clone()
+                                        }
+                                        Resolution::Registry(id) => id.to_string(),
                                         Resolution::Local(target) => {
                                             format!("{LINK_PREFIX}{}", target.display())
                                         }
@@ -342,24 +395,50 @@ pub fn load(project_dir: &Path) -> Result<Option<ResolvedGraph>, LockfileError> 
         let mut dependencies = BTreeMap::new();
         for (name, dependency) in on_disk_importer.dependencies {
             let resolution = match dependency.version.strip_prefix(LINK_PREFIX) {
-                Some(target) => Resolution::Local(PathBuf::from(target)),
+                Some(target) => {
+                    // A link legitimately climbs out of the importer — that is
+                    // how `apps/web` reaches `packages/ui` — but it must not
+                    // climb out of the *workspace*. Untrusted file, same
+                    // escape class as the importer key beside it.
+                    let target = PathBuf::from(target);
+                    if !stays_within_workspace(&importer_path, &target) {
+                        return Err(LockfileError::LinkEscapesWorkspace {
+                            path,
+                            importer: raw.clone(),
+                            name: name.clone(),
+                            target: dependency.version.clone(),
+                        });
+                    }
+                    Resolution::Local(target)
+                }
                 None => {
-                    // The name a dependency is declared under need not be the
-                    // package it resolves to — `execa` declared as
-                    // `npm:safe-execa@0.3.0` is a real example — so the target
-                    // is looked up by the version recorded against it, and
-                    // having no such package is an error rather than a
-                    // fabricated node.
-                    let id = packages
-                        .keys()
-                        .find(|id| id.name == name && id.version == dependency.version)
-                        .cloned()
-                        .ok_or_else(|| LockfileError::UnknownImporterDependency {
+                    // The key is the name a dependency is declared *under*,
+                    // which for an alias is not the package it resolves to.
+                    // `execa` recorded as `safe-execa@0.3.0` is real — it is
+                    // in pnpm's own lockfile — so the recorded value carries
+                    // the name whenever it differs, and only falls back to the
+                    // key when it does not.
+                    let id = match split_key(&dependency.version) {
+                        Some((aliased_name, version)) => PackageId {
+                            name: aliased_name.to_string(),
+                            version: version.to_string(),
+                        },
+                        None => PackageId {
+                            name: name.clone(),
+                            version: dependency.version.clone(),
+                        },
+                    };
+
+                    // Keyed lookup rather than a scan: `packages` is already a
+                    // map on exactly this, and the scan was O(deps × packages).
+                    if !packages.contains_key(&id) {
+                        return Err(LockfileError::UnknownImporterDependency {
                             path: path.clone(),
                             importer: raw.clone(),
                             name: name.clone(),
                             version: dependency.version.clone(),
-                        })?;
+                        });
+                    }
                     Resolution::Registry(id)
                 }
             };

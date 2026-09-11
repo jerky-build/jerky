@@ -561,19 +561,174 @@ fn an_importer_dependency_naming_no_package_is_refused() {
 #[test]
 fn an_alias_round_trips() {
     // `execa` declared as `npm:safe-execa@0.3.0` is real — it is in pnpm's own
-    // lockfile. The importer's key is the local name; spec 2's review called
-    // this latent and unreachable, and it is neither.
+    // lockfile. The package it resolves to is named `safe-execa`, NOT `execa`,
+    // which is the whole point: a test whose package entry is keyed `execa@…`
+    // is not testing an alias at all.
+    use jerky::resolver::{ImporterPath, Resolution};
+
     let dir = TempDir::new().unwrap();
     write_raw(
         &dir,
         &format!(
             r#"{{"lockfileVersion":1,
-                "importers":{{".":{{"dependencies":{{"execa":{{"specifier":"npm:safe-execa@0.3.0","version":"0.3.0"}}}}}}}},
-                "packages":{{"execa@0.3.0":{{"version":"0.3.0","resolved":"https://r.test/e.tgz","integrity":"{HASH}"}}}}}}"#
+                "importers":{{".":{{"dependencies":{{"execa":{{"specifier":"npm:safe-execa@0.3.0","version":"safe-execa@0.3.0"}}}}}}}},
+                "packages":{{"safe-execa@0.3.0":{{"version":"0.3.0","resolved":"https://r.test/se.tgz","integrity":"{HASH}"}}}}}}"#
         ),
     );
 
     let graph = lockfile::load(dir.path()).unwrap().unwrap();
-    let root = &graph.importers[&jerky::resolver::ImporterPath::root()];
-    assert_eq!(root.dependencies["execa"].specifier, "npm:safe-execa@0.3.0");
+    let root = &graph.importers[&ImporterPath::root()];
+    let execa = &root.dependencies["execa"];
+
+    assert_eq!(execa.specifier, "npm:safe-execa@0.3.0");
+    match &execa.resolution {
+        Resolution::Registry(id) => {
+            assert_eq!(
+                id.name, "safe-execa",
+                "the resolution must name the real package"
+            );
+            assert_eq!(id.version, "0.3.0");
+        }
+        other => panic!("expected a registry resolution, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_alias_survives_a_save_and_load_cycle() {
+    // The half the raw-JSON test cannot cover: that `save` writes a form
+    // `load` can read back. Writing only the version would lose the name.
+    use jerky::resolver::{Dependency, Importer, ImporterPath, PackageId, Resolution};
+
+    let dir = TempDir::new().unwrap();
+    let registry = FixtureRegistry::new().with_tree(&[("safe-execa", "0.3.0", &[])]);
+    let mut graph = resolve(&registry, &roots(&[("safe-execa", "^0.3.0")])).unwrap();
+
+    let real = PackageId {
+        name: "safe-execa".to_string(),
+        version: "0.3.0".to_string(),
+    };
+    let mut importer = Importer::default();
+    importer.dependencies.insert(
+        "execa".to_string(),
+        Dependency {
+            specifier: "npm:safe-execa@0.3.0".to_string(),
+            resolution: Resolution::Registry(real.clone()),
+        },
+    );
+    graph.importers.insert(ImporterPath::root(), importer);
+
+    lockfile::save(&graph, dir.path()).unwrap();
+
+    // The name is written because it differs from the key.
+    let parsed: serde_json::Value = serde_json::from_str(&read(&dir)).unwrap();
+    assert_eq!(
+        parsed["importers"]["."]["dependencies"]["execa"]["version"],
+        "safe-execa@0.3.0"
+    );
+
+    let back = lockfile::load(dir.path()).unwrap().unwrap();
+    let execa = &back.importers[&ImporterPath::root()].dependencies["execa"];
+    assert!(matches!(&execa.resolution, Resolution::Registry(id) if id == &real));
+}
+
+#[test]
+fn an_ordinary_dependency_does_not_repeat_its_name() {
+    // The common case stays terse: the name is written only when it differs.
+    let dir = TempDir::new().unwrap();
+    lockfile::save(&two_importer_graph(), dir.path()).unwrap();
+
+    let parsed: serde_json::Value = serde_json::from_str(&read(&dir)).unwrap();
+    assert_eq!(
+        parsed["importers"]["."]["dependencies"]["a"]["version"],
+        "1.0.0"
+    );
+}
+
+#[test]
+fn a_link_target_leaving_the_workspace_is_refused() {
+    // A link climbs out of its importer legitimately — that is how apps/web
+    // reaches packages/ui — but must not climb out of the workspace.
+    let dir = TempDir::new().unwrap();
+    write_raw(
+        &dir,
+        r#"{"lockfileVersion":1,
+            "importers":{".":{"dependencies":{"evil":{"specifier":"workspace:*","version":"link:../../../etc"}}}},
+            "packages":{}}"#,
+    );
+
+    assert!(matches!(
+        lockfile::load(dir.path()),
+        Err(LockfileError::LinkEscapesWorkspace { .. })
+    ));
+}
+
+#[test]
+fn a_link_target_climbing_within_the_workspace_is_accepted() {
+    // apps/web sits two deep, so ../../packages/ui lands back inside.
+    use jerky::resolver::Resolution;
+
+    let dir = TempDir::new().unwrap();
+    write_raw(
+        &dir,
+        r#"{"lockfileVersion":1,
+            "importers":{"apps/web":{"dependencies":{"ui":{"specifier":"workspace:*","version":"link:../../packages/ui"}}}},
+            "packages":{}}"#,
+    );
+
+    let graph = lockfile::load(dir.path()).unwrap().unwrap();
+    let web = &graph.importers[&jerky::resolver::ImporterPath::new("apps/web").unwrap()];
+    assert!(matches!(
+        &web.dependencies["ui"].resolution,
+        Resolution::Local(_)
+    ));
+}
+
+#[test]
+fn equivalent_importer_spellings_collapse_to_one_key() {
+    // `./packages/ui` and `packages/ui` are one directory. Keeping them apart
+    // would give that directory two importers and, once linking exists, two
+    // node_modules.
+    use jerky::resolver::ImporterPath;
+
+    assert_eq!(
+        ImporterPath::new("./packages/ui").unwrap(),
+        ImporterPath::new("packages/ui").unwrap()
+    );
+    assert_eq!(
+        ImporterPath::new("packages/ui/").unwrap(),
+        ImporterPath::new("packages/ui").unwrap()
+    );
+}
+
+#[test]
+fn one_stale_importer_does_not_invalidate_the_others() {
+    // The reason staleness is per-importer rather than whole-file, and the
+    // load-bearing justification for the whole reshape. `apps/web` edits its
+    // manifest; the root's recorded specifiers are untouched and still match.
+    use jerky::resolver::ImporterPath;
+
+    let dir = TempDir::new().unwrap();
+    lockfile::save(&two_importer_graph(), dir.path()).unwrap();
+    let back = lockfile::load(dir.path()).unwrap().unwrap();
+
+    // What a manifest now declares, per importer.
+    let root_declares = [("a", "^1.0.0")];
+    let web_declares = [("a", "^2.0.0"), ("ui", "workspace:*")]; // `a` was bumped
+
+    let matches_manifest = |importer: &ImporterPath, declared: &[(&str, &str)]| {
+        let recorded = &back.importers[importer].dependencies;
+        recorded.len() == declared.len()
+            && declared
+                .iter()
+                .all(|(name, spec)| recorded.get(*name).is_some_and(|d| d.specifier == *spec))
+    };
+
+    assert!(
+        matches_manifest(&ImporterPath::root(), &root_declares),
+        "the root importer should still be current"
+    );
+    assert!(
+        !matches_manifest(&ImporterPath::new("apps/web").unwrap(), &web_declares),
+        "apps/web should be detected as stale"
+    );
 }
