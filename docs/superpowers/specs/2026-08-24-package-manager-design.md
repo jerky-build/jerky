@@ -511,6 +511,12 @@ lockfile format, and both are worth getting right before making fast.
 **Spec 3 — everyday use.** Bare `jerky install` from the manifest,
 `devDependencies`, scoped packages, and `node_modules/.bin` linking.
 
+**Workspaces.** This design says jerky is a monorepo tool and then scopes
+workspaces out of every slice, which left the single-project assumption
+load-bearing. Corrected in
+`docs/superpowers/specs/2026-09-10-workspace-design.md`, which covers #10 and
+revises the lockfile's top-level shape.
+
 ### Effect on existing issues
 
 - **#3** absorbs #5 and #7 and becomes this spec's install command.

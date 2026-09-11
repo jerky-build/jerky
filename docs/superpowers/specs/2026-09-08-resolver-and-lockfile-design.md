@@ -341,6 +341,15 @@ match, the lockfile is stale and resolution re-runs. Without it, jerky could
 not tell an up-to-date lockfile from one written before someone hand-edited a
 dependency.
 
+> **Superseded 2026-09-10.** `root` became `importers`, keyed by
+> workspace-relative directory, with each dependency recording both a
+> `specifier` and the `version` it resolved to. jerky manages every project in
+> a monorepo from the root, so one block of ranges could describe only one of
+> them. See `docs/superpowers/specs/2026-09-10-workspace-design.md` §6. The
+> rest of this section — flat `packages` keyed `name@version`, deterministic
+> ordering, minimal diff noise, the version gate, integrity per package — is
+> unchanged.
+
 ### Reuse, not just writing
 
 Spec 1's design noted the lockfile would be "written and never consumed" in
