@@ -2,14 +2,22 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Resolve npm ranges and transitive dependency trees, install a whole graph into the virtual store, and record the result in a deterministic `jerky-lock.json`.
+**Goal:** Resolve npm ranges and transitive dependency trees, install every project in a workspace from its root, and record the result in a deterministic `jerky-lock.json`.
 
-**Architecture:** Three new modules on top of spec 1. `range` wraps `js-semver` and is the only module that names it, so the 0.4.0 dependency is swappable in one file. `resolver` is pure given a `RegistryClient` — it fetches metadata and returns a `ResolvedGraph`, writing nothing to disk, which is what makes it testable with no filesystem at all. `lockfile` is a straight serialization of that graph, which is why the two were designed together. `commands/install` grows from installing one package to walking a graph.
+**Architecture:** Four new modules on top of spec 1. `range` wraps `js-semver` and is the only module that names it, so the 0.4.0 dependency is swappable in one file. `workspace` discovers members and answers "which importer am I in". `resolver` is pure given a `RegistryClient` — it fetches metadata and returns a `ResolvedGraph`, writing nothing to disk, which is what makes it testable with no filesystem at all. `lockfile` is a straight serialization of that graph, which is why the two were designed together. `commands/install` grows from installing one package to installing a workspace.
 
-**Tech Stack:** Rust 2024, plus `js-semver`. Everything else is already in the tree.
+**Tech Stack:** Rust 2024, plus `js-semver` and a glob matcher. Everything else is already in the tree.
 
 **Spec:** `docs/superpowers/specs/2026-09-08-resolver-and-lockfile-design.md`
+**Workspaces:** `docs/superpowers/specs/2026-09-10-workspace-design.md`
 **Research:** `docs/superpowers/research/2026-09-08-npm-semver-crate-selection.md`
+
+> **Revised 2026-09-11.** Tasks 1 through 3 are done and unchanged — `range`,
+> packument fetching, and the resolver are all workspace-agnostic. Tasks 4
+> onwards are revised against the workspace design, and the numbering shifted:
+> a new Task 5 covers workspace discovery, so the old Tasks 5, 6 and 7 are now
+> 6, 7 and 8. Task 4 is already implemented in its single-project form and is
+> now a revision rather than new work.
 
 ## Global Constraints
 
@@ -17,6 +25,9 @@ Spec 1's constraints all still hold. These are the ones this spec adds or sharpe
 
 - **Nothing outside `src/range.rs` may name `js_semver`.** This is the containment boundary for a 0.4.0 dependency and the reason a future swap is one file. A `use js_semver::` anywhere else is a bug, not a shortcut.
 - **`BTreeMap`, never `HashMap`, anywhere that reaches the lockfile.** Iteration order is serialization order, and two machines resolving the same tree must produce byte-identical files. Sorted-by-construction is how that is guaranteed rather than remembered.
+- **A workspace of one goes through the same code path as a workspace of many.** A `package.json` with no `workspaces` field is a workspace with a single importer keyed `.`. There is no single-project branch to keep working, because the common case is the degenerate case of the general one. A test that only ever exercises one importer is not exercising this.
+- **Only `main.rs` locates the workspace root.** It is the one place allowed to read the current directory, so walking up for the root manifest happens there and every path below is a parameter. This is the spec 1 constraint restated for a new kind of path, and it is what keeps the workspace tests free of a real filesystem layout.
+- **Symlink targets are computed from the importer's depth, never hardcoded.** A link in the root's `node_modules` needs no `../`; one in `packages/ui/node_modules` needs three to reach the root's virtual store. Any literal `../` outside the function that computes depth is a bug waiting for a nested importer.
 - **Never follow a dependency's `devDependencies`.** Only the root project's, and that is spec 3. This is a correctness requirement, not an optimisation: following them pulls in most of the registry.
 - **Prereleases are excluded unless the range mentions one.** This is npm's rule and the exact place Cargo's semver crate diverges silently.
 - **The resolver performs no I/O beyond the `RegistryClient`.** No filesystem, no `$HOME`, no cwd.
@@ -30,6 +41,7 @@ Spec 1's constraints all still hold. These are the ones this spec adds or sharpe
 | File | Responsibility |
 |---|---|
 | `src/range.rs` | jerky's `Range`/`Version`, wrapping `js-semver`. The only file that names it. |
+| `src/workspace.rs` | Member discovery from `workspaces`, and importer lookup |
 | `src/resolver.rs` | The transitive walk. Produces a `ResolvedGraph`. |
 | `src/lockfile.rs` | `ResolvedGraph` ⟷ `jerky-lock.json` |
 | `src/registry.rs` | *(modify)* `Packument`, `RegistryClient::packument` |
@@ -40,6 +52,7 @@ Spec 1's constraints all still hold. These are the ones this spec adds or sharpe
 | `tests/fixtures/semver-oracle.json` | Committed ground truth from npm's semver 7.8.5 |
 | `tests/resolve.rs` | Tree-shape tests: diamond, conflict, cycle, chain |
 | `tests/lockfile.rs` | Determinism, diff noise, version refusal, round trip |
+| `tests/workspace.rs` | Discovery, globs, importer lookup, malformed members |
 
 ---
 
@@ -884,680 +897,393 @@ git commit -m "feat: transitive dependency resolution"
 
 ---
 
-### Task 4: The lockfile
+### Task 4 (revised): The lockfile, keyed by importer
+
+**Status:** implemented in single-project form on `main`. This task reshapes it.
 
 **Files:**
-- Create: `src/lockfile.rs`, `tests/lockfile.rs`
-- Modify: `src/lib.rs`, `src/error.rs`
+- Modify: `src/lockfile.rs`, `src/resolver.rs`, `tests/lockfile.rs`
 
 **Interfaces:**
-- Consumes: `ResolvedGraph`, `PackageId`, `Integrity`
-- Produces: `lockfile::LOCKFILE_NAME`, `lockfile::LOCKFILE_VERSION`, `lockfile::save(&ResolvedGraph, project_dir) -> Result<(), LockfileError>`, `lockfile::load(project_dir) -> Result<Option<ResolvedGraph>, LockfileError>`, `lockfile::LockfileError`
+- Changed: `ResolvedGraph.root: BTreeMap<String, String>` becomes `ResolvedGraph.importers: BTreeMap<ImporterPath, Importer>`
+- Produces: `resolver::ImporterPath(String)`, `resolver::Importer { dependencies: BTreeMap<String, Dependency> }`, `resolver::Dependency { specifier: String, resolution: Resolution }`, `resolver::Resolution` (`Registry(PackageId)` | `Local(PathBuf)`)
 
-`load` returns `Ok(None)` for a missing file — absence is normal, not an error.
+The single-project `root` block was right in intent — record what was asked so
+staleness is detectable — but singular, and it stored only the specifier.
 
-- [ ] **Step 1: Write the failing tests**
+- [ ] **Step 1: Rewrite the failing tests first**
 
-Create `tests/lockfile.rs`:
+The existing `tests/lockfile.rs` tests are good and mostly survive: determinism,
+diff noise, the version gate, key validation, dangling edges, the trailing
+newline. Change what they build, not what they assert. Then add:
 
 ```rust
-use std::collections::BTreeMap;
+#[test]
+fn importers_are_keyed_by_directory() {
+    // A workspace of one is keyed ".", which is the case every single-project
+    // repo takes. If this is the only importer a test ever sees, the test is
+    // not exercising workspaces.
+    let graph = /* resolve a workspace with "." and "apps/web" */;
+    lockfile::save(&graph, root).unwrap();
 
-use jerky::lockfile::{self, LockfileError};
-use jerky::resolver::resolve;
-use jerky::testing::FixtureRegistry;
-use tempfile::TempDir;
-
-fn roots(list: &[(&str, &str)]) -> BTreeMap<String, String> {
-    list.iter().map(|(n, r)| (n.to_string(), r.to_string())).collect()
-}
-
-fn small_tree() -> FixtureRegistry {
-    FixtureRegistry::new().with_tree(&[
-        ("a", "1.0.0", &[("b", "^1.0.0")]),
-        ("b", "1.0.0", &[]),
-    ])
+    let parsed: serde_json::Value = serde_json::from_str(&read(root)).unwrap();
+    let keys: Vec<&str> = parsed["importers"].as_object().unwrap().keys().map(String::as_str).collect();
+    assert_eq!(keys, [".", "apps/web"]);
 }
 
 #[test]
-fn writing_the_same_graph_twice_is_byte_identical() {
-    // #11's first requirement. Two machines resolving the same tree must
-    // produce identical files or the lockfile churns in every diff.
-    let registry = small_tree();
-    let dir = TempDir::new().unwrap();
-
-    let g1 = resolve(&registry, &roots(&[("a", "^1.0.0")])).unwrap();
-    lockfile::save(&g1, dir.path()).unwrap();
-    let first = std::fs::read_to_string(dir.path().join("jerky-lock.json")).unwrap();
-
-    let g2 = resolve(&registry, &roots(&[("a", "^1.0.0")])).unwrap();
-    lockfile::save(&g2, dir.path()).unwrap();
-    let second = std::fs::read_to_string(dir.path().join("jerky-lock.json")).unwrap();
-
-    assert_eq!(first, second);
+fn a_dependency_records_both_what_was_asked_and_what_was_chosen() {
+    // The pair is what lets top-level linking read the resolved identity
+    // instead of re-matching the range against loaded versions.
+    let entry = &parsed["importers"]["."]["dependencies"]["lodash"];
+    assert_eq!(entry["specifier"], "^4.17.0");
+    assert_eq!(entry["version"], "4.17.21");
 }
 
 #[test]
-fn round_trips_through_disk() {
-    let registry = small_tree();
-    let dir = TempDir::new().unwrap();
-
-    let graph = resolve(&registry, &roots(&[("a", "^1.0.0")])).unwrap();
-    lockfile::save(&graph, dir.path()).unwrap();
-    let back = lockfile::load(dir.path()).unwrap().expect("a lockfile was written");
-
-    assert_eq!(back.root, graph.root);
-    assert_eq!(back.packages.len(), graph.packages.len());
-    for (id, pkg) in &graph.packages {
-        let other = back.packages.get(id).expect("every package survives");
-        assert_eq!(other.resolved, pkg.resolved);
-        assert_eq!(other.integrity.to_ssri(), pkg.integrity.to_ssri());
-        assert_eq!(other.dependencies, pkg.dependencies);
-    }
+fn a_local_dependency_records_a_link_rather_than_a_version() {
+    // `link:` in the version slot is how a workspace package needs no separate
+    // mechanism. The path is relative to the importer that declared it.
+    let entry = &parsed["importers"]["apps/web"]["dependencies"]["ui"];
+    assert_eq!(entry["specifier"], "workspace:*");
+    assert_eq!(entry["version"], "link:../../packages/ui");
 }
 
 #[test]
-fn adding_one_dependency_touches_only_its_own_block() {
-    // #11's "minimal diff noise". A flat, name@version-keyed map is what
-    // makes this true; a nested tree would reindent everything below a change.
-    let registry = FixtureRegistry::new().with_tree(&[
-        ("a", "1.0.0", &[("b", "^1.0.0")]),
-        ("b", "1.0.0", &[]),
-        ("newcomer", "1.0.0", &[]),
-    ]);
-    let dir = TempDir::new().unwrap();
-
-    let before_graph = resolve(&registry, &roots(&[("a", "^1.0.0")])).unwrap();
-    lockfile::save(&before_graph, dir.path()).unwrap();
-    let before = std::fs::read_to_string(dir.path().join("jerky-lock.json")).unwrap();
-
-    let after_graph =
-        resolve(&registry, &roots(&[("a", "^1.0.0"), ("newcomer", "^1.0.0")])).unwrap();
-    lockfile::save(&after_graph, dir.path()).unwrap();
-    let after = std::fs::read_to_string(dir.path().join("jerky-lock.json")).unwrap();
-
-    let removed = before.lines().filter(|l| !after.contains(*l)).count();
-    assert!(
-        removed <= 1,
-        "adding a dependency rewrote {removed} existing lines; only the root block should change"
-    );
+fn a_local_dependency_has_no_packages_entry() {
+    // There is no tarball and no integrity hash, because there is nothing to
+    // verify — the bytes are in the repo.
+    assert!(parsed["packages"].as_object().unwrap().keys().all(|k| !k.starts_with("ui@")));
 }
 
 #[test]
-fn a_missing_lockfile_is_not_an_error() {
-    let dir = TempDir::new().unwrap();
-    assert!(lockfile::load(dir.path()).unwrap().is_none());
+fn one_stale_importer_does_not_invalidate_the_others() {
+    // The reason staleness is per-importer rather than whole-file.
+    // Editing apps/web's manifest leaves "."'s recorded specifiers current.
 }
 
 #[test]
-fn an_unknown_lockfile_version_is_refused() {
-    // Real projects commit lockfiles. A best-effort parse of a format we do
-    // not understand is how a tool silently installs the wrong tree.
-    let dir = TempDir::new().unwrap();
-    std::fs::write(
-        dir.path().join("jerky-lock.json"),
-        r#"{"lockfileVersion": 99, "root": {}, "packages": {}}"#,
-    )
-    .unwrap();
+fn an_importer_path_outside_the_workspace_is_refused() {
+    // A key of "../escape" in a hand-edited lockfile must not be honoured.
+    // Same class as the tar-slip guard in `archive`: a path from an untrusted
+    // file that resolves outside the tree it claims to describe.
+}
 
+#[test]
+fn an_alias_round_trips() {
+    // `execa: { specifier: "npm:safe-execa@0.3.0", version: "0.3.0" }` — real,
+    // from pnpm's own lockfile. The importer's key is the local name; the
+    // resolution names the actual package.
+}
+```
+
+- [ ] **Step 2: Change the types**
+
+`ResolvedGraph.root` becomes `importers`. Introduce `Resolution` so a
+dependency is explicitly one of two things rather than a version string that
+sometimes starts with `link:`:
+
+```rust
+/// A workspace-relative directory. `.` is the workspace root.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ImporterPath(String);
+
+#[derive(Debug, Clone)]
+pub enum Resolution {
+    /// Fetched from the registry; has a node in `packages`.
+    Registry(PackageId),
+    /// A workspace member, linked in place. No tarball, no integrity hash.
+    Local(PathBuf),
+}
+
+#[derive(Debug, Clone)]
+pub struct Dependency {
+    /// What the manifest asked for, verbatim. Makes staleness detectable.
+    pub specifier: String,
+    pub resolution: Resolution,
+}
+```
+
+Keeping `Resolution` an enum rather than a `String` that may carry a `link:`
+prefix is the point: the compiler then makes every consumer say which case it
+handles, and the `link:` spelling exists only at the serialization boundary.
+
+- [ ] **Step 3: Reshape `OnDisk`**
+
+`root` becomes `importers`. `packages` is unchanged — flat, keyed
+`name@version`, shared by every importer. Everything already true of it stays
+true, including the validation that refuses contradictory keys and dangling
+edges.
+
+`ImporterPath` must be validated on load, not just on save. A lockfile is an
+untrusted file: a key of `../escape` or an absolute path has to be refused for
+the same reason `archive` refuses a tar entry that climbs out of its
+destination.
+
+- [ ] **Step 4: Run and commit**
+
+```bash
+cargo test --test lockfile && cargo test
+git commit -m "feat: lockfile keyed by importer"
+```
+
+---
+
+### Task 5 (new): Workspace discovery
+
+**Files:**
+- Create: `src/workspace.rs`, `tests/workspace.rs`
+- Modify: `src/lib.rs`, `src/error.rs`, `src/manifest.rs`, `Cargo.toml`
+
+**Interfaces:**
+- Produces: `workspace::Workspace`, `Workspace::discover(root: &Path) -> Result<Workspace, WorkspaceError>`, `Workspace::members(&self) -> &BTreeMap<ImporterPath, Member>`, `Workspace::member_for(&self, dir: &Path) -> Option<&Member>`, `Workspace::find_root(from: &Path) -> Option<PathBuf>`, `workspace::Member { path, manifest }`, `workspace::WorkspaceError`
+
+- [ ] **Step 1: Add a glob matcher**
+
+```bash
+cargo add globset
+```
+
+`workspaces` patterns are globs. Hand-rolling `packages/*` is easy and
+hand-rolling `packages/**/!(test)` is not, so take the crate.
+
+- [ ] **Step 2: Write the failing tests**
+
+```rust
+#[test]
+fn a_manifest_without_workspaces_is_a_workspace_of_one() {
+    // The single-project case, which must go through the same path as any
+    // other. This is the test that proves there is no special branch.
+    let dir = TempDir::new().unwrap();
+    write_manifest(dir.path(), r#"{"name":"solo"}"#);
+
+    let ws = Workspace::discover(dir.path()).unwrap();
+
+    assert_eq!(ws.members().len(), 1);
+    assert!(ws.members().contains_key(&ImporterPath::root()));
+}
+
+#[test]
+fn globs_expand_to_member_directories() {
+    // packages/* with three members, keyed workspace-relative and sorted.
+}
+
+#[test]
+fn a_match_without_a_manifest_is_skipped_not_fatal() {
+    // `packages/.cache` exists and has no package.json. An install must not
+    // fail because of a stray directory.
+}
+
+#[test]
+fn a_pattern_matching_nothing_warns() {
+    // Usually a typo. Worth surfacing, not worth failing.
+}
+
+#[test]
+fn two_members_sharing_a_name_are_refused_naming_both_paths() {
+    // Membership is a set of directories, so a name collision is found by
+    // looking at paths — which is what the message must carry.
     assert!(matches!(
-        lockfile::load(dir.path()),
-        Err(LockfileError::UnsupportedVersion { found: 99, .. })
+        Workspace::discover(dir.path()),
+        Err(WorkspaceError::DuplicateName { name, first, second })
+            if name == "ui" && first != second
     ));
 }
 
 #[test]
-fn a_malformed_lockfile_is_refused_not_ignored() {
-    let dir = TempDir::new().unwrap();
-    std::fs::write(dir.path().join("jerky-lock.json"), "{ not json").unwrap();
-    assert!(matches!(lockfile::load(dir.path()), Err(LockfileError::Malformed { .. })));
+fn a_pattern_escaping_the_workspace_root_is_refused() {
+    // npm permits `../siblings/*`. Silently including a directory outside the
+    // repo has the same shape as the tar-slip class `archive` already guards
+    // against, so it is refused rather than resolved.
+    write_manifest(dir.path(), r#"{"workspaces":["../outside/*"]}"#);
+    assert!(matches!(
+        Workspace::discover(dir.path()),
+        Err(WorkspaceError::EscapesRoot { .. })
+    ));
 }
 
 #[test]
-fn the_file_ends_with_a_newline() {
-    // So it is a well-formed text file and diffs do not show "\ No newline".
-    let registry = small_tree();
-    let dir = TempDir::new().unwrap();
-    let graph = resolve(&registry, &roots(&[("a", "^1.0.0")])).unwrap();
-    lockfile::save(&graph, dir.path()).unwrap();
+fn member_for_finds_the_nearest_enclosing_member() {
+    // Standing in packages/ui/src/deep means the packages/ui importer.
+}
 
-    let raw = std::fs::read_to_string(dir.path().join("jerky-lock.json")).unwrap();
-    assert!(raw.ends_with('\n'));
+#[test]
+fn member_for_returns_none_outside_every_member() {
+    // Ambiguous rather than obviously the root, so the caller decides.
+}
+
+#[test]
+fn a_private_package_is_an_ordinary_member() {
+    // Publishability is a property of a package, not of membership.
+}
+
+#[test]
+fn find_root_walks_up_to_the_nearest_workspace_manifest() {
+    // What main.rs uses, given a cwd.
 }
 ```
 
-- [ ] **Step 2: Run to verify failure**
+- [ ] **Step 3: Implement**
 
-Run: `cargo test --test lockfile`
-Expected: FAIL — `lockfile` not found.
+`Manifest` gains `workspaces(&self) -> Vec<String>`, reading the field and
+returning empty when absent — the degenerate case, not a separate one.
 
-- [ ] **Step 3: Write the implementation**
+`discover` reads the root manifest, expands each pattern, keeps directories
+containing a `package.json`, and always includes `.` whether or not it declares
+dependencies.
 
-Create `src/lockfile.rs`. The on-disk shape is a separate type from
-`ResolvedGraph`, deliberately: the graph is what the resolver finds convenient,
-the lockfile is what is stable to commit, and conflating them means every
-internal refactor is a format change.
+**`find_root` is the only function that walks up**, and `main.rs` is its only
+caller. Everything else takes the root as a parameter.
 
-```rust
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
-
-use serde::{Deserialize, Serialize};
-use thiserror::Error;
-
-use crate::integrity::Integrity;
-use crate::resolver::{PackageId, ResolvedGraph, ResolvedPackage};
-
-pub const LOCKFILE_NAME: &str = "jerky-lock.json";
-
-/// Bumped when the on-disk shape changes. Present from the first release
-/// because a committed format without one has no migration path.
-pub const LOCKFILE_VERSION: u32 = 1;
-
-#[derive(Debug, Error)]
-pub enum LockfileError {
-    #[error("{path} is not valid JSON")]
-    Malformed {
-        path: PathBuf,
-        #[source]
-        source: serde_json::Error,
-    },
-    #[error("{path} uses lockfile version {found}, but this jerky understands {supported}. Upgrade jerky.")]
-    UnsupportedVersion { path: PathBuf, found: u32, supported: u32 },
-    #[error("{path} records `{entry}`, which is not a valid name@version key")]
-    BadKey { path: PathBuf, entry: String },
-    #[error("{path} records an unusable integrity hash for `{entry}`")]
-    BadIntegrity { path: PathBuf, entry: String },
-    #[error("failed to access {path}")]
-    Io {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-}
-
-#[derive(Serialize, Deserialize)]
-struct OnDisk {
-    #[serde(rename = "lockfileVersion")]
-    lockfile_version: u32,
-    /// The ranges the manifest declared, so staleness is detectable.
-    root: BTreeMap<String, String>,
-    /// Keyed `name@version`. Flat rather than nested so that adding a
-    /// dependency appends a block instead of reindenting a subtree.
-    packages: BTreeMap<String, Entry>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct Entry {
-    version: String,
-    resolved: String,
-    integrity: String,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    dependencies: BTreeMap<String, String>,
-}
-
-pub fn save(graph: &ResolvedGraph, project_dir: &Path) -> Result<(), LockfileError> {
-    let packages = graph
-        .packages
-        .values()
-        .map(|p| {
-            (
-                p.id.to_string(),
-                Entry {
-                    version: p.id.version.clone(),
-                    resolved: p.resolved.clone(),
-                    integrity: p.integrity.to_ssri(),
-                    // Edge values are the concrete version, not the range:
-                    // the lockfile records what was chosen, not what was asked.
-                    dependencies: p
-                        .dependencies
-                        .iter()
-                        .map(|(n, id)| (n.clone(), id.version.clone()))
-                        .collect(),
-                },
-            )
-        })
-        .collect();
-
-    let on_disk = OnDisk {
-        lockfile_version: LOCKFILE_VERSION,
-        root: graph.root.clone(),
-        packages,
-    };
-
-    let path = project_dir.join(LOCKFILE_NAME);
-    let mut text = serde_json::to_string_pretty(&on_disk)
-        .expect("a lockfile is always serializable");
-    text.push('\n');
-
-    std::fs::write(&path, text).map_err(|source| LockfileError::Io { path, source })
-}
-
-pub fn load(project_dir: &Path) -> Result<Option<ResolvedGraph>, LockfileError> {
-    let path = project_dir.join(LOCKFILE_NAME);
-    let raw = match std::fs::read_to_string(&path) {
-        Ok(raw) => raw,
-        // Absence is normal: the first install has no lockfile to read.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(source) => return Err(LockfileError::Io { path, source }),
-    };
-
-    let on_disk: OnDisk = serde_json::from_str(&raw)
-        .map_err(|source| LockfileError::Malformed { path: path.clone(), source })?;
-
-    if on_disk.lockfile_version != LOCKFILE_VERSION {
-        return Err(LockfileError::UnsupportedVersion {
-            path,
-            found: on_disk.lockfile_version,
-            supported: LOCKFILE_VERSION,
-        });
-    }
-
-    let mut packages = BTreeMap::new();
-    for (key, entry) in on_disk.packages {
-        let name = key
-            .rsplit_once('@')
-            .filter(|(name, _)| !name.is_empty())
-            .map(|(name, _)| name.to_string())
-            .ok_or_else(|| LockfileError::BadKey {
-                path: path.clone(),
-                entry: key.clone(),
-            })?;
-
-        let id = PackageId { name, version: entry.version.clone() };
-        let integrity = Integrity::parse(&entry.integrity).map_err(|_| {
-            LockfileError::BadIntegrity { path: path.clone(), entry: key.clone() }
-        })?;
-
-        let dependencies = entry
-            .dependencies
-            .iter()
-            .map(|(n, v)| (n.clone(), PackageId { name: n.clone(), version: v.clone() }))
-            .collect();
-
-        packages.insert(
-            id.clone(),
-            ResolvedPackage { id, resolved: entry.resolved, integrity, dependencies },
-        );
-    }
-
-    Ok(Some(ResolvedGraph { root: on_disk.root, packages }))
-}
-```
-
-**Note on `rsplit_once('@')`**: splitting from the right is what makes
-`@scope/name@1.0.0` parse correctly when spec 3 adds scoped packages. Doing it
-now costs nothing and avoids a quiet bug later — the same reasoning spec 1
-applied to `parse_package_spec`.
-
-- [ ] **Step 4: Register the module**
-
-`src/lib.rs`: `pub mod lockfile;`. `src/error.rs`: the `Lockfile` variant.
-
-- [ ] **Step 5: Run the tests**
-
-Run: `cargo test --test lockfile`
-Expected: PASS, 7 tests.
-
-- [ ] **Step 6: Add `jerky-lock.json` awareness to `.gitignore`?**
-
-**No.** Lockfiles are committed; that is their purpose. This step exists only
-to record that the question was asked and answered.
-
-- [ ] **Step 7: Commit**
+- [ ] **Step 4: Run and commit**
 
 ```bash
-git add src/ tests/
-git commit -m "feat: deterministic jerky-lock.json"
+cargo test --test workspace && cargo test
+git commit -m "feat: workspace discovery from package.json workspaces"
 ```
 
 ---
 
-### Task 5: Intra-store symlinks
+### Task 6 (was 5): Symlinks — intra-store and importer-relative
 
 **Files:**
 - Modify: `src/linker.rs`
-- Test: inline `#[cfg(test)]` in `src/linker.rs`
 
 **Interfaces:**
-- Produces: `linker::symlink_into_store(store_dir: &Path, pkg_name: &str, dir_name: &str) -> Result<(), LinkError>`
+- Produces: `linker::symlink_into_store(link_dir, pkg_name, dir_name)`, `linker::symlink_dependency_from(importer_dir, workspace_root, pkg_name, dir_name)`, `linker::symlink_local(importer_dir, pkg_name, target_dir)`
 
-**The correction spec 1 predicted.** `symlink_dependency` writes a target with
-no leading `../`, correct for links in `node_modules/` itself. A link from one
+Two corrections land together because they are the same class of change, and
+doing them separately would mean rewriting the linker twice.
+
+**The intra-store `../`.** Spec 1's `symlink_dependency` writes a target with no
+leading `../`, correct for links in `node_modules/` itself. A link from one
 package's private `node_modules` to another package's store directory sits one
-level deeper and does need it. Spec 1's Task 7 note called this out as pnpm's
-actual use of `../`; this is where it lands.
-
-Concretely, for `b@1.0.0` depending on `d@1.5.0`:
+level deeper and does need it:
 
 ```
-node_modules/.jerky/b@1.0.0/node_modules/d
-  -> ../../d@1.5.0/node_modules/d
+node_modules/.jerky/b@1.0.0/node_modules/d -> ../../d@1.5.0/node_modules/d
 ```
 
-Two `../` because the link sits at `.jerky/b@1.0.0/node_modules/d`, and the
-target `d@1.5.0` is a sibling of `b@1.0.0` under `.jerky/`.
+**The importer-relative depth.** A link in a nested importer's `node_modules`
+must climb back to the workspace root's virtual store, and how far depends on
+where the importer sits:
 
-- [ ] **Step 1: Write the failing test**
-
-```rust
-#[test]
-fn intra_store_links_climb_back_to_the_virtual_store_root() {
-    let root = TempDir::new().unwrap();
-    let src = store_entry(root.path());
-    let node_modules = root.path().join("node_modules");
-
-    populate_virtual_store(&src, &node_modules, "b@1.0.0", "b").unwrap();
-    populate_virtual_store(&src, &node_modules, "d@1.5.0", "d").unwrap();
-
-    let b_modules = node_modules.join(".jerky/b@1.0.0/node_modules");
-    symlink_into_store(&b_modules, "d", "d@1.5.0").unwrap();
-
-    let target = std::fs::read_link(b_modules.join("d")).unwrap();
-    assert_eq!(target, Path::new("../../d@1.5.0/node_modules/d"));
-
-    // And it resolves — the assertion that catches an off-by-one in the ../
-    assert!(b_modules.join("d").join("package.json").is_file());
-}
-
-#[test]
-fn a_package_sees_only_its_own_dependencies() {
-    // The reason for the doubled node_modules. `b` gets `d` as a sibling and
-    // nothing else, so a phantom dependency cannot resolve.
-    let root = TempDir::new().unwrap();
-    let src = store_entry(root.path());
-    let node_modules = root.path().join("node_modules");
-    populate_virtual_store(&src, &node_modules, "b@1.0.0", "b").unwrap();
-    populate_virtual_store(&src, &node_modules, "d@1.5.0", "d").unwrap();
-    populate_virtual_store(&src, &node_modules, "unrelated@1.0.0", "unrelated").unwrap();
-
-    let b_modules = node_modules.join(".jerky/b@1.0.0/node_modules");
-    symlink_into_store(&b_modules, "d", "d@1.5.0").unwrap();
-
-    let siblings: Vec<_> = std::fs::read_dir(&b_modules)
-        .unwrap()
-        .filter_map(Result::ok)
-        .map(|e| e.file_name().to_string_lossy().to_string())
-        .collect();
-    assert!(siblings.contains(&"d".to_string()));
-    assert!(!siblings.contains(&"unrelated".to_string()));
-}
 ```
-
-- [ ] **Step 2: Write the implementation**
-
-`symlink_into_store` is `symlink_dependency` with a different target prefix.
-Factor the shared replace-an-existing-link logic rather than copying it — the
-store and linker already drifted once in spec 1 by keeping two copies of
-staging cleanup, and that cost a real bug.
-
-```rust
-/// Link one package's dependency inside the virtual store.
-///
-/// `link_dir` is the dependent's own `node_modules`, at
-/// `.jerky/<dependent>/node_modules`. The target climbs two levels to reach
-/// `.jerky/` and descends into the dependency's directory — unlike
-/// `symlink_dependency`, whose links sit in `node_modules/` itself and need
-/// no `../` at all.
-pub fn symlink_into_store(
-    link_dir: &Path,
-    pkg_name: &str,
-    dir_name: &str,
-) -> Result<(), LinkError> {
-    let target = Path::new("..")
-        .join("..")
-        .join(dir_name)
-        .join("node_modules")
-        .join(pkg_name);
-    place_symlink(link_dir, pkg_name, &target)
-}
+packages/ui/node_modules/lodash -> ../../../node_modules/.jerky/lodash@4.17.21/node_modules/lodash
+apps/web/node_modules/lodash    -> ../../../node_modules/.jerky/lodash@4.18.0/node_modules/lodash
+node_modules/lodash             -> .jerky/lodash@4.17.21/node_modules/lodash
 ```
-
-- [ ] **Step 3: Run and commit**
-
-Run: `cargo test --lib linker`
-Expected: PASS.
-
-```bash
-git add src/
-git commit -m "feat: intra-virtual-store symlinks"
-```
-
----
-
-### Task 6: Install a graph
-
-**Files:**
-- Modify: `src/commands/install.rs`, `tests/install.rs`
-- Test: `tests/install.rs`
-
-**Interfaces:**
-- Consumes: `resolve`, `ResolvedGraph`, `Store`, `linker`, `archive`, `Manifest`
-- Produces: `commands::install::install(project_dir, store, registry, spec) -> Result<Installed, InstallError>` with `Installed { name, version, resolved_count }`
-
-Spec 1's `install` fetched, verified, stored and linked one package. The shape
-is unchanged; it now runs over every node in a graph.
 
 - [ ] **Step 1: Write the failing tests**
 
-Add to `tests/install.rs`:
+Cover, at minimum: the root importer (no `../`), a one-level importer, a
+two-level importer, an intra-store link, and a local package link. Assert on
+the **resolved** target as well as its text — a link whose string looks right
+but does not resolve is the bug this catches.
 
 ```rust
 #[test]
-fn installs_a_whole_dependency_tree() {
-    let home = TempDir::new().unwrap();
-    let work = TempDir::new().unwrap();
-    let project_dir = project(work.path());
-    let store = Store::new(home.path().join("store"));
-    let registry = FixtureRegistry::new().with_tree(&[
-        ("a", "1.0.0", &[("b", "^1.0.0")]),
-        ("b", "1.0.0", &[("c", "^1.0.0")]),
-        ("c", "1.0.0", &[]),
-    ]);
-
-    let installed = install(project_dir, &store, &registry,
-        &spec("a", VersionSpec::Latest)).unwrap();
-
-    assert_eq!(installed.resolved_count, 3);
-
-    // Only the direct dependency is visible at the top level.
-    assert!(project_dir.join("node_modules/a").exists());
-    assert!(!project_dir.join("node_modules/b").exists(),
-        "transitive deps must not be hoisted into the project's node_modules");
-
-    // But `a` can see `b`, and `b` can see `c`.
-    assert!(project_dir.join("node_modules/a/../../.jerky/a@1.0.0/node_modules/b").exists()
-         || project_dir.join("node_modules/.jerky/a@1.0.0/node_modules/b").exists());
-    assert!(project_dir.join("node_modules/.jerky/b@1.0.0/node_modules/c").exists());
+fn depth_is_computed_not_assumed() {
+    // The same package, linked from importers at two different depths, must
+    // get two different targets and both must resolve.
 }
 
 #[test]
-fn only_the_requested_package_is_recorded_in_the_manifest() {
-    // Transitive dependencies live in the lockfile, never in package.json.
-    let home = TempDir::new().unwrap();
-    let work = TempDir::new().unwrap();
-    let project_dir = project(work.path());
-    let store = Store::new(home.path().join("store"));
-    let registry = FixtureRegistry::new().with_tree(&[
-        ("a", "1.0.0", &[("b", "^1.0.0")]),
-        ("b", "1.0.0", &[]),
-    ]);
-
-    install(project_dir, &store, &registry, &spec("a", VersionSpec::Latest)).unwrap();
-
-    let raw = std::fs::read_to_string(project_dir.join("package.json")).unwrap();
-    let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
-    assert!(parsed["dependencies"]["a"].is_string());
-    assert!(parsed["dependencies"]["b"].is_null(), "b is transitive");
-}
-
-#[test]
-fn both_versions_of_a_conflicting_dependency_land_on_disk() {
-    let home = TempDir::new().unwrap();
-    let work = TempDir::new().unwrap();
-    let project_dir = project(work.path());
-    let store = Store::new(home.path().join("store"));
-    let registry = FixtureRegistry::new().with_tree(&[
-        ("a", "1.0.0", &[("b", "^1.0.0"), ("c", "^1.0.0")]),
-        ("b", "1.0.0", &[("d", "^1.0.0")]),
-        ("c", "1.0.0", &[("d", "^2.0.0")]),
-        ("d", "1.5.0", &[]),
-        ("d", "2.1.0", &[]),
-    ]);
-
-    install(project_dir, &store, &registry, &spec("a", VersionSpec::Latest)).unwrap();
-
-    let jerky = project_dir.join("node_modules/.jerky");
-    assert!(jerky.join("d@1.5.0").is_dir());
-    assert!(jerky.join("d@2.1.0").is_dir());
-    // And each dependent's private view points at its own.
-    assert!(jerky.join("b@1.0.0/node_modules/d/package.json").is_file());
-    assert!(jerky.join("c@1.0.0/node_modules/d/package.json").is_file());
-}
-
-#[test]
-fn a_failure_partway_through_records_nothing() {
-    // The manifest and lockfile are written last, so an interrupted install
-    // leaves an installed-but-unrecorded tree rather than a manifest that
-    // lies. `c`'s tarball does not match its advertised hash.
-    let home = TempDir::new().unwrap();
-    let work = TempDir::new().unwrap();
-    let project_dir = project(work.path());
-    let store = Store::new(home.path().join("store"));
-    let registry = FixtureRegistry::new()
-        .with_tree(&[("a", "1.0.0", &[("c", "^1.0.0")])])
-        .with_corrupt_package("c", "1.0.0", vec![1, 2, 3]);
-
-    let result = install(project_dir, &store, &registry, &spec("a", VersionSpec::Latest));
-    assert!(result.is_err());
-
-    let raw = std::fs::read_to_string(project_dir.join("package.json")).unwrap();
-    assert!(!raw.contains("\"a\""), "manifest recorded a failed install");
-    assert!(!project_dir.join("jerky-lock.json").exists(), "lockfile written on failure");
+fn a_local_package_links_straight_at_its_directory() {
+    // apps/web/node_modules/ui -> ../../packages/ui
+    // Not into the virtual store: there is no store entry, because there is
+    // no tarball.
 }
 ```
 
-- [ ] **Step 2: Write the implementation**
+- [ ] **Step 2: Implement**
 
-Restructure `install` into three phases. The phase boundaries are what make
-the ordering guarantees legible rather than emergent.
+One function computes the prefix from the importer's depth; every target is
+built from it. **No literal `../` anywhere else in the module** — that is the
+constraint that keeps a nested importer from silently getting a root-shaped
+link.
 
-```rust
-pub fn install(
-    project_dir: &Path,
-    store: &Store,
-    registry: &dyn RegistryClient,
-    spec: &PackageSpec,
-) -> Result<Installed, InstallError> {
-    // Phase 1: resolve. No disk writes at all.
-    let mut manifest = Manifest::load(project_dir)?;
+- [ ] **Step 3: Correct the spec 1 design**
 
-    let mut roots = manifest.dependency_ranges();
-    roots.insert(spec.name.clone(), spec.version.as_request().to_string());
-    let graph = resolver::resolve(registry, &roots)?;
+Section 5's symlink line is still written for a single project. Note that the
+target is importer-relative and point at the workspace design.
 
-    // The requested package's concrete version, for the manifest and the
-    // success message. Taken from the graph, never from the request.
-    let requested = graph
-        .packages
-        .values()
-        .find(|p| p.id.name == spec.name)
-        .ok_or_else(|| InstallError::NotResolved(spec.name.clone()))?
-        .clone();
-
-    // Phase 2: materialise every node. Store first, then links.
-    let node_modules = project_dir.join("node_modules");
-    for pkg in graph.packages.values() {
-        let key = pkg.integrity.store_key();
-        let entry = if store.contains(&key) {
-            store.entry_path(&key)
-        } else {
-            let tarball = registry.fetch_tarball(&pkg.resolved)?;
-            pkg.integrity.verify(&tarball).map_err(|source| InstallError::Integrity {
-                name: pkg.id.name.clone(),
-                version: pkg.id.version.clone(),
-                source,
-            })?;
-            store.commit(&key, |staging| archive::extract(&tarball, staging))?
-        };
-
-        linker::populate_virtual_store(
-            &entry, &node_modules, &pkg.id.to_string(), &pkg.id.name)?;
-    }
-
-    // Phase 3: wire the edges, now that every directory exists. Splitting this
-    // from phase 2 avoids linking at a target that has not been created yet,
-    // which the graph's ordering does not otherwise guarantee.
-    for pkg in graph.packages.values() {
-        let own_modules = node_modules
-            .join(".jerky")
-            .join(pkg.id.to_string())
-            .join("node_modules");
-        for (dep_name, dep_id) in &pkg.dependencies {
-            linker::symlink_into_store(&own_modules, dep_name, &dep_id.to_string())?;
-        }
-    }
-
-    // Direct dependencies — and only those — are visible at the top level.
-    for name in graph.root.keys() {
-        if let Some(p) = graph.packages.values().find(|p| &p.id.name == name) {
-            linker::symlink_dependency(&node_modules, name, &p.id.to_string())?;
-        }
-    }
-
-    // Phase 4: record. Last, so nothing claims more than is on disk.
-    manifest.add_dependency(&requested.id.name, &format!("^{}", requested.id.version));
-    manifest.save()?;
-    lockfile::save(&graph, project_dir)?;
-
-    Ok(Installed {
-        name: requested.id.name.clone(),
-        version: requested.id.version.clone(),
-        resolved_count: graph.packages.len(),
-    })
-}
-```
-
-`Manifest` gains `dependency_ranges(&self) -> BTreeMap<String, String>`, reading
-the `dependencies` object. Existing exact pins from spec 1 installs parse as
-ranges that match exactly one version, so old manifests keep working with no
-migration.
-
-- [ ] **Step 3: Update `main.rs`'s output**
-
-```rust
-            let installed = jerky::commands::install::install(&project_dir, &store, &registry, &spec)?;
-            println!("resolved {} packages", installed.resolved_count);
-            println!("added {}@{}", installed.name, installed.version);
-```
-
-- [ ] **Step 4: Run the tests**
-
-Run: `cargo test --test install`
-Expected: PASS — spec 1's 7 tests plus 4 new ones.
-
-Spec 1's `installs_a_package_end_to_end` will need its manifest assertion
-updated from `"4.17.21"` to `"^4.17.21"`. That is the caret change, not a
-regression — confirm it is the only spec 1 test that moves.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add src/ tests/
-git commit -m "feat: install a whole dependency graph"
-```
+- [ ] **Step 4: Run and commit**
 
 ---
 
-### Task 7: Caret ranges, lockfile reuse, and integrity authority
+### Task 7 (was 6): Install across a workspace
 
 **Files:**
-- Modify: `src/commands/install.rs`, `tests/install.rs`, `README` or `CHANGELOG` if one exists
+- Modify: `src/commands/install.rs`, `src/main.rs`, `tests/install.rs`
 
 **Interfaces:**
-- Produces: no new public API; behaviour changes only
+- Produces: `install(workspace: &Workspace, importer: &ImporterPath, store, registry, spec) -> Result<Installed, InstallError>`
 
-Three related behaviours, grouped because they are all about the lockfile being
+The phase structure from the single-project version holds. What changes is that
+resolution seeds from every importer, and linking happens per importer.
+
+- [ ] **Step 1: Write the failing tests**
+
+```rust
+#[test]
+fn installing_from_one_importer_leaves_the_others_linked() {
+    // Two importers wanting different versions. Both end up correct, and
+    // installing into one does not disturb the other's node_modules.
+}
+
+#[test]
+fn two_importers_on_the_same_version_share_one_store_entry() {
+    // The reason the store lives at the workspace root. Asserted on inode,
+    // like spec 1's hard-link test — a copy passes every other assertion.
+}
+
+#[test]
+fn a_local_dependency_is_linked_not_fetched() {
+    // Counted: the registry must see zero requests for a workspace member.
+}
+
+#[test]
+fn a_workspace_specifier_naming_no_member_is_an_error() {
+    // `workspace:*` for a package that is not in the repo is a typo, not a
+    // fallback to the registry.
+}
+
+#[test]
+fn a_single_importer_workspace_installs_exactly_as_before() {
+    // Spec 1 and 2's existing behaviour, now through the general path.
+}
+```
+
+- [ ] **Step 2: Implement**
+
+Resolution seeds from every importer's ranges at once, so one walk covers the
+workspace and two importers wanting the same package share the work.
+
+Local specifiers short-circuit before the registry: `workspace:*` resolves to
+the member of that name, and errors if there is none.
+
+Linking runs per importer: each gets its own `node_modules` of symlinks, built
+with the depth-aware targets from Task 6.
+
+- [ ] **Step 3: Wire `main.rs`**
+
+`main.rs` finds the workspace root by walking up from the cwd, discovers
+members, and picks the importer the user is standing in. A cwd inside no member
+is an error naming the members, not a guess.
+
+- [ ] **Step 4: Run, smoke-test, commit**
+
+Verify against a real two-package workspace, not only fixtures.
+
+---
+
+### Task 8 (was 7): Caret ranges, per-importer reuse, and integrity authority
+
+**Files:**
+- Modify: `src/commands/install.rs`, `tests/install.rs`, `CHANGELOG.md`
+
+Three behaviours, grouped because they are all about the lockfile being
 consumed rather than merely written.
 
 - [ ] **Step 1: Write the failing tests**
@@ -1565,184 +1291,73 @@ consumed rather than merely written.
 ```rust
 #[test]
 fn the_manifest_records_a_caret_range() {
-    // The change spec 1 deferred: "Switch to caret in spec 2, when ranges
-    // actually resolve."
-    let home = TempDir::new().unwrap();
-    let work = TempDir::new().unwrap();
-    let project_dir = project(work.path());
-    let store = Store::new(home.path().join("store"));
-    let registry = FixtureRegistry::new().with_tree(&[("lodash", "4.17.21", &[])]);
-
-    install(project_dir, &store, &registry, &spec("lodash", VersionSpec::Latest)).unwrap();
-
-    let raw = std::fs::read_to_string(project_dir.join("package.json")).unwrap();
-    let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
-    assert_eq!(parsed["dependencies"]["lodash"], "^4.17.21");
+    // What spec 1 deferred to "spec 2, when ranges actually resolve".
 }
 
 #[test]
-fn an_unchanged_project_does_not_re_resolve() {
-    // Counted, not observed: the resolved tree is identical either way.
-    let home = TempDir::new().unwrap();
-    let work = TempDir::new().unwrap();
-    let project_dir = project(work.path());
-    let store = Store::new(home.path().join("store"));
-    let registry = FixtureRegistry::new().with_tree(&[
-        ("a", "1.0.0", &[("b", "^1.0.0")]),
-        ("b", "1.0.0", &[]),
-    ]);
-
-    install(project_dir, &store, &registry, &spec("a", VersionSpec::Latest)).unwrap();
-    let after_first = registry.packument_calls();
-
-    install(project_dir, &store, &registry, &spec("a", VersionSpec::Latest)).unwrap();
-
-    assert_eq!(registry.packument_calls(), after_first,
-        "the lockfile was not reused");
+fn an_unchanged_workspace_does_not_re_resolve() {
+    // Counted, because the resolved graph is identical either way.
 }
 
 #[test]
-fn a_changed_manifest_invalidates_the_lockfile() {
-    let home = TempDir::new().unwrap();
-    let work = TempDir::new().unwrap();
-    let project_dir = project(work.path());
-    let store = Store::new(home.path().join("store"));
-    let registry = FixtureRegistry::new()
-        .with_tree(&[("a", "1.0.0", &[]), ("newcomer", "1.0.0", &[])]);
-
-    install(project_dir, &store, &registry, &spec("a", VersionSpec::Latest)).unwrap();
-    let after_first = registry.packument_calls();
-
-    install(project_dir, &store, &registry, &spec("newcomer", VersionSpec::Latest)).unwrap();
-
-    assert!(registry.packument_calls() > after_first,
-        "a new dependency must trigger resolution");
-    let graph = jerky::lockfile::load(project_dir).unwrap().unwrap();
-    assert_eq!(graph.packages.len(), 2);
+fn editing_one_importer_re_resolves_only_what_it_must() {
+    // Staleness is per-importer: a changed apps/web must not invalidate
+    // everything the root already resolved. This is what the importers map
+    // buys over a single `root` block.
 }
 
 #[test]
 fn a_lockfile_integrity_mismatch_stops_the_install() {
-    // The trust-on-first-use anchor. Spec 1 accepted this gap explicitly:
-    // "a republished or tampered tarball for an already-pinned version would
-    // go unnoticed." This is the test that closes it.
-    let home = TempDir::new().unwrap();
-    let work = TempDir::new().unwrap();
-    let project_dir = project(work.path());
-    let store = Store::new(home.path().join("store"));
-    let registry = FixtureRegistry::new().with_tree(&[("a", "1.0.0", &[])]);
-
-    install(project_dir, &store, &registry, &spec("a", VersionSpec::Latest)).unwrap();
-
-    // Someone republished a@1.0.0 with different bytes.
-    let tampered = registry.republish("a", "1.0.0", vec![9, 9, 9]);
-
-    let result = install(project_dir, &store, &tampered, &spec("a", VersionSpec::Latest));
-    assert!(matches!(result, Err(InstallError::LockfileIntegrityMismatch { .. })),
-        "a changed hash for a pinned version must stop the install");
+    // The trust-on-first-use anchor spec 1 explicitly went without.
 }
 ```
 
-- [ ] **Step 2: Write the implementation**
+- [ ] **Step 2: Implement**
 
-Insert reuse ahead of resolution in phase 1:
+Reuse compares each importer's recorded specifiers against its manifest. An
+importer that matches is reused; one that does not is re-resolved.
 
-```rust
-    let mut roots = manifest.dependency_ranges();
-    roots.insert(spec.name.clone(), spec.version.as_request().to_string());
-
-    // Reuse the lockfile when it already describes exactly these ranges.
-    // `root` is what makes this decidable: without it there is no way to tell
-    // a current lockfile from one written before someone edited package.json.
-    let graph = match lockfile::load(project_dir)? {
-        Some(locked) if locked.root == roots => locked,
-        _ => resolver::resolve(registry, &roots)?,
-    };
-```
-
-And in phase 2, before fetching, when the graph came from the lockfile:
-
-```rust
-        // The lockfile's hash is authoritative. If the registry now reports a
-        // different one for the same version, the tarball was republished or
-        // tampered with, and continuing would defeat the point of recording it.
-        if from_lockfile {
-            let live = registry.version_metadata(&pkg.id.name, &pkg.id.version)?;
-            let live_integrity = live.dist.integrity().map_err(/* ... */)?;
-            if live_integrity.to_ssri() != pkg.integrity.to_ssri() {
-                return Err(InstallError::LockfileIntegrityMismatch {
-                    name: pkg.id.name.clone(),
-                    version: pkg.id.version.clone(),
-                    expected: pkg.integrity.to_ssri(),
-                    found: live_integrity.to_ssri(),
-                });
-            }
-        }
-```
-
-**A judgement call to make explicit while implementing:** this check costs one
-metadata request per locked package, which erodes the speed benefit of reuse.
-The alternative is to check only when the package is missing from the store,
-since a store hit already proves the bytes hash to the recorded key. Prefer
-that: a store hit is itself the integrity proof, so the check is only needed on
-the download path. If you take the cheaper route, say so in a comment, because
-a reader will otherwise wonder why the guarantee looks partial.
+The integrity check runs on the download path only. A store hit is itself proof
+the bytes hash to the recorded key, so re-fetching metadata for an entry
+already in the store would erode the benefit of reuse for no guarantee.
+**Say so in a comment**, or a reader will think the check is partial.
 
 - [ ] **Step 3: Record the behaviour change**
 
 `jerky install lodash` used to write `"4.17.21"` and now writes `"^4.17.21"`.
-Add a note wherever user-facing changes are recorded. If nothing exists yet,
-this is a good moment to start a `CHANGELOG.md` — it is the first change that
-alters output for an existing user.
+This is the first change that alters output for an existing user, so it is the
+moment to start `CHANGELOG.md`.
 
-- [ ] **Step 4: Full verification**
-
-Run: `cargo fmt && cargo clippy --all-targets -- -D warnings && cargo test`
-Expected: all PASS.
-
-- [ ] **Step 5: Verify against the real registry**
+- [ ] **Step 4: Full verification and a real smoke test**
 
 ```bash
-mkdir -p /tmp/jerky-spec2 && cd /tmp/jerky-spec2
-cargo run --manifest-path "$OLDPWD/Cargo.toml" -- init
-cargo run --manifest-path "$OLDPWD/Cargo.toml" -- install express
-node -e "console.log(typeof require('express'))"
+cargo fmt && cargo clippy --all-targets -- -D warnings && cargo test
 ```
 
-Expected: `resolved N packages` with N in the fifties, then `function`. Confirm
-that `node_modules/` holds only `express` and `.jerky`, that
-`jerky-lock.json` has an entry per resolved package, and that a second
-`install express` makes no packument request.
-
-`express` is the right smoke test because it is the design's own worked
-example and has a real transitive tree without being enormous.
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add src/ tests/ CHANGELOG.md
-git commit -m "feat: caret ranges, lockfile reuse, and integrity authority"
-```
+Then a real two-package workspace installing a real dependency, confirming the
+store is shared, each importer's `node_modules` resolves, and a second install
+makes no request.
 
 ---
 
 ## Self-Review
 
-Before opening the PR, check each of these against the diff rather than from memory.
+Check each against the diff rather than from memory.
 
 - **Does anything outside `src/range.rs` name `js_semver`?** `grep -rn 'js_semver' src/ tests/` should return `range.rs` only.
-- **Is there a `HashMap` on any path that reaches the lockfile?** The resolver's caches may use one — they are not serialized. Anything in `ResolvedGraph` or `OnDisk` must be `BTreeMap`.
-- **Does the resolver touch the filesystem?** `grep -n 'std::fs\|env::' src/resolver.rs` should return nothing.
+- **Is there a `HashMap` on any path that reaches the lockfile?** Internal caches may use one; anything serialized may not.
+- **Does any module below `main.rs` read the cwd or `$HOME`?** Only `main.rs` locates the workspace root.
+- **Is there a literal `../` outside the linker's depth calculation?** That is the bug that gives a nested importer a root-shaped link.
 - **Is `devDependencies` read anywhere?** It should not be, and `VersionMetadata` should not have a field for it.
-- **Does the conformance suite actually run?** A suite that silently passes on zero cases is worse than none — the length assertion guards this.
-- **Is the caret change noted for users?** It changes output for anyone who already installed with spec 1.
-- **Do the spec 1 tests still pass unmodified**, apart from the single manifest assertion the caret change moves? Anything else moving is a regression wearing a costume.
-- **Does an interrupted install leave a lockfile?** It must not; that is the phase 4 ordering.
+- **Does any test exercise more than one importer?** A suite that only ever sees `.` is not testing workspaces.
+- **Do untrusted paths get validated?** Importer keys from a lockfile and `workspaces` globs from a manifest can both escape the root, and neither should.
+- **Is the caret change noted for users?**
+- **Do the spec 1 tests still pass**, apart from the manifest assertion the caret change moves?
 
 ## Deferred
 
-- **Parallel downloads — #33.** Until it lands, large trees install visibly
-  slower than npm, which is the accepted cost of this spec.
+- **Parallel downloads — #33.** Until it lands, large trees install visibly slower than npm, which is the accepted cost of this spec.
 - **Peer dependencies — #34.** jerky will install trees npm would warn about.
-- **Lockfile pruning**, unfiled: there is no operation that would trigger it
-  until an `uninstall` command exists.
+- **`--filter` selection — #40.** The cwd covers the common case. Overlaps #13 and #18, which need the same project graph.
+- **Enforcing one version across importers — #41.** Detection first; enforcement needs somewhere to configure it, which is #12's territory.
+- **Lockfile pruning**, unfiled: there is no operation that would trigger it until an `uninstall` command exists.
