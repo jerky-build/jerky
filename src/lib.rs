@@ -4,6 +4,7 @@ pub mod commands;
 pub mod error;
 pub mod integrity;
 pub mod linker;
+pub mod lockfile;
 pub mod manifest;
 pub mod range;
 pub mod registry;
