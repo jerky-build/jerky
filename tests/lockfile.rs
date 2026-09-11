@@ -101,7 +101,16 @@ fn round_trips_through_disk() {
         .unwrap()
         .expect("a lockfile was written");
 
-    assert_eq!(back.root, graph.root);
+    assert_eq!(back.importers.len(), graph.importers.len());
+    for (path, importer) in &graph.importers {
+        let other = back.importers.get(path).expect("every importer survives");
+        assert_eq!(other.dependencies.len(), importer.dependencies.len());
+        for (name, dependency) in &importer.dependencies {
+            let round_tripped = &other.dependencies[name];
+            assert_eq!(round_tripped.specifier, dependency.specifier);
+            assert_eq!(round_tripped.resolution, dependency.resolution);
+        }
+    }
     assert_eq!(back.packages.len(), graph.packages.len());
     for (id, pkg) in &graph.packages {
         let other = back.packages.get(id).expect("every package survives");
@@ -137,7 +146,7 @@ fn adding_one_dependency_touches_only_its_own_block() {
     let removed: Vec<&str> = before.lines().filter(|l| !after.contains(*l)).collect();
     assert!(
         removed.len() <= 1,
-        "adding a dependency rewrote {} existing lines; only the root block should change: {removed:?}",
+        "adding a dependency rewrote {} existing lines; only the importer block should change: {removed:?}",
         removed.len()
     );
 }
@@ -156,7 +165,7 @@ fn an_unknown_lockfile_version_is_refused() {
     let dir = TempDir::new().unwrap();
     std::fs::write(
         dir.path().join(LOCKFILE_NAME),
-        r#"{"lockfileVersion": 99, "root": {}, "packages": {}}"#,
+        r#"{"lockfileVersion": 99, "importers": {}, "packages": {}}"#,
     )
     .unwrap();
 
@@ -183,7 +192,7 @@ fn an_unusable_integrity_hash_is_refused() {
     let dir = TempDir::new().unwrap();
     std::fs::write(
         dir.path().join(LOCKFILE_NAME),
-        r#"{"lockfileVersion": 1, "root": {},
+        r#"{"lockfileVersion": 1, "importers": {},
             "packages": { "a@1.0.0": {
                 "version": "1.0.0",
                 "resolved": "https://r.test/a.tgz",
@@ -203,7 +212,7 @@ fn a_key_that_is_not_name_at_version_is_refused() {
     let dir = TempDir::new().unwrap();
     std::fs::write(
         dir.path().join(LOCKFILE_NAME),
-        r#"{"lockfileVersion": 1, "root": {},
+        r#"{"lockfileVersion": 1, "importers": {},
             "packages": { "no-at-sign": {
                 "version": "1.0.0",
                 "resolved": "https://r.test/a.tgz",
@@ -226,7 +235,7 @@ fn a_scoped_package_key_splits_on_the_last_at() {
     let dir = TempDir::new().unwrap();
     std::fs::write(
         dir.path().join(LOCKFILE_NAME),
-        r#"{"lockfileVersion": 1, "root": {},
+        r#"{"lockfileVersion": 1, "importers": {},
             "packages": { "@types/node@20.1.0": {
                 "version": "20.1.0",
                 "resolved": "https://r.test/n.tgz",
@@ -268,8 +277,11 @@ fn the_lockfile_records_edges_and_integrity() {
     assert!(a["integrity"].as_str().unwrap().starts_with("sha512-"));
     // The edge records the concrete version chosen, not the range asked for.
     assert_eq!(a["dependencies"]["b"], "1.0.0");
-    // And the root records the range, which is what makes staleness detectable.
-    assert_eq!(parsed["root"]["a"], "^1.0.0");
+    // And the root importer records the range it asked for alongside the
+    // version that satisfied it.
+    let declared = &parsed["importers"]["."]["dependencies"]["a"];
+    assert_eq!(declared["specifier"], "^1.0.0");
+    assert_eq!(declared["version"], "1.0.0");
 }
 
 /// A valid sha512 SSRI string. Content is irrelevant; it only has to parse.
@@ -289,7 +301,7 @@ fn a_key_disagreeing_with_its_entry_is_refused() {
     write_raw(
         &dir,
         &format!(
-            r#"{{"lockfileVersion":1,"root":{{}},"packages":{{
+            r#"{{"lockfileVersion":1,"importers":{{}},"packages":{{
                 "b@1.0.0": {{"version":"1.0.0","resolved":"https://r.test/u1.tgz","integrity":"{HASH}"}},
                 "b@2.0.0": {{"version":"1.0.0","resolved":"https://r.test/u2.tgz","integrity":"{HASH}"}}
             }}}}"#
@@ -310,7 +322,7 @@ fn an_edge_pointing_at_nothing_is_refused() {
     write_raw(
         &dir,
         &format!(
-            r#"{{"lockfileVersion":1,"root":{{}},"packages":{{
+            r#"{{"lockfileVersion":1,"importers":{{}},"packages":{{
                 "a@1.0.0": {{"version":"1.0.0","resolved":"https://r.test/a.tgz","integrity":"{HASH}",
                              "dependencies":{{"ghost":"9.9.9"}}}}
             }}}}"#
@@ -336,7 +348,7 @@ fn an_edge_resolved_later_in_the_file_is_accepted() {
     write_raw(
         &dir,
         &format!(
-            r#"{{"lockfileVersion":1,"root":{{}},"packages":{{
+            r#"{{"lockfileVersion":1,"importers":{{}},"packages":{{
                 "a@1.0.0": {{"version":"1.0.0","resolved":"https://r.test/a.tgz","integrity":"{HASH}",
                              "dependencies":{{"b":"1.0.0"}}}},
                 "b@1.0.0": {{"version":"1.0.0","resolved":"https://r.test/b.tgz","integrity":"{HASH}"}}
@@ -372,10 +384,196 @@ fn a_future_format_says_upgrade_rather_than_malformed() {
 fn a_file_without_a_version_field_is_malformed() {
     // Distinct from an unknown version: there is nothing to act on.
     let dir = TempDir::new().unwrap();
-    write_raw(&dir, r#"{"root":{},"packages":{}}"#);
+    write_raw(&dir, r#"{"importers":{},"packages":{}}"#);
 
     assert!(matches!(
         lockfile::load(dir.path()),
         Err(LockfileError::Malformed { .. })
     ));
+}
+
+/// Build a two-importer workspace by hand.
+///
+/// The resolver still seeds from a single root — widening its input is Task 7 —
+/// but the *format* has to carry multiple importers before then, and a format
+/// only ever exercised with one importer is not exercising this at all.
+fn two_importer_graph() -> jerky::resolver::ResolvedGraph {
+    use jerky::resolver::{Dependency, Importer, ImporterPath, Resolution};
+
+    let registry = small_tree();
+    let mut graph = resolve(&registry, &roots(&[("a", "^1.0.0")])).unwrap();
+
+    let a_id = graph
+        .packages
+        .keys()
+        .find(|id| id.name == "a")
+        .cloned()
+        .unwrap();
+
+    let mut web = Importer::default();
+    web.dependencies.insert(
+        "a".to_string(),
+        Dependency {
+            specifier: "^1.0.0".to_string(),
+            resolution: Resolution::Registry(a_id),
+        },
+    );
+    // A workspace member: linked in place, relative to the importer.
+    web.dependencies.insert(
+        "ui".to_string(),
+        Dependency {
+            specifier: "workspace:*".to_string(),
+            resolution: Resolution::Local(std::path::PathBuf::from("../../packages/ui")),
+        },
+    );
+
+    graph
+        .importers
+        .insert(ImporterPath::new("apps/web").unwrap(), web);
+    graph
+}
+
+#[test]
+fn importers_are_keyed_by_directory_and_sorted() {
+    let dir = TempDir::new().unwrap();
+    lockfile::save(&two_importer_graph(), dir.path()).unwrap();
+
+    let parsed: serde_json::Value = serde_json::from_str(&read(&dir)).unwrap();
+    let keys: Vec<&str> = parsed["importers"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(keys, [".", "apps/web"]);
+}
+
+#[test]
+fn a_dependency_records_both_what_was_asked_and_what_was_chosen() {
+    let dir = TempDir::new().unwrap();
+    lockfile::save(&two_importer_graph(), dir.path()).unwrap();
+
+    let parsed: serde_json::Value = serde_json::from_str(&read(&dir)).unwrap();
+    let entry = &parsed["importers"]["."]["dependencies"]["a"];
+    assert_eq!(entry["specifier"], "^1.0.0");
+    assert_eq!(entry["version"], "1.0.0");
+}
+
+#[test]
+fn a_local_dependency_records_a_link_rather_than_a_version() {
+    let dir = TempDir::new().unwrap();
+    lockfile::save(&two_importer_graph(), dir.path()).unwrap();
+
+    let parsed: serde_json::Value = serde_json::from_str(&read(&dir)).unwrap();
+    let entry = &parsed["importers"]["apps/web"]["dependencies"]["ui"];
+    assert_eq!(entry["specifier"], "workspace:*");
+    assert_eq!(entry["version"], "link:../../packages/ui");
+}
+
+#[test]
+fn a_local_dependency_has_no_packages_entry() {
+    // No tarball and no integrity hash, because there is nothing to verify —
+    // the bytes are in the repo.
+    let dir = TempDir::new().unwrap();
+    lockfile::save(&two_importer_graph(), dir.path()).unwrap();
+
+    let parsed: serde_json::Value = serde_json::from_str(&read(&dir)).unwrap();
+    assert!(
+        parsed["packages"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .all(|key| !key.starts_with("ui@")),
+        "a linked workspace member was given a packages entry"
+    );
+}
+
+#[test]
+fn a_multi_importer_graph_round_trips() {
+    use jerky::resolver::{ImporterPath, Resolution};
+
+    let dir = TempDir::new().unwrap();
+    let graph = two_importer_graph();
+    lockfile::save(&graph, dir.path()).unwrap();
+
+    let back = lockfile::load(dir.path()).unwrap().unwrap();
+
+    assert_eq!(back.importers.len(), 2);
+    let web = &back.importers[&ImporterPath::new("apps/web").unwrap()];
+    assert_eq!(web.dependencies["a"].specifier, "^1.0.0");
+    assert!(matches!(
+        &web.dependencies["ui"].resolution,
+        Resolution::Local(path) if path == std::path::Path::new("../../packages/ui")
+    ));
+}
+
+#[test]
+fn an_importer_path_escaping_the_workspace_is_refused() {
+    // A hand-edited key naming a directory outside the workspace. Same class
+    // as the tar-slip guard in `archive`: an untrusted path that resolves
+    // outside the tree it claims to describe.
+    let dir = TempDir::new().unwrap();
+    write_raw(
+        &dir,
+        r#"{"lockfileVersion":1,"importers":{"../escape":{}},"packages":{}}"#,
+    );
+
+    assert!(matches!(
+        lockfile::load(dir.path()),
+        Err(LockfileError::BadImporter { .. })
+    ));
+}
+
+#[test]
+fn an_absolute_importer_path_is_refused() {
+    let dir = TempDir::new().unwrap();
+    write_raw(
+        &dir,
+        r#"{"lockfileVersion":1,"importers":{"/etc":{}},"packages":{}}"#,
+    );
+
+    assert!(matches!(
+        lockfile::load(dir.path()),
+        Err(LockfileError::BadImporter { .. })
+    ));
+}
+
+#[test]
+fn an_importer_dependency_naming_no_package_is_refused() {
+    // The importer half needs the same guarantee the package edges already
+    // have: a dependency pointing at nothing must not load as a real node.
+    let dir = TempDir::new().unwrap();
+    write_raw(
+        &dir,
+        &format!(
+            r#"{{"lockfileVersion":1,
+                "importers":{{".":{{"dependencies":{{"ghost":{{"specifier":"^1.0.0","version":"9.9.9"}}}}}}}},
+                "packages":{{"a@1.0.0":{{"version":"1.0.0","resolved":"https://r.test/a.tgz","integrity":"{HASH}"}}}}}}"#
+        ),
+    );
+
+    assert!(matches!(
+        lockfile::load(dir.path()),
+        Err(LockfileError::UnknownImporterDependency { .. })
+    ));
+}
+
+#[test]
+fn an_alias_round_trips() {
+    // `execa` declared as `npm:safe-execa@0.3.0` is real — it is in pnpm's own
+    // lockfile. The importer's key is the local name; spec 2's review called
+    // this latent and unreachable, and it is neither.
+    let dir = TempDir::new().unwrap();
+    write_raw(
+        &dir,
+        &format!(
+            r#"{{"lockfileVersion":1,
+                "importers":{{".":{{"dependencies":{{"execa":{{"specifier":"npm:safe-execa@0.3.0","version":"0.3.0"}}}}}}}},
+                "packages":{{"execa@0.3.0":{{"version":"0.3.0","resolved":"https://r.test/e.tgz","integrity":"{HASH}"}}}}}}"#
+        ),
+    );
+
+    let graph = lockfile::load(dir.path()).unwrap().unwrap();
+    let root = &graph.importers[&jerky::resolver::ImporterPath::root()];
+    assert_eq!(root.dependencies["execa"].specifier, "npm:safe-execa@0.3.0");
 }

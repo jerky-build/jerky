@@ -12,7 +12,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::integrity::Integrity;
-use crate::resolver::{PackageId, ResolvedGraph, ResolvedPackage};
+use crate::resolver::{
+    Dependency, Importer, ImporterPath, PackageId, Resolution, ResolvedGraph, ResolvedPackage,
+};
 
 pub const LOCKFILE_NAME: &str = "jerky-lock.json";
 
@@ -40,6 +42,22 @@ pub enum LockfileError {
     },
     #[error("{path} records `{entry}`, which is not a valid name@version key")]
     BadKey { path: PathBuf, entry: String },
+    #[error("{path} records importer `{importer}`, which is not a usable workspace path")]
+    BadImporter {
+        path: PathBuf,
+        importer: String,
+        #[source]
+        source: crate::resolver::ImporterPathError,
+    },
+    #[error(
+        "{path} has importer `{importer}` depending on `{name}`, recorded as `{version}`, which it does not record"
+    )]
+    UnknownImporterDependency {
+        path: PathBuf,
+        importer: String,
+        name: String,
+        version: String,
+    },
     #[error("{path} keys `{entry}` but records version `{declared}` inside it")]
     KeyVersionMismatch {
         path: PathBuf,
@@ -71,15 +89,39 @@ pub enum LockfileError {
 struct OnDisk {
     #[serde(rename = "lockfileVersion")]
     lockfile_version: u32,
-    /// The ranges the manifest declared, so staleness is detectable. Without
-    /// it there is no way to tell a current lockfile from one written before
-    /// someone edited `package.json`.
-    root: BTreeMap<String, String>,
-    /// Keyed `name@version`, flat rather than nested. A nested tree mirroring
-    /// the graph would reindent every descendant when something deep changes;
-    /// flat means adding a dependency appends a block and touches nothing else.
+    /// Every project in the workspace, keyed by directory, each recording what
+    /// it asked for and what that resolved to. A single-project repo has one
+    /// entry keyed `.`.
+    ///
+    /// Recording the specifier is what makes staleness detectable, and
+    /// recording it per importer is what makes staleness *per importer*: one
+    /// edited project no longer invalidates everything the rest resolved.
+    importers: BTreeMap<String, OnDiskImporter>,
+    /// Keyed `name@version`, flat rather than nested, and shared by every
+    /// importer. A nested tree mirroring the graph would reindent every
+    /// descendant when something deep changes; flat means adding a dependency
+    /// appends a block and touches nothing else.
     packages: BTreeMap<String, Entry>,
 }
+
+#[derive(Serialize, Deserialize, Default)]
+struct OnDiskImporter {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    dependencies: BTreeMap<String, OnDiskDependency>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct OnDiskDependency {
+    /// What the manifest asked for, verbatim.
+    specifier: String,
+    /// What it resolved to: a concrete version, or `link:<path>` for a
+    /// workspace member. The prefix is the only place `Resolution`'s two cases
+    /// are spelled rather than typed.
+    version: String,
+}
+
+/// The marker distinguishing a linked workspace member from a registry version.
+const LINK_PREFIX: &str = "link:";
 
 /// Just enough of a lockfile to read its version, whatever else it holds.
 #[derive(Deserialize)]
@@ -131,9 +173,39 @@ pub fn save(graph: &ResolvedGraph, project_dir: &Path) -> Result<(), LockfileErr
         })
         .collect();
 
+    let importers = graph
+        .importers
+        .iter()
+        .map(|(path, importer)| {
+            (
+                path.as_str().to_string(),
+                OnDiskImporter {
+                    dependencies: importer
+                        .dependencies
+                        .iter()
+                        .map(|(name, dependency)| {
+                            (
+                                name.clone(),
+                                OnDiskDependency {
+                                    specifier: dependency.specifier.clone(),
+                                    version: match &dependency.resolution {
+                                        Resolution::Registry(id) => id.version.clone(),
+                                        Resolution::Local(target) => {
+                                            format!("{LINK_PREFIX}{}", target.display())
+                                        }
+                                    },
+                                },
+                            )
+                        })
+                        .collect(),
+                },
+            )
+        })
+        .collect();
+
     let on_disk = OnDisk {
         lockfile_version: LOCKFILE_VERSION,
-        root: graph.root.clone(),
+        importers,
         packages,
     };
 
@@ -255,8 +327,57 @@ pub fn load(project_dir: &Path) -> Result<Option<ResolvedGraph>, LockfileError> 
         }
     }
 
+    let mut importers = BTreeMap::new();
+    for (raw, on_disk_importer) in on_disk.importers {
+        // Importer keys come from a file that may have been hand-edited, so a
+        // key naming a directory outside the workspace is refused rather than
+        // resolved — the same reasoning `archive` applies to tar entries.
+        let importer_path =
+            ImporterPath::new(raw.clone()).map_err(|source| LockfileError::BadImporter {
+                path: path.clone(),
+                importer: raw.clone(),
+                source,
+            })?;
+
+        let mut dependencies = BTreeMap::new();
+        for (name, dependency) in on_disk_importer.dependencies {
+            let resolution = match dependency.version.strip_prefix(LINK_PREFIX) {
+                Some(target) => Resolution::Local(PathBuf::from(target)),
+                None => {
+                    // The name a dependency is declared under need not be the
+                    // package it resolves to — `execa` declared as
+                    // `npm:safe-execa@0.3.0` is a real example — so the target
+                    // is looked up by the version recorded against it, and
+                    // having no such package is an error rather than a
+                    // fabricated node.
+                    let id = packages
+                        .keys()
+                        .find(|id| id.name == name && id.version == dependency.version)
+                        .cloned()
+                        .ok_or_else(|| LockfileError::UnknownImporterDependency {
+                            path: path.clone(),
+                            importer: raw.clone(),
+                            name: name.clone(),
+                            version: dependency.version.clone(),
+                        })?;
+                    Resolution::Registry(id)
+                }
+            };
+
+            dependencies.insert(
+                name,
+                Dependency {
+                    specifier: dependency.specifier,
+                    resolution,
+                },
+            );
+        }
+
+        importers.insert(importer_path, Importer { dependencies });
+    }
+
     Ok(Some(ResolvedGraph {
-        root: on_disk.root,
+        importers,
         packages,
     }))
 }
