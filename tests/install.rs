@@ -68,7 +68,7 @@ fn installs_a_package_end_to_end() {
     // The manifest records the concrete version, with no caret.
     let raw = std::fs::read_to_string(project_dir.join("package.json")).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
-    assert_eq!(parsed["dependencies"]["lodash"], "4.17.21");
+    assert_eq!(parsed["dependencies"]["lodash"], "^4.17.21");
 }
 
 #[test]
@@ -91,7 +91,8 @@ fn the_recorded_version_comes_from_the_registry_not_the_request() {
 
     let raw = std::fs::read_to_string(project_dir.join("package.json")).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
-    assert_eq!(parsed["dependencies"]["react"], "18.2.0");
+    // Pinned to what came back, then recorded as a caret range over it.
+    assert_eq!(parsed["dependencies"]["react"], "^18.2.0");
 }
 
 #[test]
@@ -562,4 +563,283 @@ fn a_lockfile_target_is_one_climb_short_of_the_symlink() {
 
     assert_eq!(recorded, "../../packages/ui");
     assert_eq!(linked, Path::new("..").join(&recorded));
+}
+
+#[test]
+fn the_manifest_records_a_caret_range() {
+    // What spec 1 deferred to "spec 2, when ranges actually resolve". The
+    // caret goes on the version the registry chose, never on the request:
+    // asking for a dist-tag must still pin what came back.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let project_dir = project(work.path());
+    let store = Store::new(home.path().join("store"));
+
+    install(
+        &solo(project_dir),
+        &ImporterPath::root(),
+        &store,
+        &FixtureRegistry::new().with_package("lodash", "4.17.21", lodash_tarball()),
+        &spec("lodash", VersionSpec::Latest),
+    )
+    .unwrap();
+
+    assert_eq!(
+        read_json(&project_dir.join("package.json"))["dependencies"]["lodash"],
+        "^4.17.21"
+    );
+}
+
+#[test]
+fn an_exact_request_still_installs_that_exact_version() {
+    // The caret is what gets *recorded*; it must not become what gets
+    // *resolved*. Seeding the resolver with `^4.17.21` would install 4.18.0
+    // when one exists, which is not what `lodash@4.17.21` asked for.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let workspace = linked_workspace(root);
+    let store = Store::new(home.path().join("store"));
+    let registry =
+        FixtureRegistry::new().with_packument("lodash", &[("4.17.21", &[]), ("4.18.0", &[])]);
+
+    let installed = install(
+        &workspace,
+        &ImporterPath::new("apps/web").unwrap(),
+        &store,
+        &registry,
+        &spec("lodash", VersionSpec::Exact("4.17.21".into())),
+    )
+    .unwrap();
+
+    assert_eq!(installed.version, "4.17.21");
+    assert_eq!(linked_version(&root.join("apps/web"), "lodash"), "4.17.21");
+    assert_eq!(
+        read_json(&root.join("apps/web/package.json"))["dependencies"]["lodash"],
+        "^4.17.21"
+    );
+}
+
+#[test]
+fn an_unchanged_workspace_does_not_re_resolve() {
+    // Counted, because the resolved graph is identical either way — only the
+    // requests distinguish a reuse from a re-resolution.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let workspace = linked_workspace(root);
+    let store = Store::new(home.path().join("store"));
+    let registry = two_versions_of_lodash();
+    let request = spec("lodash", VersionSpec::Exact("4.17.21".into()));
+    let web = ImporterPath::new("apps/web").unwrap();
+
+    install(&workspace, &web, &store, &registry, &request).unwrap();
+    let after_first = registry.packument_calls();
+    assert!(after_first > 0, "the first install resolved nothing");
+
+    // Same workspace, same request, and now a lockfile recording both.
+    let workspace = Workspace::discover(root).unwrap();
+    install(&workspace, &web, &store, &registry, &request).unwrap();
+
+    assert_eq!(
+        registry.packument_calls(),
+        after_first,
+        "the second install re-resolved an unchanged workspace"
+    );
+    assert_eq!(registry.tarball_calls(), 1, "the tarball was fetched twice");
+    assert_eq!(linked_version(&root.join("apps/web"), "lodash"), "4.17.21");
+}
+
+#[test]
+fn editing_one_importer_re_resolves_only_what_it_must() {
+    // Staleness is per-importer: a changed apps/web must not invalidate
+    // everything the root already resolved. This is what the importers map
+    // buys over a single `root` block.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    write_manifest(
+        root,
+        r#"{"name":"ws","workspaces":["packages/*","apps/*"]}"#,
+    );
+    write_manifest(
+        &root.join("packages/ui"),
+        r#"{"name":"ui","dependencies":{"lodash":"^4.0.0"}}"#,
+    );
+    write_manifest(&root.join("apps/web"), r#"{"name":"web"}"#);
+
+    let store = Store::new(home.path().join("store"));
+    let registry = FixtureRegistry::new().with_tree(&[
+        ("lodash", "4.17.21", &[]),
+        ("alpha", "1.0.0", &[]),
+        ("beta", "1.0.0", &[]),
+    ]);
+    let web = ImporterPath::new("apps/web").unwrap();
+
+    install(
+        &Workspace::discover(root).unwrap(),
+        &web,
+        &store,
+        &registry,
+        &spec("alpha", VersionSpec::Exact("1.0.0".into())),
+    )
+    .unwrap();
+    assert_eq!(registry.packument_calls_for("lodash"), 1);
+
+    // Only apps/web changes.
+    write_manifest(
+        &root.join("apps/web"),
+        r#"{"name":"web","dependencies":{"alpha":"^1.0.0","beta":"^1.0.0"}}"#,
+    );
+
+    install(
+        &Workspace::discover(root).unwrap(),
+        &web,
+        &store,
+        &registry,
+        &spec("beta", VersionSpec::Exact("1.0.0".into())),
+    )
+    .unwrap();
+
+    assert_eq!(
+        registry.packument_calls_for("lodash"),
+        1,
+        "packages/ui was re-resolved even though its manifest never changed"
+    );
+    assert_eq!(registry.packument_calls_for("beta"), 1);
+
+    // And the untouched importer is still installed and still recorded.
+    assert_eq!(
+        linked_version(&root.join("packages/ui"), "lodash"),
+        "4.17.21"
+    );
+    let lock = read_json(&root.join("jerky-lock.json"));
+    assert_eq!(
+        lock["importers"]["packages/ui"]["dependencies"]["lodash"]["version"], "4.17.21",
+        "a reused importer was dropped from the lockfile"
+    );
+    assert!(
+        lock["packages"]["lodash@4.17.21"].is_object(),
+        "the reused importer's package was pruned out from under it"
+    );
+}
+
+#[test]
+fn a_lockfile_integrity_mismatch_stops_the_install() {
+    // The trust-on-first-use anchor spec 1 explicitly went without. The
+    // lockfile's hash is authoritative: if the registry later reports a
+    // different one for the same version, the install stops.
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    write_manifest(root, r#"{"name":"ws","workspaces":["packages/*"]}"#);
+    write_manifest(
+        &root.join("packages/ui"),
+        r#"{"name":"ui","dependencies":{"lodash":"^4.0.0"}}"#,
+    );
+
+    let registry = FixtureRegistry::new().with_tree(&[("lodash", "4.17.21", &[])]);
+    let first_home = TempDir::new().unwrap();
+    install(
+        &Workspace::discover(root).unwrap(),
+        &ImporterPath::root(),
+        &Store::new(first_home.path().join("store")),
+        &registry,
+        &spec("lodash", VersionSpec::Exact("4.17.21".into())),
+    )
+    .unwrap();
+
+    // Someone edits the committed lockfile, or the registry republishes the
+    // version under a different tarball. Either way the recorded hash and the
+    // reported one disagree.
+    let lock_path = root.join("jerky-lock.json");
+    let mut lock = read_json(&lock_path);
+    // Well-formed and the right length — sha512 of different bytes — so the
+    // refusal comes from the comparison rather than from a parse failure.
+    lock["packages"]["lodash@4.17.21"]["integrity"] = serde_json::Value::String(
+        "sha512-IsrOi3z1jfn6siSktZ62e0Sw0+tMBkqVpd1c21rXb70/VQu/Lp0xHuqJsgBtmbh5rCrKy4NYndU2byuYRUPePw=="
+            .into(),
+    );
+    std::fs::write(&lock_path, serde_json::to_string_pretty(&lock).unwrap()).unwrap();
+
+    // Force a re-resolution, so the registry's hash is fetched and compared.
+    write_manifest(
+        &root.join("packages/ui"),
+        r#"{"name":"ui","dependencies":{"lodash":"^4.17.0"}}"#,
+    );
+
+    // A fresh store, which is the realistic case: another machine cloning the
+    // repo with the lockfile committed. A store hit could not be wrong — the
+    // store key is the hash — so this is the only path where it can bite.
+    let second_home = TempDir::new().unwrap();
+    let err = install(
+        &Workspace::discover(root).unwrap(),
+        &ImporterPath::root(),
+        &Store::new(second_home.path().join("store")),
+        &registry,
+        &spec("lodash", VersionSpec::Exact("4.17.21".into())),
+    )
+    .unwrap_err();
+
+    match err {
+        InstallError::LockedIntegrityMismatch { name, version, .. } => {
+            assert_eq!(name, "lodash");
+            assert_eq!(version, "4.17.21");
+        }
+        other => panic!("expected a locked-integrity refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_warm_store_does_not_excuse_a_lockfile_mismatch() {
+    // The bytes being present proves only that they hash to their own key. It
+    // says nothing about whether that hash is the one the lockfile pinned, and
+    // a republished tarball is exactly the case where the two differ while the
+    // store is warm — the store is machine-global, so another project can have
+    // put the new bytes there already.
+    let work = TempDir::new().unwrap();
+    let home = TempDir::new().unwrap();
+    let root = work.path();
+    write_manifest(root, r#"{"name":"ws","workspaces":["packages/*"]}"#);
+    write_manifest(
+        &root.join("packages/ui"),
+        r#"{"name":"ui","dependencies":{"lodash":"^4.0.0"}}"#,
+    );
+
+    let registry = FixtureRegistry::new().with_tree(&[("lodash", "4.17.21", &[])]);
+    let store = Store::new(home.path().join("store"));
+    install(
+        &Workspace::discover(root).unwrap(),
+        &ImporterPath::root(),
+        &store,
+        &registry,
+        &spec("lodash", VersionSpec::Exact("4.17.21".into())),
+    )
+    .unwrap();
+
+    let lock_path = root.join("jerky-lock.json");
+    let mut lock = read_json(&lock_path);
+    lock["packages"]["lodash@4.17.21"]["integrity"] = serde_json::Value::String(
+        "sha512-IsrOi3z1jfn6siSktZ62e0Sw0+tMBkqVpd1c21rXb70/VQu/Lp0xHuqJsgBtmbh5rCrKy4NYndU2byuYRUPePw=="
+            .into(),
+    );
+    std::fs::write(&lock_path, serde_json::to_string_pretty(&lock).unwrap()).unwrap();
+    write_manifest(
+        &root.join("packages/ui"),
+        r#"{"name":"ui","dependencies":{"lodash":"^4.17.0"}}"#,
+    );
+
+    // Same store as the first install, so the bytes are already there.
+    let err = install(
+        &Workspace::discover(root).unwrap(),
+        &ImporterPath::root(),
+        &store,
+        &registry,
+        &spec("lodash", VersionSpec::Exact("4.17.21".into())),
+    )
+    .unwrap_err();
+
+    assert!(
+        matches!(err, InstallError::LockedIntegrityMismatch { .. }),
+        "a warm store let a lockfile mismatch through, got {err:?}"
+    );
 }

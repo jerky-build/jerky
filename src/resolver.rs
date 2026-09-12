@@ -5,7 +5,7 @@
 //! with no filesystem at all, and it is why the lockfile can be a straight
 //! serialization of the result.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Component, Path, PathBuf};
 
 use thiserror::Error;
@@ -222,6 +222,23 @@ pub struct Importer {
     pub dependencies: BTreeMap<String, Dependency>,
 }
 
+impl Importer {
+    /// Does this record exactly what a manifest declares?
+    ///
+    /// Both directions matter: a dependency added to the manifest is missing
+    /// from the record, and one deleted from it lingers there. Either way what
+    /// was recorded no longer describes what was asked for, which is the whole
+    /// question a lockfile's specifiers exist to answer.
+    pub fn matches(&self, declared: &BTreeMap<String, String>) -> bool {
+        self.dependencies.len() == declared.len()
+            && declared.iter().all(|(name, specifier)| {
+                self.dependencies
+                    .get(name)
+                    .is_some_and(|dependency| &dependency.specifier == specifier)
+            })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ResolvedGraph {
     /// Every project in the workspace, keyed by directory. A single-project
@@ -242,6 +259,48 @@ enum Dependent {
     Importer(ImporterPath),
     /// A package declaring one of its own.
     Package(PackageId),
+}
+
+impl ResolvedGraph {
+    /// The same graph with packages no importer can reach dropped.
+    ///
+    /// A full resolution only ever produces the reachable set, so keeping that
+    /// true under partial reuse preserves an existing property rather than
+    /// deciding lockfile pruning as a policy: merging a reused importer's
+    /// packages with a re-resolved one's would otherwise accumulate entries
+    /// nothing references, and would cost the format the minimal-diff property
+    /// it was flattened to get.
+    pub fn reachable(self) -> Self {
+        let mut reachable: BTreeSet<PackageId> = BTreeSet::new();
+        let mut queue: VecDeque<PackageId> = self
+            .importers
+            .values()
+            .flat_map(|importer| importer.dependencies.values())
+            .filter_map(|dependency| match &dependency.resolution {
+                Resolution::Registry(id) => Some(id.clone()),
+                // A local dependency has no node in `packages`; it is the repo.
+                Resolution::Local(_) => None,
+            })
+            .collect();
+
+        while let Some(id) = queue.pop_front() {
+            if !reachable.insert(id.clone()) {
+                continue;
+            }
+            if let Some(package) = self.packages.get(&id) {
+                queue.extend(package.dependencies.values().cloned());
+            }
+        }
+
+        ResolvedGraph {
+            importers: self.importers,
+            packages: self
+                .packages
+                .into_iter()
+                .filter(|(id, _)| reachable.contains(id))
+                .collect(),
+        }
+    }
 }
 
 /// One edge waiting to be resolved: who asked, for what name, at what range.
