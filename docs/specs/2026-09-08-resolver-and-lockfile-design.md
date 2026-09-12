@@ -4,7 +4,7 @@
 **Status:** Approved
 **Scope:** Spec 2 of 3 for jerky's package-manager spine
 **Issues:** #6, #11 (this spec); enables #19, #21, #22
-**Builds on:** `docs/superpowers/specs/2026-08-24-package-manager-design.md`
+**Builds on:** `docs/specs/2026-08-24-package-manager-design.md`
 
 ## 1. Context
 
@@ -27,7 +27,7 @@ designing it against the input that exercises none of its structure.
 **The semver crate is `js-semver`.** Answered by differential testing against
 npm's own `semver` 7.8.5 over 531 ranges: `js-semver` 531/531, `nodejs-semver`
 515/531, Cargo's `semver` 431/531. Full data in
-`docs/superpowers/research/2026-09-08-npm-semver-crate-selection.md`.
+`docs/research/2026-09-08-npm-semver-crate-selection.md`.
 
 The control matters for what it says about the failure mode, not just the
 score. Of Cargo `semver`'s 100 failures, 55 are refusals to parse and **45 are
@@ -269,8 +269,7 @@ the graph.
 **One linker correction this forces.** Spec 1's `symlink_dependency` writes a
 target with no leading `../`, correct for links in `node_modules/` itself. Links
 between packages *inside* the virtual store sit one level deeper, so they do
-need the `../` — which is exactly the case spec 1's Task 7 note said pnpm uses
-it for. The function gains a variant for intra-store links rather than being
+need the `../` — which is exactly the case pnpm uses it for. The function gains a variant for intra-store links rather than being
 changed.
 
 ### Selection rules
@@ -345,7 +344,7 @@ dependency.
 > workspace-relative directory, with each dependency recording both a
 > `specifier` and the `version` it resolved to. jerky manages every project in
 > a monorepo from the root, so one block of ranges could describe only one of
-> them. See `docs/superpowers/specs/2026-09-10-workspace-design.md` §6. The
+> them. See `docs/specs/2026-09-10-workspace-design.md` §6. The
 > rest of this section — flat `packages` keyed `name@version`, deterministic
 > ordering, minimal diff noise, the version gate, integrity per package — is
 > unchanged.

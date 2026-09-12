@@ -2,7 +2,7 @@
 //!
 //! The oracle is committed rather than generated, so this runs offline and CI
 //! never depends on the registry being reachable. See
-//! `docs/superpowers/research/2026-09-08-npm-semver-crate-selection.md` for how
+//! `docs/research/2026-09-08-npm-semver-crate-selection.md` for how
 //! it was produced and why this suite exists: `js-semver` is pre-1.0, and this
 //! is what makes replacing it one test run rather than a repeat investigation.
 //!

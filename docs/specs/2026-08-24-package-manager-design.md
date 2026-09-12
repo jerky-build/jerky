@@ -504,7 +504,7 @@ invisible on Linux.
 **Spec 2 — the resolver.** `jerky install express`: npm range parsing,
 transitive walk, virtual store wiring for nested dependencies, and
 `jerky-lock.json`. Designed in
-`docs/superpowers/specs/2026-09-08-resolver-and-lockfile-design.md`. Parallel
+`docs/specs/2026-09-08-resolver-and-lockfile-design.md`. Parallel
 downloads were dropped from that slice: spec 2 is already a resolver plus a
 lockfile format, and both are worth getting right before making fast.
 
@@ -514,7 +514,7 @@ lockfile format, and both are worth getting right before making fast.
 **Workspaces.** This design says jerky is a monorepo tool and then scopes
 workspaces out of every slice, which left the single-project assumption
 load-bearing. Corrected in
-`docs/superpowers/specs/2026-09-10-workspace-design.md`, which covers #10 and
+`docs/specs/2026-09-10-workspace-design.md`, which covers #10 and
 revises the lockfile's top-level shape.
 
 ### Effect on existing issues
@@ -551,7 +551,7 @@ ranges put it at 531/531, against 515 for `nodejs-semver` and 431 for Cargo's
 worse than expected: 45 of its 100 failures are silent wrong answers on
 prerelease ranges rather than refusals to parse. Full data, the residual risk
 that `js-semver` is pre-1.0, and the reproducible harness are in
-`docs/superpowers/research/2026-09-08-npm-semver-crate-selection.md`.
+`docs/research/2026-09-08-npm-semver-crate-selection.md`.
 
 **File-level content addressing.** Whether to upgrade the store from
 package-level to file-level CAS, and when. The `v1/` path segment keeps this
