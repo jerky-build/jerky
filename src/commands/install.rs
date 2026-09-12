@@ -91,7 +91,7 @@ pub fn install(
     let node_modules = project_dir.join("node_modules");
     let dir_name = format!("{name}@{version}");
     linker::populate_virtual_store(&entry, &node_modules, &dir_name, &name)?;
-    linker::symlink_dependency(&node_modules, &name, &dir_name)?;
+    linker::symlink_dependency_from(project_dir, project_dir, &name, &dir_name)?;
 
     // Last: never record something that is not already true on disk. And
     // always the concrete version from the response, never a caret range that

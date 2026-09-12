@@ -155,9 +155,11 @@ impl ImporterPath {
 
     /// How many directories deep this importer sits below the workspace root.
     ///
-    /// The linker needs it: a symlink in the root's `node_modules` climbs
-    /// nowhere, while one in `packages/ui/node_modules` climbs three levels to
-    /// reach the root's virtual store.
+    /// Used to decide whether a relative `link:` target stays inside the
+    /// workspace: a `..` may not climb past the root. The linker does not use
+    /// it — it derives each climb from where the link and its target diverge,
+    /// so that one calculation covers importer, intra-store and local links
+    /// alike rather than three depth rules kept in agreement.
     pub fn depth(&self) -> usize {
         if self.is_root() {
             0

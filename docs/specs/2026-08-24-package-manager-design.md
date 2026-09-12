@@ -197,8 +197,12 @@ only module aware of more than one of the others. `integrity`, `archive`,
 <project>/node_modules/.jerky/lodash@4.17.21/node_modules/lodash/
     virtual store; hard links to the store entry
 
-<project>/node_modules/lodash -> .jerky/lodash@4.17.21/node_modules/lodash
-    relative symlink for each direct dependency
+<workspace root>/node_modules/lodash -> .jerky/lodash@4.17.21/node_modules/lodash
+    relative symlink for a direct dependency of the root importer
+
+<workspace root>/packages/ui/node_modules/lodash
+    -> ../../../node_modules/.jerky/lodash@4.17.21/node_modules/lodash
+    the same dependency from a nested importer; the climb follows its depth
 ```
 
 The doubled `node_modules` in the virtual store path is the mechanism, not an
@@ -213,10 +217,19 @@ transitive wiring nearly free.
 as base64 (`sha512-Ab3x...`), but macOS filesystems are case-insensitive by
 default, so base64 keys can collide. Hex-encoding the raw digest avoids it.
 
-**Symlinks are relative**, so moving or copying a project does not break every
-link. The target carries no leading `../`: it is resolved relative to
-`node_modules/`, the directory holding the link. pnpm uses `../` only for
-links *inside* the virtual store, which sit one level deeper.
+**Symlinks are relative**, so moving or copying a workspace does not break
+every link. The target is *importer-relative*: it is resolved from the
+directory holding the link, so its shape depends on where that directory sits.
+A link in the workspace root's `node_modules` climbs nowhere; one in
+`packages/ui/node_modules` climbs three levels to reach the root's virtual
+store; one *inside* the virtual store climbs two.
+
+Spec 1 originally stated that the target carries no leading `../`, which was
+true only of a single project linking at its own root. See §5 of
+[the workspace design](2026-09-10-workspace-design.md) for the general rule,
+and `linker::relative_path` for the single function that computes every target
+— deriving the climb from where the two paths diverge is what keeps a nested
+importer from silently getting a root-shaped link.
 
 ## 6. Data flow and types
 
