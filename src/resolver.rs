@@ -6,6 +6,7 @@
 //! serialization of the result.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::path::{Component, Path, PathBuf};
 
 use thiserror::Error;
 
@@ -71,11 +72,147 @@ pub struct ResolvedPackage {
     pub dependencies: BTreeMap<String, PackageId>,
 }
 
+/// A workspace-relative directory that declares dependencies. `.` is the
+/// workspace root.
+///
+/// Deliberately not a package identifier. An importer is a *consumer* —
+/// something that declares dependencies and receives a `node_modules` — and is
+/// identified by where it sits, because that is where its `node_modules` goes.
+/// A `PackageId` identifies a *resolved artifact*. A workspace member is both,
+/// but the two roles need different identities: rename the package and it is
+/// still the same importer.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ImporterPath(String);
+
+#[derive(Debug, Error)]
+pub enum ImporterPathError {
+    #[error("importer path `{0}` is absolute; importers are workspace-relative")]
+    Absolute(String),
+    #[error("importer path `{0}` escapes the workspace root")]
+    EscapesRoot(String),
+    #[error("importer path cannot be empty; the workspace root is `.`")]
+    Empty,
+}
+
+impl ImporterPath {
+    /// The workspace root, and the only importer a single-project repo has.
+    pub fn root() -> Self {
+        ImporterPath(".".to_string())
+    }
+
+    /// Validate a workspace-relative directory.
+    ///
+    /// Importer paths arrive from two untrusted places — a lockfile that may
+    /// have been hand-edited, and `workspaces` globs in a manifest — so this
+    /// refuses anything that could name a directory outside the workspace.
+    /// That is the same class of check `archive` applies to tar entries, and
+    /// for the same reason.
+    pub fn new(raw: impl Into<String>) -> Result<Self, ImporterPathError> {
+        let raw = raw.into();
+        if raw.is_empty() {
+            return Err(ImporterPathError::Empty);
+        }
+        if raw == "." {
+            return Ok(ImporterPath::root());
+        }
+
+        let path = Path::new(&raw);
+        if path.is_absolute() {
+            return Err(ImporterPathError::Absolute(raw));
+        }
+
+        // Rebuilt from its `Normal` components rather than stored verbatim.
+        // Refusing an escape is only half the job: `packages/ui`,
+        // `./packages/ui`, `packages//ui` and `packages/ui/` all name one
+        // directory, and keeping them as distinct keys would give that one
+        // directory several importers — and, once linking exists, several
+        // `node_modules`. This mirrors `archive::strip_prefix_component`,
+        // which rebuilds for the same reason.
+        let mut normalized = PathBuf::new();
+        for component in path.components() {
+            match component {
+                Component::Normal(part) => normalized.push(part),
+                Component::CurDir => {}
+                _ => return Err(ImporterPathError::EscapesRoot(raw)),
+            }
+        }
+
+        if normalized.as_os_str().is_empty() {
+            // Something like `./` or `.` that normalized away.
+            return Ok(ImporterPath::root());
+        }
+
+        Ok(ImporterPath(normalized.to_string_lossy().into_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn is_root(&self) -> bool {
+        self.0 == "."
+    }
+
+    /// How many directories deep this importer sits below the workspace root.
+    ///
+    /// The linker needs it: a symlink in the root's `node_modules` climbs
+    /// nowhere, while one in `packages/ui/node_modules` climbs three levels to
+    /// reach the root's virtual store.
+    pub fn depth(&self) -> usize {
+        if self.is_root() {
+            0
+        } else {
+            // Normalized at construction, so every component is a plain name.
+            self.0.split('/').count()
+        }
+    }
+}
+
+impl std::fmt::Display for ImporterPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Where a declared dependency actually came from.
+///
+/// An enum rather than a version string that sometimes starts with `link:`, so
+/// the compiler makes every consumer say which case it handles. The `link:`
+/// spelling exists only at the serialization boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Resolution {
+    /// Fetched from the registry. Has a node in `ResolvedGraph::packages`.
+    Registry(PackageId),
+    /// A workspace member, linked in place. No tarball and no integrity hash,
+    /// because there is nothing to verify — the bytes are in the repo. The
+    /// path is relative to the importer that declared it.
+    Local(PathBuf),
+}
+
+/// One dependency as an importer declared it, and what it resolved to.
+///
+/// The pair does the work of two mechanisms. `specifier` is what the manifest
+/// asked for, which is what makes staleness detectable. `resolution` is what
+/// that became, which lets linking read the answer instead of re-deriving it.
+/// It also records an alias faithfully — `execa` declared as
+/// `npm:safe-execa@0.3.0` keeps the local name as its key.
+#[derive(Debug, Clone)]
+pub struct Dependency {
+    pub specifier: String,
+    pub resolution: Resolution,
+}
+
+/// One project in the workspace and the dependencies it declares.
+#[derive(Debug, Clone, Default)]
+pub struct Importer {
+    pub dependencies: BTreeMap<String, Dependency>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ResolvedGraph {
-    /// The ranges the root manifest declared, recorded verbatim so a lockfile
-    /// written from this graph can later be told apart from a stale one.
-    pub root: BTreeMap<String, String>,
+    /// Every project in the workspace, keyed by directory. A single-project
+    /// repo has exactly one, keyed `.`, and takes the same path as any other.
+    pub importers: BTreeMap<ImporterPath, Importer>,
     /// `BTreeMap`, so iteration order is structural rather than incidental.
     /// Two machines resolving the same tree must serialize identically.
     pub packages: BTreeMap<PackageId, ResolvedPackage>,
@@ -95,6 +232,7 @@ pub fn resolve(
     roots: &BTreeMap<String, String>,
 ) -> Result<ResolvedGraph, ResolveError> {
     let mut packages: BTreeMap<PackageId, ResolvedPackage> = BTreeMap::new();
+    let mut root_importer = Importer::default();
 
     // One request per package, however many dependents ask for it.
     let mut packuments: HashMap<String, Packument> = HashMap::new();
@@ -118,12 +256,24 @@ pub fn resolve(
     {
         let id = select(registry, &mut packuments, &mut selections, &name, &range)?;
 
-        // Record the edge on whoever asked for it. The root's edges are not
-        // recorded here — they live in `root` — so `None` is simply skipped.
-        if let Some(parent) = dependent
-            && let Some(package) = packages.get_mut(&parent)
-        {
-            package.dependencies.insert(name.clone(), id.clone());
+        // Record the edge on whoever asked for it. A `None` dependent is an
+        // importer's own dependency, which is recorded against the importer
+        // rather than against a package.
+        match dependent {
+            Some(parent) => {
+                if let Some(package) = packages.get_mut(&parent) {
+                    package.dependencies.insert(name.clone(), id.clone());
+                }
+            }
+            None => {
+                root_importer.dependencies.insert(
+                    name.clone(),
+                    Dependency {
+                        specifier: range.clone(),
+                        resolution: Resolution::Registry(id.clone()),
+                    },
+                );
+            }
         }
 
         // Recursion is gated on node novelty, not on path. That is what makes
@@ -175,8 +325,14 @@ pub fn resolve(
         );
     }
 
+    // One importer, keyed `.`. A workspace of many is the same shape with more
+    // entries, which is why there is no single-project branch here to keep
+    // working when Task 7 widens the input.
+    let mut importers = BTreeMap::new();
+    importers.insert(ImporterPath::root(), root_importer);
+
     Ok(ResolvedGraph {
-        root: roots.clone(),
+        importers,
         packages,
     })
 }
@@ -248,4 +404,74 @@ fn select(
     };
     selections.insert(key, id.clone());
     Ok(id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_root_importer_is_dot_and_has_no_depth() {
+        let root = ImporterPath::root();
+        assert_eq!(root.as_str(), ".");
+        assert!(root.is_root());
+        assert_eq!(root.depth(), 0);
+    }
+
+    #[test]
+    fn depth_counts_directories_below_the_root() {
+        // What the linker uses to decide how far a symlink must climb to reach
+        // the workspace root's virtual store.
+        assert_eq!(ImporterPath::new("packages").unwrap().depth(), 1);
+        assert_eq!(ImporterPath::new("packages/ui").unwrap().depth(), 2);
+        assert_eq!(ImporterPath::new("apps/web/inner").unwrap().depth(), 3);
+    }
+
+    #[test]
+    fn a_leading_current_directory_does_not_count_as_depth() {
+        assert_eq!(ImporterPath::new("./packages/ui").unwrap().depth(), 2);
+    }
+
+    #[test]
+    fn paths_escaping_the_workspace_are_refused() {
+        for raw in ["../escape", "packages/../../escape", ".."] {
+            assert!(
+                matches!(
+                    ImporterPath::new(raw),
+                    Err(ImporterPathError::EscapesRoot(_))
+                ),
+                "{raw} should be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn absolute_paths_are_refused() {
+        assert!(matches!(
+            ImporterPath::new("/etc"),
+            Err(ImporterPathError::Absolute(_))
+        ));
+    }
+
+    #[test]
+    fn an_empty_path_is_refused_because_the_root_is_dot() {
+        assert!(matches!(
+            ImporterPath::new(""),
+            Err(ImporterPathError::Empty)
+        ));
+    }
+
+    #[test]
+    fn importers_sort_with_the_root_first() {
+        // Serialization order is iteration order, and a lockfile reads better
+        // with the root at the top.
+        let mut paths = [
+            ImporterPath::new("packages/ui").unwrap(),
+            ImporterPath::root(),
+            ImporterPath::new("apps/web").unwrap(),
+        ];
+        paths.sort();
+        let order: Vec<&str> = paths.iter().map(|p| p.as_str()).collect();
+        assert_eq!(order, [".", "apps/web", "packages/ui"]);
+    }
 }

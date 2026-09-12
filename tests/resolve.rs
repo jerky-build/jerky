@@ -191,13 +191,36 @@ fn dist_tags_resolve_through_the_packument() {
 }
 
 #[test]
-fn the_root_ranges_are_recorded_verbatim() {
-    // What makes lockfile staleness detectable later.
+fn the_root_importer_records_what_was_asked_and_what_was_chosen() {
+    // The specifier is what makes staleness detectable; the resolution is what
+    // saves linking from re-deriving which version a range picked.
+    use jerky::resolver::{ImporterPath, Resolution};
+
     let registry = FixtureRegistry::new().with_tree(&[("a", "1.0.0", &[])]);
 
     let graph = resolve(&registry, &roots(&[("a", "^1.0.0")])).unwrap();
 
-    assert_eq!(graph.root.get("a").map(String::as_str), Some("^1.0.0"));
+    let root = &graph.importers[&ImporterPath::root()];
+    let dependency = &root.dependencies["a"];
+    assert_eq!(dependency.specifier, "^1.0.0");
+    assert!(matches!(
+        &dependency.resolution,
+        Resolution::Registry(id) if id.version == "1.0.0"
+    ));
+}
+
+#[test]
+fn a_single_project_repo_is_a_workspace_of_one() {
+    // No special case: the common shape is the degenerate case of the general
+    // one, keyed `.`.
+    use jerky::resolver::ImporterPath;
+
+    let registry = FixtureRegistry::new().with_tree(&[("a", "1.0.0", &[])]);
+
+    let graph = resolve(&registry, &roots(&[("a", "^1.0.0")])).unwrap();
+
+    assert_eq!(graph.importers.len(), 1);
+    assert!(graph.importers.contains_key(&ImporterPath::root()));
 }
 
 #[test]

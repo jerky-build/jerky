@@ -12,7 +12,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::integrity::Integrity;
-use crate::resolver::{PackageId, ResolvedGraph, ResolvedPackage};
+use crate::resolver::{
+    Dependency, Importer, ImporterPath, PackageId, Resolution, ResolvedGraph, ResolvedPackage,
+};
 
 pub const LOCKFILE_NAME: &str = "jerky-lock.json";
 
@@ -40,6 +42,22 @@ pub enum LockfileError {
     },
     #[error("{path} records `{entry}`, which is not a valid name@version key")]
     BadKey { path: PathBuf, entry: String },
+    #[error("{path} records importer `{importer}`, which is not a usable workspace path")]
+    BadImporter {
+        path: PathBuf,
+        importer: String,
+        #[source]
+        source: crate::resolver::ImporterPathError,
+    },
+    #[error(
+        "{path} has importer `{importer}` depending on `{name}`, recorded as `{version}`, which it does not record"
+    )]
+    UnknownImporterDependency {
+        path: PathBuf,
+        importer: String,
+        name: String,
+        version: String,
+    },
     #[error("{path} keys `{entry}` but records version `{declared}` inside it")]
     KeyVersionMismatch {
         path: PathBuf,
@@ -51,6 +69,15 @@ pub enum LockfileError {
         path: PathBuf,
         entry: String,
         dependency: String,
+    },
+    #[error(
+        "{path} has importer `{importer}` linking `{name}` to `{target}`, which leaves the workspace"
+    )]
+    LinkEscapesWorkspace {
+        path: PathBuf,
+        importer: String,
+        name: String,
+        target: String,
     },
     #[error("{path} records an unusable integrity hash for `{entry}`")]
     BadIntegrity {
@@ -71,15 +98,48 @@ pub enum LockfileError {
 struct OnDisk {
     #[serde(rename = "lockfileVersion")]
     lockfile_version: u32,
-    /// The ranges the manifest declared, so staleness is detectable. Without
-    /// it there is no way to tell a current lockfile from one written before
-    /// someone edited `package.json`.
-    root: BTreeMap<String, String>,
-    /// Keyed `name@version`, flat rather than nested. A nested tree mirroring
-    /// the graph would reindent every descendant when something deep changes;
-    /// flat means adding a dependency appends a block and touches nothing else.
+    /// Every project in the workspace, keyed by directory, each recording what
+    /// it asked for and what that resolved to. A single-project repo has one
+    /// entry keyed `.`.
+    ///
+    /// Recording the specifier is what makes staleness detectable, and
+    /// recording it per importer is what makes staleness *per importer*: one
+    /// edited project no longer invalidates everything the rest resolved.
+    importers: BTreeMap<String, OnDiskImporter>,
+    /// Keyed `name@version`, flat rather than nested, and shared by every
+    /// importer. A nested tree mirroring the graph would reindent every
+    /// descendant when something deep changes; flat means adding a dependency
+    /// appends a block and touches nothing else.
     packages: BTreeMap<String, Entry>,
 }
+
+#[derive(Serialize, Deserialize, Default)]
+struct OnDiskImporter {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    dependencies: BTreeMap<String, OnDiskDependency>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct OnDiskDependency {
+    /// What the manifest asked for, verbatim.
+    specifier: String,
+    /// What it resolved to, in one of three forms:
+    ///
+    /// - `4.17.21` — a registry package whose name matches the key it is
+    ///   declared under, which is the overwhelmingly common case.
+    /// - `safe-execa@0.3.0` — a registry package whose name *differs* from the
+    ///   key, i.e. an alias. Without the name the package would be
+    ///   unidentifiable, since the key is the local name rather than the real
+    ///   one. This is pnpm's encoding, taken from its own lockfile.
+    /// - `link:../../packages/ui` — a workspace member, linked in place.
+    ///
+    /// The spelling exists only here; above this boundary it is a
+    /// `Resolution`, so consumers cannot forget a case.
+    version: String,
+}
+
+/// The marker distinguishing a linked workspace member from a registry version.
+const LINK_PREFIX: &str = "link:";
 
 /// Just enough of a lockfile to read its version, whatever else it holds.
 #[derive(Deserialize)]
@@ -110,6 +170,34 @@ fn split_key(key: &str) -> Option<(&str, &str)> {
         .filter(|(name, version)| !name.is_empty() && !version.is_empty())
 }
 
+/// Does a `link:` target, read relative to its importer, stay inside the
+/// workspace?
+///
+/// Walked rather than canonicalized because the directories need not exist
+/// yet: a lockfile is read before anything is linked.
+fn stays_within_workspace(importer: &ImporterPath, target: &Path) -> bool {
+    if target.is_absolute() {
+        return false;
+    }
+
+    let mut depth = importer.depth() as isize;
+    for component in target.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                depth -= 1;
+                if depth < 0 {
+                    return false;
+                }
+            }
+            std::path::Component::Normal(_) => depth += 1,
+            std::path::Component::CurDir => {}
+            // A prefix or root component means it was not relative after all.
+            _ => return false,
+        }
+    }
+    true
+}
+
 pub fn save(graph: &ResolvedGraph, project_dir: &Path) -> Result<(), LockfileError> {
     let packages = graph
         .packages
@@ -131,9 +219,46 @@ pub fn save(graph: &ResolvedGraph, project_dir: &Path) -> Result<(), LockfileErr
         })
         .collect();
 
+    let importers = graph
+        .importers
+        .iter()
+        .map(|(path, importer)| {
+            (
+                path.as_str().to_string(),
+                OnDiskImporter {
+                    dependencies: importer
+                        .dependencies
+                        .iter()
+                        .map(|(name, dependency)| {
+                            (
+                                name.clone(),
+                                OnDiskDependency {
+                                    specifier: dependency.specifier.clone(),
+                                    version: match &dependency.resolution {
+                                        // The name is written only when it
+                                        // differs from the key, so an ordinary
+                                        // dependency stays terse and an alias
+                                        // stays identifiable.
+                                        Resolution::Registry(id) if &id.name == name => {
+                                            id.version.clone()
+                                        }
+                                        Resolution::Registry(id) => id.to_string(),
+                                        Resolution::Local(target) => {
+                                            format!("{LINK_PREFIX}{}", target.display())
+                                        }
+                                    },
+                                },
+                            )
+                        })
+                        .collect(),
+                },
+            )
+        })
+        .collect();
+
     let on_disk = OnDisk {
         lockfile_version: LOCKFILE_VERSION,
-        root: graph.root.clone(),
+        importers,
         packages,
     };
 
@@ -255,8 +380,83 @@ pub fn load(project_dir: &Path) -> Result<Option<ResolvedGraph>, LockfileError> 
         }
     }
 
+    let mut importers = BTreeMap::new();
+    for (raw, on_disk_importer) in on_disk.importers {
+        // Importer keys come from a file that may have been hand-edited, so a
+        // key naming a directory outside the workspace is refused rather than
+        // resolved — the same reasoning `archive` applies to tar entries.
+        let importer_path =
+            ImporterPath::new(raw.clone()).map_err(|source| LockfileError::BadImporter {
+                path: path.clone(),
+                importer: raw.clone(),
+                source,
+            })?;
+
+        let mut dependencies = BTreeMap::new();
+        for (name, dependency) in on_disk_importer.dependencies {
+            let resolution = match dependency.version.strip_prefix(LINK_PREFIX) {
+                Some(target) => {
+                    // A link legitimately climbs out of the importer — that is
+                    // how `apps/web` reaches `packages/ui` — but it must not
+                    // climb out of the *workspace*. Untrusted file, same
+                    // escape class as the importer key beside it.
+                    let target = PathBuf::from(target);
+                    if !stays_within_workspace(&importer_path, &target) {
+                        return Err(LockfileError::LinkEscapesWorkspace {
+                            path,
+                            importer: raw.clone(),
+                            name: name.clone(),
+                            target: dependency.version.clone(),
+                        });
+                    }
+                    Resolution::Local(target)
+                }
+                None => {
+                    // The key is the name a dependency is declared *under*,
+                    // which for an alias is not the package it resolves to.
+                    // `execa` recorded as `safe-execa@0.3.0` is real — it is
+                    // in pnpm's own lockfile — so the recorded value carries
+                    // the name whenever it differs, and only falls back to the
+                    // key when it does not.
+                    let id = match split_key(&dependency.version) {
+                        Some((aliased_name, version)) => PackageId {
+                            name: aliased_name.to_string(),
+                            version: version.to_string(),
+                        },
+                        None => PackageId {
+                            name: name.clone(),
+                            version: dependency.version.clone(),
+                        },
+                    };
+
+                    // Keyed lookup rather than a scan: `packages` is already a
+                    // map on exactly this, and the scan was O(deps × packages).
+                    if !packages.contains_key(&id) {
+                        return Err(LockfileError::UnknownImporterDependency {
+                            path: path.clone(),
+                            importer: raw.clone(),
+                            name: name.clone(),
+                            version: dependency.version.clone(),
+                        });
+                    }
+                    Resolution::Registry(id)
+                }
+            };
+
+            dependencies.insert(
+                name,
+                Dependency {
+                    specifier: dependency.specifier,
+                    resolution,
+                },
+            );
+        }
+
+        importers.insert(importer_path, Importer { dependencies });
+    }
+
     Ok(Some(ResolvedGraph {
-        root: on_disk.root,
+        importers,
         packages,
     }))
 }
