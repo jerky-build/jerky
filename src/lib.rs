@@ -12,3 +12,4 @@ pub mod resolver;
 mod staging;
 pub mod store;
 pub mod testing;
+pub mod workspace;

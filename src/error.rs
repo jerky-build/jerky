@@ -11,6 +11,7 @@ use crate::range::RangeError;
 use crate::registry::RegistryError;
 use crate::resolver::ResolveError;
 use crate::store::StoreError;
+use crate::workspace::WorkspaceError;
 
 #[derive(Debug, Error)]
 pub enum JerkyError {
@@ -36,6 +37,8 @@ pub enum JerkyError {
     Lockfile(#[from] LockfileError),
     #[error(transparent)]
     Install(#[from] InstallError),
+    #[error(transparent)]
+    Workspace(#[from] WorkspaceError),
     #[error("could not determine the current directory")]
     Cwd(#[source] std::io::Error),
     #[error("could not determine the home directory for the package store")]
