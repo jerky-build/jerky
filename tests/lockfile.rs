@@ -7,14 +7,24 @@
 use std::collections::BTreeMap;
 
 use jerky::lockfile::{self, LOCKFILE_NAME, LockfileError};
-use jerky::resolver::resolve;
+use jerky::resolver::{ImporterPath, resolve};
 use jerky::testing::FixtureRegistry;
 use tempfile::TempDir;
 
-fn roots(list: &[(&str, &str)]) -> BTreeMap<String, String> {
-    list.iter()
-        .map(|(n, r)| (n.to_string(), r.to_string()))
-        .collect()
+/// A workspace of one, keyed `.`. These tests predate multiple importers and
+/// read unchanged: one importer is the degenerate case of the general input.
+fn roots(list: &[(&str, &str)]) -> BTreeMap<ImporterPath, BTreeMap<String, String>> {
+    BTreeMap::from([(
+        ImporterPath::root(),
+        list.iter()
+            .map(|(n, r)| (n.to_string(), r.to_string()))
+            .collect(),
+    )])
+}
+
+/// No `workspace:` dependencies, which is every test here.
+fn no_members() -> BTreeMap<String, ImporterPath> {
+    BTreeMap::new()
 }
 
 fn small_tree() -> FixtureRegistry {
@@ -32,11 +42,11 @@ fn writing_the_same_graph_twice_is_byte_identical() {
     let registry = small_tree();
     let dir = TempDir::new().unwrap();
 
-    let first_graph = resolve(&registry, &roots(&[("a", "^1.0.0")])).unwrap();
+    let first_graph = resolve(&registry, &roots(&[("a", "^1.0.0")]), &no_members()).unwrap();
     lockfile::save(&first_graph, dir.path()).unwrap();
     let first = read(&dir);
 
-    let second_graph = resolve(&registry, &roots(&[("a", "^1.0.0")])).unwrap();
+    let second_graph = resolve(&registry, &roots(&[("a", "^1.0.0")]), &no_members()).unwrap();
     lockfile::save(&second_graph, dir.path()).unwrap();
     let second = read(&dir);
 
@@ -56,7 +66,7 @@ fn keys_are_written_in_sorted_order() {
     ]);
     let dir = TempDir::new().unwrap();
 
-    let graph = resolve(&registry, &roots(&[("alpha", "^1.0.0")])).unwrap();
+    let graph = resolve(&registry, &roots(&[("alpha", "^1.0.0")]), &no_members()).unwrap();
     lockfile::save(&graph, dir.path()).unwrap();
 
     let parsed: serde_json::Value = serde_json::from_str(&read(&dir)).unwrap();
@@ -83,7 +93,7 @@ fn a_package_without_dependencies_omits_the_key() {
     // nothing in a file people read in review.
     let registry = small_tree();
     let dir = TempDir::new().unwrap();
-    let graph = resolve(&registry, &roots(&[("a", "^1.0.0")])).unwrap();
+    let graph = resolve(&registry, &roots(&[("a", "^1.0.0")]), &no_members()).unwrap();
     lockfile::save(&graph, dir.path()).unwrap();
 
     let parsed: serde_json::Value = serde_json::from_str(&read(&dir)).unwrap();
@@ -95,7 +105,7 @@ fn round_trips_through_disk() {
     let registry = small_tree();
     let dir = TempDir::new().unwrap();
 
-    let graph = resolve(&registry, &roots(&[("a", "^1.0.0")])).unwrap();
+    let graph = resolve(&registry, &roots(&[("a", "^1.0.0")]), &no_members()).unwrap();
     lockfile::save(&graph, dir.path()).unwrap();
     let back = lockfile::load(dir.path())
         .unwrap()
@@ -131,13 +141,14 @@ fn adding_one_dependency_touches_only_its_own_block() {
     ]);
     let dir = TempDir::new().unwrap();
 
-    let before_graph = resolve(&registry, &roots(&[("a", "^1.0.0")])).unwrap();
+    let before_graph = resolve(&registry, &roots(&[("a", "^1.0.0")]), &no_members()).unwrap();
     lockfile::save(&before_graph, dir.path()).unwrap();
     let before = read(&dir);
 
     let after_graph = resolve(
         &registry,
         &roots(&[("a", "^1.0.0"), ("newcomer", "^1.0.0")]),
+        &no_members(),
     )
     .unwrap();
     lockfile::save(&after_graph, dir.path()).unwrap();
@@ -255,7 +266,7 @@ fn the_file_ends_with_a_newline() {
     // So it is a well-formed text file and diffs do not show "\ No newline".
     let registry = small_tree();
     let dir = TempDir::new().unwrap();
-    let graph = resolve(&registry, &roots(&[("a", "^1.0.0")])).unwrap();
+    let graph = resolve(&registry, &roots(&[("a", "^1.0.0")]), &no_members()).unwrap();
     lockfile::save(&graph, dir.path()).unwrap();
 
     assert!(read(&dir).ends_with('\n'));
@@ -267,7 +278,7 @@ fn the_lockfile_records_edges_and_integrity() {
     // and the dependency edges.
     let registry = small_tree();
     let dir = TempDir::new().unwrap();
-    let graph = resolve(&registry, &roots(&[("a", "^1.0.0")])).unwrap();
+    let graph = resolve(&registry, &roots(&[("a", "^1.0.0")]), &no_members()).unwrap();
     lockfile::save(&graph, dir.path()).unwrap();
 
     let parsed: serde_json::Value = serde_json::from_str(&read(&dir)).unwrap();
@@ -401,7 +412,7 @@ fn two_importer_graph() -> jerky::resolver::ResolvedGraph {
     use jerky::resolver::{Dependency, Importer, ImporterPath, Resolution};
 
     let registry = small_tree();
-    let mut graph = resolve(&registry, &roots(&[("a", "^1.0.0")])).unwrap();
+    let mut graph = resolve(&registry, &roots(&[("a", "^1.0.0")]), &no_members()).unwrap();
 
     let a_id = graph
         .packages
@@ -601,7 +612,12 @@ fn an_alias_survives_a_save_and_load_cycle() {
 
     let dir = TempDir::new().unwrap();
     let registry = FixtureRegistry::new().with_tree(&[("safe-execa", "0.3.0", &[])]);
-    let mut graph = resolve(&registry, &roots(&[("safe-execa", "^0.3.0")])).unwrap();
+    let mut graph = resolve(
+        &registry,
+        &roots(&[("safe-execa", "^0.3.0")]),
+        &no_members(),
+    )
+    .unwrap();
 
     let real = PackageId {
         name: "safe-execa".to_string(),

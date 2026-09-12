@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
@@ -95,6 +96,10 @@ impl Manifest {
         self.value.get("name").and_then(Value::as_str)
     }
 
+    pub fn version(&self) -> Option<&str> {
+        self.value.get("version").and_then(Value::as_str)
+    }
+
     /// The `workspaces` patterns this manifest declares.
     ///
     /// Empty when the field is absent, which is the degenerate case rather
@@ -108,6 +113,31 @@ impl Manifest {
                 patterns
                     .iter()
                     .filter_map(|pattern| pattern.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The `dependencies` this manifest declares, specifier verbatim.
+    ///
+    /// `BTreeMap` because these seed the resolver, and the resolver's output
+    /// reaches the lockfile: iteration order is serialization order, and two
+    /// machines must agree. Specifiers are returned exactly as written —
+    /// `workspace:*` is a protocol the resolver keys on, and normalizing here
+    /// would also make staleness undetectable once the lockfile compares what
+    /// was recorded against what is declared.
+    ///
+    /// `devDependencies` are deliberately absent: only the root project's are
+    /// ever followed, and that is spec 3.
+    pub fn dependencies(&self) -> BTreeMap<String, String> {
+        self.value
+            .get("dependencies")
+            .and_then(Value::as_object)
+            .map(|deps| {
+                deps.iter()
+                    .filter_map(|(name, spec)| {
+                        spec.as_str().map(|spec| (name.clone(), spec.to_string()))
+                    })
                     .collect()
             })
             .unwrap_or_default()
@@ -270,5 +300,36 @@ mod tests {
         let raw = std::fs::read_to_string(dir.path().join("package.json")).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(parsed["dependencies"]["lodash"], "4.17.21");
+    }
+
+    #[test]
+    fn dependencies_are_read_back_as_declared() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":"web","dependencies":{"lodash":"^4.17.21","ui":"workspace:*"}}"#,
+        )
+        .unwrap();
+
+        let deps = Manifest::load(dir.path()).unwrap().dependencies();
+
+        // The specifier is carried through verbatim. Normalizing here would
+        // lose the `workspace:` protocol the resolver keys on, and would make
+        // staleness undetectable once the lockfile compares the two.
+        assert_eq!(deps["lodash"], "^4.17.21");
+        assert_eq!(deps["ui"], "workspace:*");
+    }
+
+    #[test]
+    fn a_manifest_without_dependencies_declares_none() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("package.json"), r#"{"name":"web"}"#).unwrap();
+
+        assert!(
+            Manifest::load(dir.path())
+                .unwrap()
+                .dependencies()
+                .is_empty()
+        );
     }
 }

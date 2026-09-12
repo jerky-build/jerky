@@ -5,14 +5,20 @@
 //! terminates, and that the walk is iterative.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 
-use jerky::resolver::{ResolveError, resolve};
+use jerky::resolver::{ImporterPath, Resolution, ResolveError, resolve};
 use jerky::testing::FixtureRegistry;
 
-fn roots(list: &[(&str, &str)]) -> BTreeMap<String, String> {
-    list.iter()
-        .map(|(n, r)| (n.to_string(), r.to_string()))
-        .collect()
+/// A workspace of one, keyed `.` — the degenerate case of the general input,
+/// which is why these tests read unchanged now that the resolver takes many.
+fn roots(list: &[(&str, &str)]) -> BTreeMap<ImporterPath, BTreeMap<String, String>> {
+    BTreeMap::from([(
+        ImporterPath::root(),
+        list.iter()
+            .map(|(n, r)| (n.to_string(), r.to_string()))
+            .collect(),
+    )])
 }
 
 #[test]
@@ -25,7 +31,7 @@ fn resolves_a_diamond_to_one_shared_node() {
         ("d", "1.0.0", &[]),
     ]);
 
-    let graph = resolve(&registry, &roots(&[("a", "^1.0.0")])).unwrap();
+    let graph = resolve(&registry, &roots(&[("a", "^1.0.0")]), &no_members()).unwrap();
 
     assert_eq!(graph.packages.len(), 4);
     let ds: Vec<_> = graph.packages.keys().filter(|id| id.name == "d").collect();
@@ -43,7 +49,7 @@ fn incompatible_versions_coexist_as_separate_nodes() {
         ("d", "2.1.0", &[]),
     ]);
 
-    let graph = resolve(&registry, &roots(&[("a", "^1.0.0")])).unwrap();
+    let graph = resolve(&registry, &roots(&[("a", "^1.0.0")]), &no_members()).unwrap();
 
     let mut ds: Vec<_> = graph
         .packages
@@ -69,7 +75,7 @@ fn a_cycle_terminates() {
         ("b", "1.0.0", &[("a", "^1.0.0")]),
     ]);
 
-    let graph = resolve(&registry, &roots(&[("a", "^1.0.0")])).unwrap();
+    let graph = resolve(&registry, &roots(&[("a", "^1.0.0")]), &no_members()).unwrap();
 
     assert_eq!(graph.packages.len(), 2);
     let a = graph.packages.values().find(|p| p.id.name == "a").unwrap();
@@ -86,7 +92,7 @@ fn a_self_referencing_package_terminates() {
     // Rarer than a two-node cycle but it exists, and it is the tighter case.
     let registry = FixtureRegistry::new().with_tree(&[("a", "1.0.0", &[("a", "^1.0.0")])]);
 
-    let graph = resolve(&registry, &roots(&[("a", "^1.0.0")])).unwrap();
+    let graph = resolve(&registry, &roots(&[("a", "^1.0.0")]), &no_members()).unwrap();
 
     assert_eq!(graph.packages.len(), 1);
 }
@@ -109,7 +115,7 @@ fn a_deep_chain_does_not_blow_the_stack() {
         }
     }
 
-    let graph = resolve(&registry, &roots(&[("p0", "^1.0.0")])).unwrap();
+    let graph = resolve(&registry, &roots(&[("p0", "^1.0.0")]), &no_members()).unwrap();
 
     assert_eq!(graph.packages.len(), 5000);
 }
@@ -125,7 +131,7 @@ fn the_packument_for_a_package_is_fetched_once() {
         ("shared", "1.0.0", &[]),
     ]);
 
-    resolve(&registry, &roots(&[("a", "^1.0.0")])).unwrap();
+    resolve(&registry, &roots(&[("a", "^1.0.0")]), &no_members()).unwrap();
 
     assert_eq!(registry.packument_calls_for("shared"), 1);
 }
@@ -142,7 +148,7 @@ fn distinct_ranges_on_one_package_still_share_a_packument() {
         ("d", "2.1.0", &[]),
     ]);
 
-    resolve(&registry, &roots(&[("a", "^1.0.0")])).unwrap();
+    resolve(&registry, &roots(&[("a", "^1.0.0")]), &no_members()).unwrap();
 
     assert_eq!(registry.packument_calls_for("d"), 1);
 }
@@ -151,7 +157,7 @@ fn distinct_ranges_on_one_package_still_share_a_packument() {
 fn an_unsatisfiable_range_names_the_available_versions() {
     let registry = FixtureRegistry::new().with_tree(&[("a", "1.0.0", &[])]);
 
-    let err = resolve(&registry, &roots(&[("a", "^9.0.0")])).unwrap_err();
+    let err = resolve(&registry, &roots(&[("a", "^9.0.0")]), &no_members()).unwrap_err();
 
     match err {
         ResolveError::Unsatisfiable {
@@ -175,7 +181,7 @@ fn an_unknown_package_is_reported() {
     let registry = FixtureRegistry::new().with_tree(&[("a", "1.0.0", &[])]);
 
     assert!(matches!(
-        resolve(&registry, &roots(&[("nope", "^1.0.0")])),
+        resolve(&registry, &roots(&[("nope", "^1.0.0")]), &no_members()),
         Err(ResolveError::Registry(_))
     ));
 }
@@ -184,7 +190,7 @@ fn an_unknown_package_is_reported() {
 fn dist_tags_resolve_through_the_packument() {
     let registry = FixtureRegistry::new().with_tree(&[("a", "1.0.0", &[]), ("a", "2.0.0", &[])]);
 
-    let graph = resolve(&registry, &roots(&[("a", "latest")])).unwrap();
+    let graph = resolve(&registry, &roots(&[("a", "latest")]), &no_members()).unwrap();
 
     assert_eq!(graph.packages.len(), 1);
     assert_eq!(graph.packages.keys().next().unwrap().version, "2.0.0");
@@ -198,7 +204,7 @@ fn the_root_importer_records_what_was_asked_and_what_was_chosen() {
 
     let registry = FixtureRegistry::new().with_tree(&[("a", "1.0.0", &[])]);
 
-    let graph = resolve(&registry, &roots(&[("a", "^1.0.0")])).unwrap();
+    let graph = resolve(&registry, &roots(&[("a", "^1.0.0")]), &no_members()).unwrap();
 
     let root = &graph.importers[&ImporterPath::root()];
     let dependency = &root.dependencies["a"];
@@ -217,7 +223,7 @@ fn a_single_project_repo_is_a_workspace_of_one() {
 
     let registry = FixtureRegistry::new().with_tree(&[("a", "1.0.0", &[])]);
 
-    let graph = resolve(&registry, &roots(&[("a", "^1.0.0")])).unwrap();
+    let graph = resolve(&registry, &roots(&[("a", "^1.0.0")]), &no_members()).unwrap();
 
     assert_eq!(graph.importers.len(), 1);
     assert!(graph.importers.contains_key(&ImporterPath::root()));
@@ -234,8 +240,8 @@ fn resolution_is_deterministic() {
         ("d", "1.0.0", &[]),
     ]);
 
-    let first = resolve(&registry, &roots(&[("a", "^1.0.0")])).unwrap();
-    let second = resolve(&registry, &roots(&[("a", "^1.0.0")])).unwrap();
+    let first = resolve(&registry, &roots(&[("a", "^1.0.0")]), &no_members()).unwrap();
+    let second = resolve(&registry, &roots(&[("a", "^1.0.0")]), &no_members()).unwrap();
 
     let ids = |g: &jerky::resolver::ResolvedGraph| {
         g.packages
@@ -317,7 +323,7 @@ fn a_dangling_dist_tag_is_an_error_not_a_panic() {
         tags: vec![("latest", "9.9.9")],
     };
 
-    let err = resolve(&registry, &roots(&[("a", "latest")])).unwrap_err();
+    let err = resolve(&registry, &roots(&[("a", "latest")]), &no_members()).unwrap_err();
 
     match err {
         ResolveError::DanglingTag { name, tag, version } => {
@@ -340,7 +346,7 @@ fn a_dist_tag_cannot_shadow_a_real_range() {
         tags: vec![("^1.0.0", "9.9.9")],
     };
 
-    let graph = resolve(&registry, &roots(&[("a", "^1.0.0")])).unwrap();
+    let graph = resolve(&registry, &roots(&[("a", "^1.0.0")]), &no_members()).unwrap();
 
     let chosen = &graph.packages.keys().next().unwrap().version;
     assert_eq!(chosen, "1.5.0", "the tag overrode the range");
@@ -353,7 +359,7 @@ fn a_spec_that_is_neither_a_range_nor_a_tag_is_reported() {
         tags: vec![("latest", "1.0.0"), ("next", "1.0.0")],
     };
 
-    let err = resolve(&registry, &roots(&[("a", "nonsense-spec")])).unwrap_err();
+    let err = resolve(&registry, &roots(&[("a", "nonsense-spec")]), &no_members()).unwrap_err();
 
     match err {
         ResolveError::UnresolvableSpec { name, spec, tags } => {
@@ -365,4 +371,160 @@ fn a_spec_that_is_neither_a_range_nor_a_tag_is_reported() {
         }
         other => panic!("wrong error: {other:?}"),
     }
+}
+
+fn importers(list: &[(&str, &[(&str, &str)])]) -> BTreeMap<ImporterPath, BTreeMap<String, String>> {
+    list.iter()
+        .map(|(importer, deps)| {
+            (
+                ImporterPath::new(*importer).unwrap(),
+                deps.iter()
+                    .map(|(n, r)| (n.to_string(), r.to_string()))
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn each_importer_records_the_version_it_asked_for() {
+    // Two importers wanting incompatible majors. The resolver deliberately
+    // does not force agreement, so both land and each importer points at its
+    // own — the cross-tree conflict case, now across projects.
+    let registry =
+        FixtureRegistry::new().with_tree(&[("lodash", "4.17.21", &[]), ("lodash", "3.10.1", &[])]);
+
+    let graph = resolve(
+        &registry,
+        &importers(&[
+            ("packages/ui", &[("lodash", "^4.0.0")]),
+            ("apps/web", &[("lodash", "^3.0.0")]),
+        ]),
+        &no_members(),
+    )
+    .unwrap();
+
+    assert_eq!(graph.importers.len(), 2, "an importer went missing");
+    for (importer, expected) in [("packages/ui", "4.17.21"), ("apps/web", "3.10.1")] {
+        let key = ImporterPath::new(importer).unwrap();
+        let dep = &graph.importers[&key].dependencies["lodash"];
+        match &dep.resolution {
+            Resolution::Registry(id) => assert_eq!(id.version, expected, "{importer}"),
+            other => panic!("{importer} resolved to {other:?}, not the registry"),
+        }
+    }
+    assert_eq!(graph.packages.len(), 2, "both versions must coexist");
+}
+
+#[test]
+fn one_walk_covers_importers_that_agree() {
+    // Two importers on the same range share the work: the packument is
+    // fetched once, not once per importer.
+    let registry = FixtureRegistry::new().with_tree(&[("lodash", "4.17.21", &[])]);
+
+    let graph = resolve(
+        &registry,
+        &importers(&[
+            ("packages/ui", &[("lodash", "^4.0.0")]),
+            ("apps/web", &[("lodash", "^4.0.0")]),
+        ]),
+        &no_members(),
+    )
+    .unwrap();
+
+    assert_eq!(graph.packages.len(), 1, "the shared version was duplicated");
+    assert_eq!(
+        registry.packument_calls_for("lodash"),
+        1,
+        "each importer fetched the packument separately"
+    );
+}
+
+/// A workspace whose members declare nothing local, which is every test that
+/// predates the `workspace:` protocol.
+fn no_members() -> BTreeMap<String, ImporterPath> {
+    BTreeMap::new()
+}
+
+fn members(list: &[(&str, &str)]) -> BTreeMap<String, ImporterPath> {
+    list.iter()
+        .map(|(name, importer)| (name.to_string(), ImporterPath::new(*importer).unwrap()))
+        .collect()
+}
+
+#[test]
+fn a_workspace_specifier_never_reaches_the_registry() {
+    // The member is in the repo, so there is nothing to fetch and nothing to
+    // verify. An empty registry proves the short-circuit rather than merely
+    // suggesting it.
+    let registry = FixtureRegistry::new();
+
+    let graph = resolve(
+        &registry,
+        &importers(&[("apps/web", &[("ui", "workspace:*")])]),
+        &members(&[("ui", "packages/ui")]),
+    )
+    .unwrap();
+
+    let dep = &graph.importers[&ImporterPath::new("apps/web").unwrap()].dependencies["ui"];
+    match &dep.resolution {
+        // Relative to the importer that declared it: apps/web climbs two to
+        // the workspace root, then descends.
+        Resolution::Local(path) => assert_eq!(path, Path::new("../../packages/ui")),
+        other => panic!("resolved to {other:?}, not a local member"),
+    }
+    assert_eq!(
+        dep.specifier, "workspace:*",
+        "the specifier is recorded as written"
+    );
+    assert_eq!(graph.packages.len(), 0);
+    assert_eq!(registry.packument_calls(), 0, "the registry was consulted");
+}
+
+#[test]
+fn a_workspace_specifier_from_the_root_importer_descends_only() {
+    let registry = FixtureRegistry::new();
+
+    let graph = resolve(
+        &registry,
+        &importers(&[(".", &[("ui", "workspace:^1.0.0")])]),
+        &members(&[("ui", "packages/ui")]),
+    )
+    .unwrap();
+
+    let dep = &graph.importers[&ImporterPath::root()].dependencies["ui"];
+    match &dep.resolution {
+        Resolution::Local(path) => assert_eq!(path, Path::new("packages/ui")),
+        other => panic!("resolved to {other:?}, not a local member"),
+    }
+}
+
+#[test]
+fn a_workspace_specifier_naming_no_member_is_an_error() {
+    // `workspace:*` for a package that is not in the repo is a typo, not a
+    // fallback to the registry.
+    let registry = FixtureRegistry::new().with_tree(&[("ui", "1.0.0", &[])]);
+
+    let err = resolve(
+        &registry,
+        &importers(&[("apps/web", &[("ui", "workspace:*")])]),
+        &members(&[("other", "packages/other")]),
+    )
+    .unwrap_err();
+
+    match err {
+        ResolveError::NoSuchMember { name, members, .. } => {
+            assert_eq!(name, "ui");
+            assert!(
+                members.contains(&"other".to_string()),
+                "the error names the members"
+            );
+        }
+        other => panic!("expected NoSuchMember, got {other:?}"),
+    }
+    assert_eq!(
+        registry.packument_calls(),
+        0,
+        "a missing member fell back to the registry instead of failing"
+    );
 }

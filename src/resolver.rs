@@ -14,6 +14,12 @@ use crate::integrity::{Integrity, IntegrityError};
 use crate::range::{Range, RangeError};
 use crate::registry::{Packument, RegistryClient, RegistryError};
 
+/// The protocol marking a dependency as a workspace member rather than a
+/// registry package. `workspace:*` and `workspace:^1.0.0` both select the
+/// member; what follows the colon is a range against the member's own version,
+/// which matters only once a member is published.
+const WORKSPACE_PROTOCOL: &str = "workspace:";
+
 #[derive(Debug, Error)]
 pub enum ResolveError {
     #[error(transparent)]
@@ -39,6 +45,12 @@ pub enum ResolveError {
         name: String,
         spec: String,
         tags: Vec<String>,
+    },
+    #[error("`{specifier}` names `{name}`, which is not a workspace member (members: {})", members.join(", "))]
+    NoSuchMember {
+        name: String,
+        specifier: String,
+        members: Vec<String>,
     },
     #[error("`{name}@{version}` has no usable integrity hash")]
     Integrity {
@@ -220,35 +232,90 @@ pub struct ResolvedGraph {
     pub packages: BTreeMap<PackageId, ResolvedPackage>,
 }
 
+/// Who asked for an edge.
+///
+/// An enum rather than an `Option<PackageId>` standing in for "the root", now
+/// that there is more than one importer to be: `None` could only ever mean one
+/// project, and the compiler would not have asked about the rest.
+enum Dependent {
+    /// A project declaring its own dependency, identified by where it sits.
+    Importer(ImporterPath),
+    /// A package declaring one of its own.
+    Package(PackageId),
+}
+
 /// One edge waiting to be resolved: who asked, for what name, at what range.
-/// `dependent` is `None` for the root project's own dependencies.
 struct Pending {
-    dependent: Option<PackageId>,
+    dependent: Dependent,
     name: String,
     range: String,
 }
 
-/// Walk the dependency graph from the root's declared ranges.
+/// Walk the dependency graph from every importer's declared ranges.
+///
+/// One walk covers the whole workspace rather than one per project, so two
+/// importers asking for the same range select once and share the request. They
+/// are deliberately not forced into agreement: importers wanting incompatible
+/// versions each get their own node, exactly as two packages within one tree
+/// do.
 pub fn resolve(
     registry: &dyn RegistryClient,
-    roots: &BTreeMap<String, String>,
+    roots: &BTreeMap<ImporterPath, BTreeMap<String, String>>,
+    members: &BTreeMap<String, ImporterPath>,
 ) -> Result<ResolvedGraph, ResolveError> {
     let mut packages: BTreeMap<PackageId, ResolvedPackage> = BTreeMap::new();
-    let mut root_importer = Importer::default();
+    // Seeded from the input rather than filled in as edges arrive, so an
+    // importer that declares nothing still appears in the graph — it has a
+    // `node_modules` to own, and the lockfile records it as resolved.
+    let mut importers: BTreeMap<ImporterPath, Importer> = roots
+        .keys()
+        .map(|importer| (importer.clone(), Importer::default()))
+        .collect();
 
     // One request per package, however many dependents ask for it.
     let mut packuments: HashMap<String, Packument> = HashMap::new();
     // Identical (name, range) pairs select once.
     let mut selections: HashMap<(String, String), PackageId> = HashMap::new();
 
-    let mut work: VecDeque<Pending> = roots
-        .iter()
-        .map(|(name, range)| Pending {
-            dependent: None,
-            name: name.clone(),
-            range: range.clone(),
-        })
-        .collect();
+    // Local dependencies are settled before the walk starts rather than
+    // inside it: there is no tarball, no integrity hash and no version to
+    // select, so a `workspace:` specifier has nothing the walk could do with
+    // it. Only an importer may declare one — a registry package's
+    // dependencies are whatever it published, and `VersionMetadata` has no
+    // way to name a directory in this repo.
+    let mut work: VecDeque<Pending> = VecDeque::new();
+    for (importer, declared) in roots {
+        for (name, range) in declared {
+            if !range.starts_with(WORKSPACE_PROTOCOL) {
+                work.push_back(Pending {
+                    dependent: Dependent::Importer(importer.clone()),
+                    name: name.clone(),
+                    range: range.clone(),
+                });
+                continue;
+            }
+
+            let member = members
+                .get(name)
+                .ok_or_else(|| ResolveError::NoSuchMember {
+                    name: name.clone(),
+                    specifier: range.clone(),
+                    members: members.keys().cloned().collect(),
+                })?;
+
+            importers
+                .entry(importer.clone())
+                .or_default()
+                .dependencies
+                .insert(
+                    name.clone(),
+                    Dependency {
+                        specifier: range.clone(),
+                        resolution: Resolution::Local(local_path(importer, member)),
+                    },
+                );
+        }
+    }
 
     while let Some(Pending {
         dependent,
@@ -258,17 +325,17 @@ pub fn resolve(
     {
         let id = select(registry, &mut packuments, &mut selections, &name, &range)?;
 
-        // Record the edge on whoever asked for it. A `None` dependent is an
-        // importer's own dependency, which is recorded against the importer
-        // rather than against a package.
+        // Record the edge on whoever asked for it. An importer's own
+        // dependency is recorded against the importer rather than against a
+        // package, because that is what its `node_modules` is built from.
         match dependent {
-            Some(parent) => {
+            Dependent::Package(parent) => {
                 if let Some(package) = packages.get_mut(&parent) {
                     package.dependencies.insert(name.clone(), id.clone());
                 }
             }
-            None => {
-                root_importer.dependencies.insert(
+            Dependent::Importer(importer) => {
+                importers.entry(importer).or_default().dependencies.insert(
                     name.clone(),
                     Dependency {
                         specifier: range.clone(),
@@ -310,7 +377,7 @@ pub fn resolve(
         // `VersionMetadata` has no field for them to be read from.
         for (dep_name, dep_range) in &metadata.dependencies {
             work.push_back(Pending {
-                dependent: Some(id.clone()),
+                dependent: Dependent::Package(id.clone()),
                 name: dep_name.clone(),
                 range: dep_range.clone(),
             });
@@ -327,16 +394,37 @@ pub fn resolve(
         );
     }
 
-    // One importer, keyed `.`. A workspace of many is the same shape with more
-    // entries, which is why there is no single-project branch here to keep
-    // working when Task 7 widens the input.
-    let mut importers = BTreeMap::new();
-    importers.insert(ImporterPath::root(), root_importer);
-
     Ok(ResolvedGraph {
         importers,
         packages,
     })
+}
+
+/// Where `member` sits, as seen from `importer`.
+///
+/// Climbing is driven by [`ImporterPath::depth`]: both paths are
+/// workspace-relative, so reaching the root takes exactly as many steps as the
+/// declaring importer is deep, and the member's own path descends from there.
+/// The result is the lockfile's `link:` value, relative to the importer's own
+/// directory. The symlink the linker writes is deliberately *not* this string:
+/// a link lives inside the importer's `node_modules`, one level deeper, so
+/// `linker::relative_path` derives its own target from absolute paths rather
+/// than adding a climb to this one. `a_lockfile_target_is_one_climb_short_of_
+/// the_symlink` pins the two together.
+fn local_path(importer: &ImporterPath, member: &ImporterPath) -> PathBuf {
+    let mut path = PathBuf::new();
+    for _ in 0..importer.depth() {
+        path.push(Component::ParentDir);
+    }
+    if !member.is_root() {
+        path.push(member.as_str());
+    }
+    if path.as_os_str().is_empty() {
+        // An importer depending on itself, or the root on the root. `.` is a
+        // path; the empty string is not.
+        path.push(Component::CurDir);
+    }
+    path
 }
 
 /// Choose the concrete version satisfying one `(name, range)` pair, fetching

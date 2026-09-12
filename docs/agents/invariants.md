@@ -80,4 +80,5 @@ Then, against the diff:
 - `devDependencies` is read nowhere, and `VersionMetadata` has no field for it.
 - At least one test exercises more than one importer. A suite that only ever
   sees `.` is not testing workspaces.
-- Any user-visible behaviour change is noted in `CHANGELOG.md`.
+- Any user-visible behaviour change is noted in `CHANGELOG.md`, under
+  `## [Unreleased]`.
