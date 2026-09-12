@@ -91,6 +91,28 @@ impl Manifest {
         Ok(Self { path, value })
     }
 
+    pub fn name(&self) -> Option<&str> {
+        self.value.get("name").and_then(Value::as_str)
+    }
+
+    /// The `workspaces` patterns this manifest declares.
+    ///
+    /// Empty when the field is absent, which is the degenerate case rather
+    /// than a separate one: a manifest without `workspaces` is a workspace of
+    /// one, and callers need no branch to see it that way.
+    pub fn workspaces(&self) -> Vec<String> {
+        self.value
+            .get("workspaces")
+            .and_then(Value::as_array)
+            .map(|patterns| {
+                patterns
+                    .iter()
+                    .filter_map(|pattern| pattern.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub fn add_dependency(&mut self, name: &str, version: &str) {
         let deps = self
             .value
