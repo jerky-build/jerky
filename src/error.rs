@@ -43,4 +43,16 @@ pub enum JerkyError {
     Cwd(#[source] std::io::Error),
     #[error("could not determine the home directory for the package store")]
     NoHomeDirectory,
+    #[error("no package.json found in {} or any parent directory", .0.display())]
+    NoManifestAnywhere(std::path::PathBuf),
+    #[error(
+        "{} belongs to no workspace member (members: {})\n\
+         cd into one of them, or add it to `workspaces` in the root package.json",
+        .directory.display(),
+        .members.join(", ")
+    )]
+    NotInAMember {
+        directory: std::path::PathBuf,
+        members: Vec<String>,
+    },
 }

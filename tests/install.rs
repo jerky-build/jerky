@@ -2,8 +2,10 @@ use std::path::Path;
 
 use jerky::cli::{PackageSpec, VersionSpec};
 use jerky::commands::install::{InstallError, install};
+use jerky::resolver::{ImporterPath, ResolveError};
 use jerky::store::Store;
 use jerky::testing::{FixtureRegistry, TarEntry, build_tarball};
+use jerky::workspace::{Workspace, WorkspaceError};
 
 use std::os::unix::fs::MetadataExt as _;
 use tempfile::TempDir;
@@ -23,6 +25,12 @@ fn project(dir: &Path) -> &Path {
     dir
 }
 
+/// A workspace of one — what every single-project test is, and the same code
+/// path a workspace of many takes.
+fn solo(dir: &Path) -> Workspace {
+    Workspace::discover(dir).unwrap()
+}
+
 fn spec(name: &str, version: VersionSpec) -> PackageSpec {
     PackageSpec {
         name: name.to_string(),
@@ -39,7 +47,8 @@ fn installs_a_package_end_to_end() {
     let registry = FixtureRegistry::new().with_package("lodash", "4.17.21", lodash_tarball());
 
     let installed = install(
-        project_dir,
+        &solo(project_dir),
+        &ImporterPath::root(),
         &store,
         &registry,
         &spec("lodash", VersionSpec::Latest),
@@ -72,7 +81,8 @@ fn the_recorded_version_comes_from_the_registry_not_the_request() {
 
     // Requesting a dist-tag must pin whatever concrete version came back.
     install(
-        project_dir,
+        &solo(project_dir),
+        &ImporterPath::root(),
         &store,
         &registry,
         &spec("react", VersionSpec::Exact("latest".into())),
@@ -95,7 +105,8 @@ fn files_are_hard_linked_from_the_store_not_copied() {
     let registry = FixtureRegistry::new().with_package("lodash", "4.17.21", lodash_tarball());
 
     install(
-        project_dir,
+        &solo(project_dir),
+        &ImporterPath::root(),
         &store,
         &registry,
         &spec("lodash", VersionSpec::Latest),
@@ -129,7 +140,8 @@ fn a_second_install_reuses_the_store_without_downloading() {
     let registry = FixtureRegistry::new().with_package("lodash", "4.17.21", lodash_tarball());
 
     install(
-        project_dir,
+        &solo(project_dir),
+        &ImporterPath::root(),
         &store,
         &registry,
         &spec("lodash", VersionSpec::Latest),
@@ -138,7 +150,8 @@ fn a_second_install_reuses_the_store_without_downloading() {
     assert_eq!(registry.tarball_calls(), 1);
 
     install(
-        project_dir,
+        &solo(project_dir),
+        &ImporterPath::root(),
         &store,
         &registry,
         &spec("lodash", VersionSpec::Latest),
@@ -164,7 +177,8 @@ fn an_integrity_mismatch_leaves_the_store_empty() {
     let registry = FixtureRegistry::new().with_corrupt_package("evil", "1.0.0", lodash_tarball());
 
     let result = install(
-        project_dir,
+        &solo(project_dir),
+        &ImporterPath::root(),
         &store,
         &registry,
         &spec("evil", VersionSpec::Latest),
@@ -194,30 +208,358 @@ fn reports_an_unknown_package() {
 
     assert!(matches!(
         install(
-            project_dir,
+            &solo(project_dir),
+            &ImporterPath::root(),
             &store,
             &registry,
             &spec("nope", VersionSpec::Latest)
         ),
-        Err(InstallError::Registry(_))
+        // Reaches the caller through the resolver now: version selection is
+        // what asks the registry, so that is where a missing package is found.
+        Err(InstallError::Resolve(ResolveError::Registry(_)))
     ));
 }
 
 #[test]
 fn requires_a_manifest() {
+    let work = TempDir::new().unwrap();
+
+    // No package.json was written. The requirement now sits in discovery
+    // rather than in install: there is no workspace to install into, which is
+    // the same refusal one layer earlier.
+    assert!(matches!(
+        Workspace::discover(work.path()),
+        Err(WorkspaceError::Manifest(_))
+    ));
+}
+
+fn write_manifest(dir: &Path, json: &str) {
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(dir.join("package.json"), json).unwrap();
+}
+
+/// The version recorded in the `package.json` a link resolves to. Reading it
+/// through the link is the point: it proves the link resolves *and* lands on
+/// the version the importer asked for.
+fn linked_version(importer_dir: &Path, pkg: &str) -> String {
+    let raw = std::fs::read_to_string(
+        importer_dir
+            .join("node_modules")
+            .join(pkg)
+            .join("package.json"),
+    )
+    .unwrap_or_else(|err| panic!("{pkg} is not linked into {}: {err}", importer_dir.display()));
+    let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    parsed["version"].as_str().unwrap().to_string()
+}
+
+fn two_versions_of_lodash() -> FixtureRegistry {
+    FixtureRegistry::new().with_packument("lodash", &[("4.17.21", &[]), ("3.10.1", &[])])
+}
+
+#[test]
+fn installing_from_one_importer_leaves_the_others_linked() {
+    // Two importers wanting different versions. Both end up correct, and
+    // installing into one does not disturb the other's node_modules.
     let home = TempDir::new().unwrap();
     let work = TempDir::new().unwrap();
-    let store = Store::new(home.path().join("store"));
-    let registry = FixtureRegistry::new().with_package("lodash", "4.17.21", lodash_tarball());
+    let root = work.path();
+    write_manifest(
+        root,
+        r#"{"name":"ws","workspaces":["packages/*","apps/*"]}"#,
+    );
+    write_manifest(
+        &root.join("packages/ui"),
+        r#"{"name":"ui","dependencies":{"lodash":"3.10.1"}}"#,
+    );
+    write_manifest(&root.join("apps/web"), r#"{"name":"web"}"#);
 
-    // No package.json was written.
-    assert!(matches!(
-        install(
-            work.path(),
-            &store,
-            &registry,
-            &spec("lodash", VersionSpec::Latest)
-        ),
-        Err(InstallError::Manifest(_))
-    ));
+    let store = Store::new(home.path().join("store"));
+    let workspace = Workspace::discover(root).unwrap();
+
+    install(
+        &workspace,
+        &ImporterPath::new("apps/web").unwrap(),
+        &store,
+        &two_versions_of_lodash(),
+        &spec("lodash", VersionSpec::Exact("4.17.21".into())),
+    )
+    .unwrap();
+
+    assert_eq!(linked_version(&root.join("apps/web"), "lodash"), "4.17.21");
+    assert_eq!(
+        linked_version(&root.join("packages/ui"), "lodash"),
+        "3.10.1",
+        "installing into apps/web disturbed packages/ui"
+    );
+}
+
+#[test]
+fn two_importers_on_the_same_version_share_one_store_entry() {
+    // The reason the store lives at the workspace root. Asserted on inode,
+    // like spec 1's hard-link test — a copy passes every other assertion.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    write_manifest(
+        root,
+        r#"{"name":"ws","workspaces":["packages/*","apps/*"]}"#,
+    );
+    write_manifest(
+        &root.join("packages/ui"),
+        r#"{"name":"ui","dependencies":{"lodash":"4.17.21"}}"#,
+    );
+    write_manifest(&root.join("apps/web"), r#"{"name":"web"}"#);
+
+    let store = Store::new(home.path().join("store"));
+    let workspace = Workspace::discover(root).unwrap();
+
+    install(
+        &workspace,
+        &ImporterPath::new("apps/web").unwrap(),
+        &store,
+        &two_versions_of_lodash(),
+        &spec("lodash", VersionSpec::Exact("4.17.21".into())),
+    )
+    .unwrap();
+
+    let virtual_store = root.join("node_modules/.jerky");
+    let entries: Vec<_> = std::fs::read_dir(&virtual_store)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("lodash@"))
+        .collect();
+    assert_eq!(entries, ["lodash@4.17.21"], "the version was stored twice");
+
+    let a = std::fs::metadata(root.join("apps/web/node_modules/lodash/package.json")).unwrap();
+    let b = std::fs::metadata(root.join("packages/ui/node_modules/lodash/package.json")).unwrap();
+    assert_eq!(
+        (a.dev(), a.ino()),
+        (b.dev(), b.ino()),
+        "each importer got its own copy of the bytes"
+    );
+}
+
+#[test]
+fn a_local_dependency_is_linked_not_fetched() {
+    // Counted: the registry must see zero requests for a workspace member.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    write_manifest(
+        root,
+        r#"{"name":"ws","workspaces":["packages/*","apps/*"]}"#,
+    );
+    write_manifest(
+        &root.join("packages/ui"),
+        r#"{"name":"ui","version":"1.0.0"}"#,
+    );
+    write_manifest(
+        &root.join("apps/web"),
+        r#"{"name":"web","dependencies":{"ui":"workspace:*"}}"#,
+    );
+
+    let store = Store::new(home.path().join("store"));
+    let workspace = Workspace::discover(root).unwrap();
+    let registry = two_versions_of_lodash();
+
+    install(
+        &workspace,
+        &ImporterPath::new("apps/web").unwrap(),
+        &store,
+        &registry,
+        &spec("lodash", VersionSpec::Exact("4.17.21".into())),
+    )
+    .unwrap();
+
+    assert_eq!(linked_version(&root.join("apps/web"), "ui"), "1.0.0");
+    assert_eq!(
+        registry.packument_calls_for("ui"),
+        0,
+        "a workspace member was fetched from the registry"
+    );
+    // And it points at the member itself, not into the virtual store.
+    let target = std::fs::read_link(root.join("apps/web/node_modules/ui")).unwrap();
+    assert_eq!(target, Path::new("../../../packages/ui"));
+}
+
+#[test]
+fn a_workspace_specifier_naming_no_member_is_an_error() {
+    // `workspace:*` for a package that is not in the repo is a typo, not a
+    // fallback to the registry.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    write_manifest(root, r#"{"name":"ws","workspaces":["apps/*"]}"#);
+    write_manifest(
+        &root.join("apps/web"),
+        r#"{"name":"web","dependencies":{"ghost":"workspace:*"}}"#,
+    );
+
+    let store = Store::new(home.path().join("store"));
+    let workspace = Workspace::discover(root).unwrap();
+
+    let err = install(
+        &workspace,
+        &ImporterPath::new("apps/web").unwrap(),
+        &store,
+        &two_versions_of_lodash(),
+        &spec("lodash", VersionSpec::Exact("4.17.21".into())),
+    )
+    .unwrap_err();
+
+    assert!(
+        matches!(err, InstallError::Resolve(_)),
+        "expected a resolution failure, got {err:?}"
+    );
+}
+
+#[test]
+fn a_single_importer_workspace_installs_exactly_as_before() {
+    // Spec 1 and 2's existing behaviour, now through the general path.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = project(work.path());
+
+    let store = Store::new(home.path().join("store"));
+    let workspace = Workspace::discover(root).unwrap();
+
+    let installed = install(
+        &workspace,
+        &ImporterPath::root(),
+        &store,
+        &FixtureRegistry::new().with_package("lodash", "4.17.21", lodash_tarball()),
+        &spec("lodash", VersionSpec::Latest),
+    )
+    .unwrap();
+
+    assert_eq!(installed.version, "4.17.21");
+    assert_eq!(
+        std::fs::read_link(root.join("node_modules/lodash")).unwrap(),
+        Path::new(".jerky/lodash@4.17.21/node_modules/lodash"),
+        "the root importer got a target shaped for a nested one"
+    );
+    assert_eq!(linked_version(root, "lodash"), "4.17.21");
+}
+
+/// A two-importer workspace with one local dependency, which is the shape
+/// most of these assertions need.
+fn linked_workspace(root: &Path) -> Workspace {
+    write_manifest(
+        root,
+        r#"{"name":"ws","workspaces":["packages/*","apps/*"]}"#,
+    );
+    write_manifest(
+        &root.join("packages/ui"),
+        r#"{"name":"ui","version":"1.0.0"}"#,
+    );
+    write_manifest(
+        &root.join("apps/web"),
+        r#"{"name":"web","dependencies":{"ui":"workspace:*"}}"#,
+    );
+    Workspace::discover(root).unwrap()
+}
+
+fn read_json(path: &Path) -> serde_json::Value {
+    serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+}
+
+#[test]
+fn installing_a_member_by_the_workspace_protocol_links_it() {
+    // `jerky install ui@workspace:*` names a member on purpose. It must link
+    // rather than fetch, and record the protocol rather than a version: the
+    // member's version is whatever the repo says today, so pinning it would
+    // go stale on the next commit to that member.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let workspace = linked_workspace(root);
+    let store = Store::new(home.path().join("store"));
+    let registry = two_versions_of_lodash();
+
+    let installed = install(
+        &workspace,
+        &ImporterPath::new("apps/web").unwrap(),
+        &store,
+        &registry,
+        &spec("ui", VersionSpec::Exact("workspace:*".into())),
+    )
+    .unwrap();
+
+    assert_eq!(installed.version, "1.0.0", "reported the member's version");
+    assert_eq!(linked_version(&root.join("apps/web"), "ui"), "1.0.0");
+    assert_eq!(
+        read_json(&root.join("apps/web/package.json"))["dependencies"]["ui"],
+        "workspace:*",
+        "a member was pinned to a version instead of the protocol"
+    );
+    assert_eq!(registry.packument_calls_for("ui"), 0);
+}
+
+#[test]
+fn install_writes_one_lockfile_at_the_workspace_root() {
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let workspace = linked_workspace(root);
+    let store = Store::new(home.path().join("store"));
+
+    install(
+        &workspace,
+        &ImporterPath::new("apps/web").unwrap(),
+        &store,
+        &two_versions_of_lodash(),
+        &spec("lodash", VersionSpec::Exact("4.17.21".into())),
+    )
+    .unwrap();
+
+    let lock = read_json(&root.join("jerky-lock.json"));
+    assert_eq!(
+        lock["importers"]["apps/web"]["dependencies"]["lodash"]["version"],
+        "4.17.21"
+    );
+    // Every importer appears, including the ones that declare nothing: each
+    // owns a node_modules, and a missing key would read as unresolved.
+    assert!(lock["importers"]["packages/ui"].is_object());
+    assert!(lock["importers"]["."].is_object());
+    assert!(
+        !root.join("apps/web/jerky-lock.json").exists(),
+        "an importer got its own lockfile; there is one per workspace"
+    );
+}
+
+#[test]
+fn a_lockfile_target_is_one_climb_short_of_the_symlink() {
+    // Two independent calculations produce these: `resolver::local_path` for
+    // the lockfile, relative to the importer, and `linker::relative_path` for
+    // the symlink, relative to the importer's node_modules. The link sits one
+    // level deeper, so it must climb exactly once more. Nothing in the types
+    // keeps the two in agreement, so it is pinned here.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let workspace = linked_workspace(root);
+    let store = Store::new(home.path().join("store"));
+
+    install(
+        &workspace,
+        &ImporterPath::new("apps/web").unwrap(),
+        &store,
+        &two_versions_of_lodash(),
+        &spec("lodash", VersionSpec::Exact("4.17.21".into())),
+    )
+    .unwrap();
+
+    let lock = read_json(&root.join("jerky-lock.json"));
+    let recorded = lock["importers"]["apps/web"]["dependencies"]["ui"]["version"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("link:")
+        .expect("a local dependency is recorded with the link: protocol")
+        .to_string();
+    let linked = std::fs::read_link(root.join("apps/web/node_modules/ui")).unwrap();
+
+    assert_eq!(recorded, "../../packages/ui");
+    assert_eq!(linked, Path::new("..").join(&recorded));
 }
