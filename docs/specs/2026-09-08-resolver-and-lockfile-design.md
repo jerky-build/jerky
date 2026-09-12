@@ -266,11 +266,13 @@ There is also no placement algorithm. Every node gets
 become symlinks *inside* that directory. The layout is a mechanical function of
 the graph.
 
-**One linker correction this forces.** Spec 1's `symlink_dependency` writes a
-target with no leading `../`, correct for links in `node_modules/` itself. Links
-between packages *inside* the virtual store sit one level deeper, so they do
-need the `../` — which is exactly the case pnpm uses it for. The function gains a variant for intra-store links rather than being
-changed.
+**One linker correction this forces.** Spec 1's `symlink_dependency` wrote a
+target with no leading `../`, correct only for links in `node_modules/` itself.
+Links between packages *inside* the virtual store sit one level deeper, so they
+do need the `../` — which is exactly the case pnpm uses it for. Resolved by
+#45: `symlink_dependency` is gone, replaced by `symlink_dependency_from`,
+`symlink_into_store` and `symlink_local`, which all derive their target from
+where the link and its destination diverge rather than assuming a shape.
 
 ### Selection rules
 
