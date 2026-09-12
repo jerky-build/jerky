@@ -3,8 +3,8 @@
 **Date:** 2026-09-10
 **Status:** Approved
 **Issues:** #10 (this spec); reshapes #11, interacts with #12, unblocks #13/#18
-**Amends:** `docs/superpowers/specs/2026-09-08-resolver-and-lockfile-design.md` §8
-**Builds on:** `docs/superpowers/specs/2026-08-24-package-manager-design.md`
+**Amends:** `docs/specs/2026-09-08-resolver-and-lockfile-design.md` §8
+**Builds on:** `docs/specs/2026-08-24-package-manager-design.md`
 
 ## 1. Context, and a gap worth naming
 
@@ -14,7 +14,7 @@ jerky's first design opened with what it is:
 > manager and a **monorepo** build/task orchestrator.
 
 That sentence is the only time the word appears in roughly a thousand lines of
-design and five thousand lines of plan. "Workspace" appears zero times. The
+design. "Workspace" appears zero times. The
 ambition was stated and then partitioned away, because the same paragraph goes
 on to say the spec covers "only the first slice of the package-manager half".
 
@@ -188,9 +188,8 @@ Three things this diagram is making concrete.
 no `../`; a link in `packages/ui/node_modules` needs three to climb back to the
 root's virtual store. The existing linker computes a fixed target, so it must
 take the importer's depth as input. This lands next to the intra-store `../`
-correction already scheduled as spec 2's Task 5, which is convenient: both are
-the same class of change, and doing them together avoids touching the linker
-twice.
+correction already scheduled as #45, which is convenient: both are the same
+class of change, and doing them together avoids touching the linker twice.
 
 **A local dependency is a symlink straight at the source directory** —
 `ui -> ../../../packages/ui` — not into the virtual store. There is no store
@@ -285,14 +284,16 @@ belongs behind a flag rather than in the resolver.
 
 ## 9. Effect on existing work
 
-**Spec 2's Tasks 4 through 7 change.** PR #38 is held rather than merged: its
-determinism, diff-noise, version-gate and validation work stands, but the
-top-level shape moves from `root` to `importers`. Doing this now costs a
-find-and-replace; doing it after a released format costs a migration and a
-compatibility shim.
+**The lockfile reshape has landed.** PR #38 was held rather than merged and
+superseded by #43: its determinism, diff-noise, version-gate and validation work
+stands, but the top-level shape moved from `root` to `importers`. Doing it then
+cost a find-and-replace; doing it after a released format would have cost a
+migration and a compatibility shim. Member discovery followed in #44.
 
-**Tasks 5 and 6** absorb importer-relative symlink depth, which is the same
-class of change as the intra-store `../` correction they already carry.
+**Importer-relative symlink depth is #45**, grouped there with the intra-store
+`../` correction because they are the same class of change. #46 installs across
+the workspace on top of it, and #47 makes the lockfile something jerky reads
+back rather than only writes.
 
 ### Issues
 
@@ -306,10 +307,11 @@ class of change as the intra-store `../` correction they already carry.
   spec is their prerequisite.
 - **#19** gains its workspace meaning: bare install covers every importer.
 
-### Needs filing
+### Filed since
 
-- **`--filter` selection**, deferred from §3.
-- **Enforcing one version across importers**, if it turns out to be wanted.
+- **#40** — `--filter` selection, deferred from §3.
+- **#41** — enforcing one version across importers, if it turns out to be
+  wanted.
 
 ## 10. Open questions
 

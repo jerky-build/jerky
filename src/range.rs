@@ -3,7 +3,7 @@
 //! The wrapper is the containment boundary for a pre-1.0 dependency: swapping
 //! the crate is a change to this file alone, and
 //! `tests/semver_conformance.rs` decides whether a replacement is acceptable.
-//! See `docs/superpowers/research/2026-09-08-npm-semver-crate-selection.md`.
+//! See `docs/research/2026-09-08-npm-semver-crate-selection.md`.
 
 use std::cmp::Ordering;
 
