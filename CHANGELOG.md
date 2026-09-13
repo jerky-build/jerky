@@ -73,7 +73,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   edit; discovering that a dependency already drifted is not.
 - A range you *ask* for is recorded as you wrote it: `jerky install
   lodash@^4.0.0` puts `"^4.0.0"` in `package.json`, not the version it selected
-  today. The pin is the default for a request that named no version, not an
+  today. Every range form npm accepts counts — `~4.17.0`, `4.x`, `>=4 <5`, a
+  bare `4` — because the test is whether the request parses as a range at all,
+  not which operator it used. The pin is the default for a request that named no version, not an
   override of one that did. A dist-tag still pins — `jerky install lodash@latest`
   records the version `latest` meant, since a tag in a manifest is a moving
   pointer rather than a constraint.

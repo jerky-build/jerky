@@ -676,6 +676,56 @@ fn a_range_the_user_typed_is_recorded_as_they_typed_it() {
 }
 
 #[test]
+fn every_range_form_is_recorded_as_written() {
+    // The rule is "parses as a range, is not a bare version", so it is the
+    // shape of the request that decides rather than a list of operators the
+    // code knows about. Asserting the *selected* version alongside the
+    // recorded string is what keeps this honest: each of these resolves as a
+    // real range, and none of them is a string being copied through.
+    let cases = [
+        ("~4.17.0", "4.17.21"),
+        ("~4.17.21", "4.17.21"),
+        ("^4.0.0", "4.18.0"),
+        ("4.x", "4.18.0"),
+        ("4.17.x", "4.17.21"),
+        ("4", "4.18.0"),
+        (">=4 <5", "4.18.0"),
+        ("*", "5.0.0"),
+    ];
+
+    for (requested, expected) in cases {
+        let home = TempDir::new().unwrap();
+        let work = TempDir::new().unwrap();
+        let root = work.path();
+        let store = Store::new(home.path().join("store"));
+        let registry = FixtureRegistry::new().with_packument(
+            "lodash",
+            &[("4.17.21", &[]), ("4.18.0", &[]), ("5.0.0", &[])],
+        );
+        write_manifest(root, r#"{"name":"demo"}"#);
+
+        let installed = install(
+            &solo(root),
+            &ImporterPath::root(),
+            &store,
+            &registry,
+            &spec("lodash", VersionSpec::Exact(requested.into())),
+        )
+        .unwrap();
+
+        assert_eq!(
+            installed.version, expected,
+            "`{requested}` selected the wrong version"
+        );
+        assert_eq!(
+            read_json(&root.join("package.json"))["dependencies"]["lodash"],
+            requested,
+            "`{requested}` was not recorded as written"
+        );
+    }
+}
+
+#[test]
 fn a_dist_tag_is_pinned_rather_than_recorded_as_a_tag() {
     // `latest` parses as no range at all, and recording it verbatim would put
     // a moving pointer in the manifest — worse than the caret this default
