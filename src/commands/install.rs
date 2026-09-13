@@ -216,8 +216,17 @@ pub fn install(
         // The cost #47 wanted to avoid was re-fetching metadata for an entry
         // already present. Nothing is re-fetched: both hashes are already in
         // memory. A package carried over from the lockfile rather than
-        // re-resolved compares equal by construction, so this cannot fire
-        // spuriously either.
+        // re-resolved compares equal by construction.
+        //
+        // The comparison is algorithm-sensitive, though, and that is the one
+        // way it fires without tampering: `Integrity` compares algo *and*
+        // digest, so an entry locked from a legacy `dist.shasum` (sha1) whose
+        // metadata later carries a `dist.integrity` (sha512) disagrees with
+        // itself. The bytes are fine and the error says otherwise, with no
+        // path out but editing the lockfile by hand. Narrowing that needs a
+        // decision about which side to re-hash and is deliberately not made
+        // here — but it is the reason this is not the "cannot fire
+        // spuriously" check an earlier draft of this comment claimed.
         if let Some(locked) = locked_integrity.get(id)
             && *locked != package.integrity
         {
@@ -408,6 +417,20 @@ fn already_satisfies(recorded: &Importer, spec: &PackageSpec) -> bool {
     }
 }
 
+/// The request, when it is a range that rules nothing out.
+///
+/// What counts as ruling nothing out is `Range`'s question, not this module's
+/// — `*` has several spellings and the test is on what a range admits.
+fn unconstrained_range(requested: &VersionSpec) -> Option<&str> {
+    let VersionSpec::Exact(specifier) = requested else {
+        return None;
+    };
+    Range::parse(specifier)
+        .ok()?
+        .admits_everything()
+        .then_some(specifier.as_str())
+}
+
 /// The range the user typed, when what they typed was a range.
 ///
 /// A bare version is excluded on purpose: `4.17.21` is a valid range matching
@@ -416,26 +439,6 @@ fn already_satisfies(recorded: &Importer, spec: &PackageSpec) -> bool {
 /// does not parse as a range at all — and must not be recorded verbatim,
 /// because `latest` in a manifest names whatever the registry means by it on
 /// some later day rather than the thing that was installed.
-/// The request, when it is a range that rules nothing out.
-///
-/// Asked semantically rather than by spelling, because `*` has several: `x`,
-/// `X`, `*.*.*` and `>=0.0.0` all say the same nothing, and a blocklist of
-/// literals would catch whichever ones its author happened to think of.
-/// Satisfying both the lowest version expressible and an absurdly high one is
-/// the property they share and that no real constraint has — `^0.0.0` and
-/// `0.x` admit 0.0.0 but stop well below the ceiling, and `>=1.0.0` reaches
-/// the ceiling but excludes the floor.
-fn unconstrained_range(requested: &VersionSpec) -> Option<&str> {
-    let VersionSpec::Exact(specifier) = requested else {
-        return None;
-    };
-    let range = Range::parse(specifier).ok()?;
-
-    let floor = Version::parse("0.0.0").expect("a literal version parses");
-    let ceiling = Version::parse("999999.0.0").expect("a literal version parses");
-    (range.matches(&floor) && range.matches(&ceiling)).then_some(specifier.as_str())
-}
-
 fn declared_range(requested: &VersionSpec) -> Option<&str> {
     let VersionSpec::Exact(specifier) = requested else {
         return None;

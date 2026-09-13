@@ -13,8 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - The lockfile is now read back, not only written. An importer whose recorded
   specifiers still match its `package.json` is reused verbatim; one that does
   not is re-resolved. Staleness is per importer, so editing `apps/web` does not
-  invalidate what the root already resolved, and a repeated install of an
-  unchanged workspace reaches the registry not at all
+  invalidate what the root already resolved. Repeating an install that named a
+  version or a range — `jerky install lodash@4.17.21`, `jerky install
+  lodash@^4.0.0` — then reaches the registry not at all. A bare `jerky install
+  lodash` or a dist-tag still asks every time, because only the registry can
+  say what `latest` means today; that is the request rather than a shortcoming
   ([#47](https://github.com/jerky-build/jerky/issues/47)).
 - A lockfile entry's integrity hash is authoritative. If the registry later
   reports a different hash for a version the lockfile already pins, the install
@@ -24,7 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   consulted: a store hit proves only that the bytes match their *own* hash,
   which says nothing about whether that hash is the one the lockfile pinned.
   A republished tarball whose bytes another project already placed in the
-  machine-global store is exactly that case.
+  machine-global store is exactly that case. Note that the check compares the
+  hash algorithm as well as the digest, so an entry locked from a package's
+  legacy sha1 `shasum` will report a mismatch if the registry later serves a
+  sha512 `integrity` for it; the fix for now is to delete that lockfile entry
+  and reinstall.
 - `jerky install` now resolves the whole workspace in one walk and links every
   importer, rather than installing a single package into a single project.
   Members come from the root `package.json`'s `workspaces` field, which is

@@ -770,8 +770,9 @@ fn a_range_that_rules_nothing_out_is_refused() {
 
 #[test]
 fn a_bounded_range_is_not_mistaken_for_a_wildcard() {
-    // The refusal is narrow on purpose. `^0.0.0` and `0.x` admit 0.0.0, and
-    // `>=1.0.0` has no upper bound; each rules something out, so each stands.
+    // The refusal is narrow on purpose. `^0.0.0` and `0.x` admit 0.0.0,
+    // `>=1.0.0` has no upper bound, and `<9999999.0.0` has one that merely
+    // looks enormous; each rules something out, so each stands.
     let registry = FixtureRegistry::new().with_packument(
         "lodash",
         &[("0.0.0", &[]), ("0.1.0", &[]), ("4.17.21", &[])],
@@ -781,6 +782,9 @@ fn a_bounded_range_is_not_mistaken_for_a_wildcard() {
         ("^0.0.0", "0.0.0"),
         ("0.x", "0.1.0"),
         (">=1.0.0", "4.17.21"),
+        // Bounded, however large the bound looks. Probing with a merely big
+        // version rather than the highest expressible one refused this.
+        ("<9999999.0.0", "4.17.21"),
     ] {
         let home = TempDir::new().unwrap();
         let work = TempDir::new().unwrap();
