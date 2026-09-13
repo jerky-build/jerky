@@ -1351,3 +1351,180 @@ fn a_sync_with_no_request_installs_what_the_manifests_declare() {
     assert!(lock["importers"]["packages/ui"]["dependencies"]["lodash"].is_object());
     assert!(lock["importers"]["packages/api"]["dependencies"]["alpha"].is_object());
 }
+
+#[test]
+fn a_members_dev_dependencies_are_installed() {
+    // The whole point: a manifest declaring only devDependencies installed
+    // nothing at all before this. Two importers, because the member that
+    // declares nothing must still come out of the same walk unharmed.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    write_manifest(
+        root,
+        r#"{"name":"ws","workspaces":["packages/*"],"devDependencies":{"lodash":"4.17.21"}}"#,
+    );
+    write_manifest(&root.join("packages/ui"), r#"{"name":"ui"}"#);
+
+    let store = Store::new(home.path().join("store"));
+    let registry = two_versions_of_lodash();
+
+    sync(
+        &Workspace::discover(root).unwrap(),
+        &store,
+        &registry,
+        None::<&Request>,
+    )
+    .unwrap();
+
+    assert_eq!(linked_version(root, "lodash"), "4.17.21");
+    let lock = read_json(&root.join("jerky-lock.json"));
+    assert_eq!(
+        lock["importers"]["."]["devDependencies"]["lodash"]["version"],
+        "4.17.21"
+    );
+}
+
+#[test]
+fn every_importers_dev_dependencies_are_followed_not_only_the_roots() {
+    // The rule is usually phrased "only the root project's", which does not
+    // survive workspaces: in a monorepo every member is a first-party project,
+    // not just the one keyed `.`. So the root declares nothing here and the
+    // assertions are on packages/ui.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    write_manifest(root, r#"{"name":"ws","workspaces":["packages/*"]}"#);
+    write_manifest(
+        &root.join("packages/ui"),
+        r#"{"name":"ui","devDependencies":{"lodash":"4.17.21"}}"#,
+    );
+
+    let store = Store::new(home.path().join("store"));
+    let registry = two_versions_of_lodash();
+
+    sync(
+        &Workspace::discover(root).unwrap(),
+        &store,
+        &registry,
+        None::<&Request>,
+    )
+    .unwrap();
+
+    assert_eq!(
+        linked_version(&root.join("packages/ui"), "lodash"),
+        "4.17.21",
+        "a member's devDependencies went unfollowed because it is not the root"
+    );
+    let lock = read_json(&root.join("jerky-lock.json"));
+    assert_eq!(
+        lock["importers"]["packages/ui"]["devDependencies"]["lodash"]["version"],
+        "4.17.21"
+    );
+}
+
+#[test]
+fn moving_a_dependency_between_sections_makes_its_importer_stale() {
+    // Same specifier, different section. This is what the separate blocks buy:
+    // with one flat block the edit reads as no change at all, and the lockfile
+    // goes on claiming a section the manifest no longer uses.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    write_manifest(root, r#"{"name":"ws","workspaces":["packages/*"]}"#);
+    write_manifest(
+        &root.join("packages/ui"),
+        r#"{"name":"ui","dependencies":{"lodash":"4.17.21"}}"#,
+    );
+    write_manifest(
+        &root.join("packages/api"),
+        r#"{"name":"api","dependencies":{"alpha":"1.0.0"}}"#,
+    );
+
+    let store = Store::new(home.path().join("store"));
+    let registry = two_versions_of_lodash().with_tree(&[("alpha", "1.0.0", &[])]);
+
+    sync(
+        &Workspace::discover(root).unwrap(),
+        &store,
+        &registry,
+        None::<&Request>,
+    )
+    .unwrap();
+    assert_eq!(registry.packument_calls_for("lodash"), 1);
+
+    // Nothing about what is wanted changed — only which section wants it.
+    write_manifest(
+        &root.join("packages/ui"),
+        r#"{"name":"ui","devDependencies":{"lodash":"4.17.21"}}"#,
+    );
+
+    sync(
+        &Workspace::discover(root).unwrap(),
+        &store,
+        &registry,
+        None::<&Request>,
+    )
+    .unwrap();
+
+    assert_eq!(
+        registry.packument_calls_for("lodash"),
+        2,
+        "the section change read as no change, so the importer was reused"
+    );
+    assert_eq!(
+        registry.packument_calls_for("alpha"),
+        1,
+        "packages/api was re-resolved even though its manifest never changed"
+    );
+
+    let lock = read_json(&root.join("jerky-lock.json"));
+    assert_eq!(
+        lock["importers"]["packages/ui"]["devDependencies"]["lodash"]["version"],
+        "4.17.21"
+    );
+    assert!(
+        lock["importers"]["packages/ui"]["dependencies"].is_null(),
+        "the lockfile still records the section the manifest moved away from"
+    );
+}
+
+#[test]
+fn a_name_in_both_sections_resolves_as_a_production_dependency() {
+    // A contradiction the manifest may not be the user's to fix, so it is
+    // resolved the way npm resolves it rather than refused.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    write_manifest(root, r#"{"name":"ws","workspaces":["packages/*"]}"#);
+    write_manifest(
+        &root.join("packages/ui"),
+        r#"{"name":"ui","dependencies":{"lodash":"4.17.21"},"devDependencies":{"lodash":"3.10.1"}}"#,
+    );
+
+    let store = Store::new(home.path().join("store"));
+    let registry = two_versions_of_lodash();
+
+    sync(
+        &Workspace::discover(root).unwrap(),
+        &store,
+        &registry,
+        None::<&Request>,
+    )
+    .unwrap();
+
+    assert_eq!(
+        linked_version(&root.join("packages/ui"), "lodash"),
+        "4.17.21",
+        "the devDependencies entry won"
+    );
+    let lock = read_json(&root.join("jerky-lock.json"));
+    assert_eq!(
+        lock["importers"]["packages/ui"]["dependencies"]["lodash"]["specifier"],
+        "4.17.21"
+    );
+    assert!(
+        lock["importers"]["packages/ui"]["devDependencies"].is_null(),
+        "one name resolved to two entries; the graph is keyed by name"
+    );
+}

@@ -203,6 +203,30 @@ pub enum Resolution {
     Local(PathBuf),
 }
 
+/// Which section of a manifest declared a dependency.
+///
+/// Only an importer ever has one. A registry package's dependencies are all
+/// `Prod` by construction, because `VersionMetadata` has no field a dev
+/// dependency could arrive through — which is where that correctness
+/// requirement is enforced, rather than by anything here remembering it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Prod,
+    Dev,
+}
+
+/// What an importer declares: a specifier, and which section it came from.
+///
+/// The pair is the resolver's input and the unit staleness is measured in. A
+/// specifier alone cannot tell `dependencies` from `devDependencies`, so a
+/// dependency moved between the two at an unchanged specifier would read as no
+/// change at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Declared {
+    pub specifier: String,
+    pub kind: Kind,
+}
+
 /// One dependency as an importer declared it, and what it resolved to.
 ///
 /// The pair does the work of two mechanisms. `specifier` is what the manifest
@@ -210,9 +234,15 @@ pub enum Resolution {
 /// that became, which lets linking read the answer instead of re-deriving it.
 /// It also records an alias faithfully — `execa` declared as
 /// `npm:safe-execa@0.3.0` keeps the local name as its key.
+///
+/// `kind` is a field rather than a second map on [`Importer`], so a name can
+/// only ever mean one thing and every lookup stays single-branch. The split
+/// into two blocks happens at serialization, where the on-disk format wants
+/// it; the graph has no use for it.
 #[derive(Debug, Clone)]
 pub struct Dependency {
     pub specifier: String,
+    pub kind: Kind,
     pub resolution: Resolution,
 }
 
@@ -229,12 +259,18 @@ impl Importer {
     /// from the record, and one deleted from it lingers there. Either way what
     /// was recorded no longer describes what was asked for, which is the whole
     /// question a lockfile's specifiers exist to answer.
-    pub fn matches(&self, declared: &BTreeMap<String, String>) -> bool {
+    ///
+    /// The comparison is over `(specifier, kind)` pairs rather than specifiers
+    /// alone. A dependency moved from `dependencies` to `devDependencies`
+    /// without its specifier changing is a real edit, and one the lockfile
+    /// records, so it has to make its importer stale — otherwise the file goes
+    /// on describing a section the manifest has abandoned.
+    pub fn matches(&self, declared: &BTreeMap<String, Declared>) -> bool {
         self.dependencies.len() == declared.len()
-            && declared.iter().all(|(name, specifier)| {
-                self.dependencies
-                    .get(name)
-                    .is_some_and(|dependency| &dependency.specifier == specifier)
+            && declared.iter().all(|(name, declared)| {
+                self.dependencies.get(name).is_some_and(|dependency| {
+                    dependency.specifier == declared.specifier && dependency.kind == declared.kind
+                })
             })
     }
 }
@@ -255,8 +291,11 @@ pub struct ResolvedGraph {
 /// that there is more than one importer to be: `None` could only ever mean one
 /// project, and the compiler would not have asked about the rest.
 enum Dependent {
-    /// A project declaring its own dependency, identified by where it sits.
-    Importer(ImporterPath),
+    /// A project declaring its own dependency, identified by where it sits,
+    /// and by which of its sections asked. The kind rides along rather than
+    /// steering anything: resolution is identical either way, and the value is
+    /// only carried so the graph can record what the manifest said.
+    Importer { path: ImporterPath, kind: Kind },
     /// A package declaring one of its own.
     Package(PackageId),
 }
@@ -323,9 +362,15 @@ struct Pending {
 /// are deliberately not forced into agreement: importers wanting incompatible
 /// versions each get their own node, exactly as two packages within one tree
 /// do.
+///
+/// Kind-blind: a devDependency resolves exactly as a dependency does, and the
+/// only thing that widened to admit them is this input. Nothing below decides
+/// anything on a [`Kind`], which is what keeps "no registry package's dev
+/// dependencies" a property of `VersionMetadata`'s shape rather than a rule
+/// this walk has to remember.
 pub fn resolve(
     registry: &dyn RegistryClient,
-    roots: &BTreeMap<ImporterPath, BTreeMap<String, String>>,
+    roots: &BTreeMap<ImporterPath, BTreeMap<String, Declared>>,
     members: &BTreeMap<String, ImporterPath>,
 ) -> Result<ResolvedGraph, ResolveError> {
     let mut packages: BTreeMap<PackageId, ResolvedPackage> = BTreeMap::new();
@@ -350,12 +395,15 @@ pub fn resolve(
     // way to name a directory in this repo.
     let mut work: VecDeque<Pending> = VecDeque::new();
     for (importer, declared) in roots {
-        for (name, range) in declared {
-            if !range.starts_with(WORKSPACE_PROTOCOL) {
+        for (name, Declared { specifier, kind }) in declared {
+            if !specifier.starts_with(WORKSPACE_PROTOCOL) {
                 work.push_back(Pending {
-                    dependent: Dependent::Importer(importer.clone()),
+                    dependent: Dependent::Importer {
+                        path: importer.clone(),
+                        kind: *kind,
+                    },
                     name: name.clone(),
-                    range: range.clone(),
+                    range: specifier.clone(),
                 });
                 continue;
             }
@@ -364,7 +412,7 @@ pub fn resolve(
                 .get(name)
                 .ok_or_else(|| ResolveError::NoSuchMember {
                     name: name.clone(),
-                    specifier: range.clone(),
+                    specifier: specifier.clone(),
                     members: members.keys().cloned().collect(),
                 })?;
 
@@ -375,7 +423,8 @@ pub fn resolve(
                 .insert(
                     name.clone(),
                     Dependency {
-                        specifier: range.clone(),
+                        specifier: specifier.clone(),
+                        kind: *kind,
                         resolution: Resolution::Local(local_path(importer, member)),
                     },
                 );
@@ -399,11 +448,12 @@ pub fn resolve(
                     package.dependencies.insert(name.clone(), id.clone());
                 }
             }
-            Dependent::Importer(importer) => {
-                importers.entry(importer).or_default().dependencies.insert(
+            Dependent::Importer { path, kind } => {
+                importers.entry(path).or_default().dependencies.insert(
                     name.clone(),
                     Dependency {
                         specifier: range.clone(),
+                        kind,
                         resolution: Resolution::Registry(id.clone()),
                     },
                 );

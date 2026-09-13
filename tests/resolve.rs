@@ -7,18 +7,28 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use jerky::resolver::{ImporterPath, Resolution, ResolveError, resolve};
+use jerky::resolver::{Declared, ImporterPath, Kind, Resolution, ResolveError, resolve};
 use jerky::testing::FixtureRegistry;
 
 /// A workspace of one, keyed `.` — the degenerate case of the general input,
 /// which is why these tests read unchanged now that the resolver takes many.
-fn roots(list: &[(&str, &str)]) -> BTreeMap<ImporterPath, BTreeMap<String, String>> {
-    BTreeMap::from([(
-        ImporterPath::root(),
-        list.iter()
-            .map(|(n, r)| (n.to_string(), r.to_string()))
-            .collect(),
-    )])
+fn roots(list: &[(&str, &str)]) -> BTreeMap<ImporterPath, BTreeMap<String, Declared>> {
+    BTreeMap::from([(ImporterPath::root(), section(list, Kind::Prod))])
+}
+
+/// One manifest section as the resolver takes it.
+fn section(list: &[(&str, &str)], kind: Kind) -> BTreeMap<String, Declared> {
+    list.iter()
+        .map(|(name, specifier)| {
+            (
+                name.to_string(),
+                Declared {
+                    specifier: specifier.to_string(),
+                    kind,
+                },
+            )
+        })
+        .collect()
 }
 
 #[test]
@@ -373,14 +383,14 @@ fn a_spec_that_is_neither_a_range_nor_a_tag_is_reported() {
     }
 }
 
-fn importers(list: &[(&str, &[(&str, &str)])]) -> BTreeMap<ImporterPath, BTreeMap<String, String>> {
+fn importers(
+    list: &[(&str, &[(&str, &str)])],
+) -> BTreeMap<ImporterPath, BTreeMap<String, Declared>> {
     list.iter()
         .map(|(importer, deps)| {
             (
                 ImporterPath::new(*importer).unwrap(),
-                deps.iter()
-                    .map(|(n, r)| (n.to_string(), r.to_string()))
-                    .collect(),
+                section(deps, Kind::Prod),
             )
         })
         .collect()
@@ -527,4 +537,106 @@ fn a_workspace_specifier_naming_no_member_is_an_error() {
         0,
         "a missing member fell back to the registry instead of failing"
     );
+}
+
+/// A registry serving packuments straight from raw JSON.
+///
+/// The only way to express a package that *declares* devDependencies:
+/// `VersionMetadata` has no field for them, so `FixtureRegistry` cannot build
+/// one, and a test that cannot express the input cannot test the defence. The
+/// JSON below is the shape npm actually serves — a live `express` version
+/// really does carry a `devDependencies` object.
+struct RawRegistry {
+    packuments: BTreeMap<String, String>,
+}
+
+impl jerky::registry::RegistryClient for RawRegistry {
+    fn version_metadata(
+        &self,
+        name: &str,
+        _version: &str,
+    ) -> Result<jerky::registry::VersionMetadata, jerky::registry::RegistryError> {
+        Err(jerky::registry::RegistryError::PackageNotFound(
+            name.to_string(),
+        ))
+    }
+
+    fn packument(
+        &self,
+        name: &str,
+    ) -> Result<jerky::registry::Packument, jerky::registry::RegistryError> {
+        let raw = self
+            .packuments
+            .get(name)
+            .ok_or_else(|| jerky::registry::RegistryError::PackageNotFound(name.to_string()))?;
+        Ok(serde_json::from_str(raw).expect("the fixture JSON is well formed"))
+    }
+
+    fn fetch_tarball(&self, url: &str) -> Result<Vec<u8>, jerky::registry::RegistryError> {
+        panic!("resolution fetched {url}; it does no I/O beyond metadata");
+    }
+}
+
+/// One packument holding one version, with whatever sections the caller names.
+fn raw_packument(name: &str, sections: &str) -> String {
+    format!(
+        r#"{{"name":"{name}","dist-tags":{{"latest":"1.0.0"}},
+            "versions":{{"1.0.0":{{"name":"{name}","version":"1.0.0",
+                "dist":{{"tarball":"https://r.test/{name}.tgz",
+                         "integrity":"{}"}}{sections}}}}}}}"#,
+        jerky::testing::ABC_SHA512_SSRI
+    )
+}
+
+#[test]
+fn a_registry_packages_dev_dependencies_are_still_not_followed() {
+    // The correctness requirement, and the one widening the resolver's input
+    // could plausibly have broken: an importer's devDependencies are followed
+    // now, and a package's must never be — following them pulls in most of the
+    // registry. `a` is declared as a devDependency here precisely so the two
+    // rules meet in one graph.
+    //
+    // Enforced by `VersionMetadata` having no field for them rather than by
+    // the resolver remembering, which is why `test-only-dep` is a package the
+    // registry could serve: this fails because the graph holds it, not because
+    // resolution errored looking for something absent.
+    let registry = RawRegistry {
+        packuments: BTreeMap::from([
+            (
+                "a".to_string(),
+                raw_packument(
+                    "a",
+                    r#","dependencies":{"runtime-dep":"^1.0.0"},
+                       "devDependencies":{"test-only-dep":"^1.0.0"}"#,
+                ),
+            ),
+            ("runtime-dep".to_string(), raw_packument("runtime-dep", "")),
+            (
+                "test-only-dep".to_string(),
+                raw_packument("test-only-dep", ""),
+            ),
+        ]),
+    };
+
+    let graph = resolve(
+        &registry,
+        &BTreeMap::from([(
+            ImporterPath::new("packages/ui").unwrap(),
+            section(&[("a", "^1.0.0")], Kind::Dev),
+        )]),
+        &no_members(),
+    )
+    .unwrap();
+
+    let names: Vec<&str> = graph.packages.keys().map(|id| id.name.as_str()).collect();
+    assert_eq!(
+        names,
+        ["a", "runtime-dep"],
+        "a dependency's devDependencies were followed"
+    );
+
+    // And the importer's own devDependency did resolve, so the assertion above
+    // is not passing because nothing happened at all.
+    let dependency = &graph.importers[&ImporterPath::new("packages/ui").unwrap()].dependencies["a"];
+    assert_eq!(dependency.kind, Kind::Dev);
 }

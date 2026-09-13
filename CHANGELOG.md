@@ -10,6 +10,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `devDependencies` are now installed. Every workspace member's are followed,
+  not only the root project's — in a monorepo each member is a first-party
+  project, and a `packages/ui` declaring nothing but devDependencies previously
+  installed nothing at all. A dependency's own dev dependencies remain
+  unreachable, as they must: following them pulls in most of the registry.
+  The lockfile records which section asked, in a `devDependencies` block beside
+  `dependencies` for each importer, so moving a package between the two shows
+  up as a real diff and reinstalls rather than reading as no change. A project
+  with no devDependencies gets no new block. `lockfileVersion` stays `1`; the
+  format is unreleased ([#21](https://github.com/jerky-build/jerky/issues/21)).
+  Recording a package *into* `devDependencies` from the command line is
+  `--save-dev`, which is still to come; a name appearing in both sections is
+  resolved as a production dependency, which is npm's answer, rather than
+  refused — the manifest may not be the user's to edit.
 - The lockfile is now read back, not only written. An importer whose recorded
   specifiers still match its `package.json` is reused verbatim; one that does
   not is re-resolved. Staleness is per importer, so editing `apps/web` does not
