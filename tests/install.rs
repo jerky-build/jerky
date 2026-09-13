@@ -563,3 +563,640 @@ fn a_lockfile_target_is_one_climb_short_of_the_symlink() {
     assert_eq!(recorded, "../../packages/ui");
     assert_eq!(linked, Path::new("..").join(&recorded));
 }
+
+#[test]
+fn the_manifest_records_an_exact_pin() {
+    // Even now that ranges resolve, `jerky install <pkg>` pins. What gets
+    // recorded is the version the registry chose, not the request that found
+    // it, so a dist-tag lands in the manifest as the version it meant today
+    // rather than as a range that will mean something else tomorrow.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let project_dir = project(work.path());
+    let store = Store::new(home.path().join("store"));
+
+    install(
+        &solo(project_dir),
+        &ImporterPath::root(),
+        &store,
+        &FixtureRegistry::new().with_package("lodash", "4.17.21", lodash_tarball()),
+        &spec("lodash", VersionSpec::Latest),
+    )
+    .unwrap();
+
+    assert_eq!(
+        read_json(&project_dir.join("package.json"))["dependencies"]["lodash"],
+        "4.17.21"
+    );
+}
+
+#[test]
+fn an_exact_request_still_installs_that_exact_version() {
+    // A request for one version must not be widened on the way through the
+    // resolver: `^4.17.21` would select 4.18.0 where one exists, which is not
+    // what `lodash@4.17.21` asked for — in the manifest or in node_modules.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let workspace = linked_workspace(root);
+    let store = Store::new(home.path().join("store"));
+    let registry =
+        FixtureRegistry::new().with_packument("lodash", &[("4.17.21", &[]), ("4.18.0", &[])]);
+
+    let installed = install(
+        &workspace,
+        &ImporterPath::new("apps/web").unwrap(),
+        &store,
+        &registry,
+        &spec("lodash", VersionSpec::Exact("4.17.21".into())),
+    )
+    .unwrap();
+
+    assert_eq!(installed.version, "4.17.21");
+    assert_eq!(linked_version(&root.join("apps/web"), "lodash"), "4.17.21");
+    assert_eq!(
+        read_json(&root.join("apps/web/package.json"))["dependencies"]["lodash"],
+        "4.17.21"
+    );
+}
+
+#[test]
+fn a_range_the_user_typed_is_recorded_as_they_typed_it() {
+    // The pin is a default, not an override. Someone who writes a range has
+    // stated a preference, and flattening it to the version it happens to
+    // select today would be the tool overruling an instruction rather than
+    // supplying a missing one. 5.0.0 exists and must not be selected, which is
+    // what makes this a range rather than a synonym for `latest`.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let store = Store::new(home.path().join("store"));
+    let registry = FixtureRegistry::new().with_packument(
+        "lodash",
+        &[("4.17.21", &[]), ("4.18.0", &[]), ("5.0.0", &[])],
+    );
+    write_manifest(root, r#"{"name":"demo"}"#);
+
+    let installed = install(
+        &solo(root),
+        &ImporterPath::root(),
+        &store,
+        &registry,
+        &spec("lodash", VersionSpec::Exact("^4.0.0".into())),
+    )
+    .unwrap();
+
+    assert_eq!(installed.version, "4.18.0");
+    assert_eq!(
+        read_json(&root.join("package.json"))["dependencies"]["lodash"],
+        "^4.0.0"
+    );
+
+    // The lockfile carries the same specifier the manifest declares, which is
+    // what lets the next install recognise it as answered.
+    let recorded =
+        &read_json(&root.join("jerky-lock.json"))["importers"]["."]["dependencies"]["lodash"];
+    assert_eq!(recorded["specifier"], "^4.0.0");
+    assert_eq!(recorded["version"], "4.18.0");
+
+    let after_first = registry.packument_calls();
+    install(
+        &solo(root),
+        &ImporterPath::root(),
+        &store,
+        &registry,
+        &spec("lodash", VersionSpec::Exact("^4.0.0".into())),
+    )
+    .unwrap();
+    assert_eq!(
+        registry.packument_calls(),
+        after_first,
+        "a repeated range request re-resolved what the lockfile already answered"
+    );
+}
+
+#[test]
+fn every_range_form_is_recorded_as_written() {
+    // The rule is "parses as a range, is not a bare version", so it is the
+    // shape of the request that decides rather than a list of operators the
+    // code knows about. Asserting the *selected* version alongside the
+    // recorded string is what keeps this honest: each of these resolves as a
+    // real range, and none of them is a string being copied through.
+    let cases = [
+        ("~4.17.0", "4.17.21"),
+        ("~4.17.21", "4.17.21"),
+        ("^4.0.0", "4.18.0"),
+        ("4.x", "4.18.0"),
+        ("4.17.x", "4.17.21"),
+        ("4", "4.18.0"),
+        (">=4 <5", "4.18.0"),
+    ];
+
+    for (requested, expected) in cases {
+        let home = TempDir::new().unwrap();
+        let work = TempDir::new().unwrap();
+        let root = work.path();
+        let store = Store::new(home.path().join("store"));
+        let registry = FixtureRegistry::new().with_packument(
+            "lodash",
+            &[("4.17.21", &[]), ("4.18.0", &[]), ("5.0.0", &[])],
+        );
+        write_manifest(root, r#"{"name":"demo"}"#);
+
+        let installed = install(
+            &solo(root),
+            &ImporterPath::root(),
+            &store,
+            &registry,
+            &spec("lodash", VersionSpec::Exact(requested.into())),
+        )
+        .unwrap();
+
+        assert_eq!(
+            installed.version, expected,
+            "`{requested}` selected the wrong version"
+        );
+        assert_eq!(
+            read_json(&root.join("package.json"))["dependencies"]["lodash"],
+            requested,
+            "`{requested}` was not recorded as written"
+        );
+    }
+}
+
+#[test]
+fn a_range_that_rules_nothing_out_is_refused() {
+    // `*` is the one range there is no good answer to. Recording it would put
+    // the widest possible drift permission in a manifest whose default exists
+    // to avoid one; pinning instead would answer a question nobody asked. So
+    // it is refused, before anything is fetched or written.
+    //
+    // Every spelling, because the check is on what the range admits rather
+    // than on how it was typed — a blocklist of literals would catch `*` and
+    // miss `x`.
+    for requested in ["*", "x", "X", "*.*.*", "x.x.x", ">=0.0.0"] {
+        let home = TempDir::new().unwrap();
+        let work = TempDir::new().unwrap();
+        let root = work.path();
+        let registry =
+            FixtureRegistry::new().with_packument("lodash", &[("4.17.21", &[]), ("5.0.0", &[])]);
+        write_manifest(root, r#"{"name":"demo"}"#);
+
+        let err = install(
+            &solo(root),
+            &ImporterPath::root(),
+            &Store::new(home.path().join("store")),
+            &registry,
+            &spec("lodash", VersionSpec::Exact(requested.into())),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(err, InstallError::UnconstrainedRange { .. }),
+            "`{requested}` was accepted, got {err:?}"
+        );
+        // Refused before the registry was asked and before anything was
+        // written, which is what makes this a rejection rather than a rollback.
+        assert_eq!(registry.packument_calls(), 0, "`{requested}` was resolved");
+        assert!(
+            read_json(&root.join("package.json"))
+                .get("dependencies")
+                .is_none(),
+            "`{requested}` reached the manifest"
+        );
+        assert!(!root.join("jerky-lock.json").exists());
+    }
+}
+
+#[test]
+fn a_bounded_range_is_not_mistaken_for_a_wildcard() {
+    // The refusal is narrow on purpose. `^0.0.0` and `0.x` admit 0.0.0,
+    // `>=1.0.0` has no upper bound, and `<9999999.0.0` has one that merely
+    // looks enormous; each rules something out, so each stands.
+    let registry = FixtureRegistry::new().with_packument(
+        "lodash",
+        &[("0.0.0", &[]), ("0.1.0", &[]), ("4.17.21", &[])],
+    );
+
+    for (requested, expected) in [
+        ("^0.0.0", "0.0.0"),
+        ("0.x", "0.1.0"),
+        (">=1.0.0", "4.17.21"),
+        // Bounded, however large the bound looks. Probing with a merely big
+        // version rather than the highest expressible one refused this.
+        ("<9999999.0.0", "4.17.21"),
+    ] {
+        let home = TempDir::new().unwrap();
+        let work = TempDir::new().unwrap();
+        let root = work.path();
+        write_manifest(root, r#"{"name":"demo"}"#);
+
+        let installed = install(
+            &solo(root),
+            &ImporterPath::root(),
+            &Store::new(home.path().join("store")),
+            &registry,
+            &spec("lodash", VersionSpec::Exact(requested.into())),
+        )
+        .unwrap_or_else(|err| panic!("`{requested}` was refused: {err}"));
+
+        assert_eq!(installed.version, expected);
+        assert_eq!(
+            read_json(&root.join("package.json"))["dependencies"]["lodash"],
+            requested
+        );
+    }
+}
+
+#[test]
+fn a_dist_tag_other_than_latest_resolves_and_pins() {
+    // `next` is not a range, so it takes the tag path — and a tag is the one
+    // request that reaches a prerelease, since range resolution excludes them
+    // unless the range says otherwise. What lands in the manifest is the
+    // version the tag meant, never the tag: `next` names something different
+    // next week, which is the opposite of what a manifest is for.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let registry = FixtureRegistry::new()
+        .with_packument("lodash", &[("4.17.21", &[]), ("5.0.0-beta.1", &[])])
+        .with_dist_tag("lodash", "next", "5.0.0-beta.1");
+    write_manifest(root, r#"{"name":"demo"}"#);
+
+    let installed = install(
+        &solo(root),
+        &ImporterPath::root(),
+        &Store::new(home.path().join("store")),
+        &registry,
+        &spec("lodash", VersionSpec::Exact("next".into())),
+    )
+    .unwrap();
+
+    assert_eq!(installed.version, "5.0.0-beta.1");
+    assert_eq!(linked_version(root, "lodash"), "5.0.0-beta.1");
+    assert_eq!(
+        read_json(&root.join("package.json"))["dependencies"]["lodash"],
+        "5.0.0-beta.1"
+    );
+}
+
+#[test]
+fn a_dist_tag_is_pinned_rather_than_recorded_as_a_tag() {
+    // `latest` parses as no range at all, and recording it verbatim would put
+    // a moving pointer in the manifest — worse than the caret this default
+    // exists to avoid, because it names whatever the registry decides later
+    // rather than a constraint on it.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let store = Store::new(home.path().join("store"));
+    let registry =
+        FixtureRegistry::new().with_packument("lodash", &[("4.17.21", &[]), ("4.18.0", &[])]);
+    write_manifest(root, r#"{"name":"demo"}"#);
+
+    install(
+        &solo(root),
+        &ImporterPath::root(),
+        &store,
+        &registry,
+        &spec("lodash", VersionSpec::Exact("latest".into())),
+    )
+    .unwrap();
+
+    assert_eq!(
+        read_json(&root.join("package.json"))["dependencies"]["lodash"],
+        "4.18.0"
+    );
+}
+
+#[test]
+fn a_pinned_dependency_does_not_drift_when_its_importer_is_re_resolved() {
+    // The reason the pin is the default. Installing something *else* makes
+    // the importer stale, so lodash is resolved a second time — and a caret
+    // in the manifest is exactly the permission the resolver needs to move it
+    // to 4.18.0 at that point, without the user asking for anything. An exact
+    // specifier resolves to itself however often it is asked.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let store = Store::new(home.path().join("store"));
+    let registry = FixtureRegistry::new()
+        .with_packument("lodash", &[("4.17.21", &[]), ("4.18.0", &[])])
+        .with_tree(&[("alpha", "1.0.0", &[])]);
+    write_manifest(root, r#"{"name":"demo"}"#);
+
+    install(
+        &solo(root),
+        &ImporterPath::root(),
+        &store,
+        &registry,
+        &spec("lodash", VersionSpec::Exact("4.17.21".into())),
+    )
+    .unwrap();
+
+    install(
+        &solo(root),
+        &ImporterPath::root(),
+        &store,
+        &registry,
+        &spec("alpha", VersionSpec::Exact("1.0.0".into())),
+    )
+    .unwrap();
+
+    assert_eq!(linked_version(root, "lodash"), "4.17.21");
+    assert_eq!(
+        read_json(&root.join("package.json"))["dependencies"]["lodash"],
+        "4.17.21"
+    );
+    assert_eq!(
+        read_json(&root.join("jerky-lock.json"))["importers"]["."]["dependencies"]["lodash"]["version"],
+        "4.17.21"
+    );
+}
+
+#[test]
+fn an_unchanged_workspace_does_not_re_resolve() {
+    // Counted, because the resolved graph is identical either way — only the
+    // requests distinguish a reuse from a re-resolution.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let workspace = linked_workspace(root);
+    let store = Store::new(home.path().join("store"));
+    let registry = two_versions_of_lodash();
+    let request = spec("lodash", VersionSpec::Exact("4.17.21".into()));
+    let web = ImporterPath::new("apps/web").unwrap();
+
+    install(&workspace, &web, &store, &registry, &request).unwrap();
+    let after_first = registry.packument_calls();
+    assert!(after_first > 0, "the first install resolved nothing");
+
+    // Same workspace, same request, and now a lockfile recording both.
+    let workspace = Workspace::discover(root).unwrap();
+    install(&workspace, &web, &store, &registry, &request).unwrap();
+
+    assert_eq!(
+        registry.packument_calls(),
+        after_first,
+        "the second install re-resolved an unchanged workspace"
+    );
+    assert_eq!(registry.tarball_calls(), 1, "the tarball was fetched twice");
+    assert_eq!(linked_version(&root.join("apps/web"), "lodash"), "4.17.21");
+}
+
+#[test]
+fn editing_one_importer_re_resolves_only_what_it_must() {
+    // Staleness is per-importer: a changed apps/web must not invalidate
+    // everything the root already resolved. This is what the importers map
+    // buys over a single `root` block.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    write_manifest(
+        root,
+        r#"{"name":"ws","workspaces":["packages/*","apps/*"]}"#,
+    );
+    write_manifest(
+        &root.join("packages/ui"),
+        r#"{"name":"ui","dependencies":{"lodash":"^4.0.0"}}"#,
+    );
+    write_manifest(&root.join("apps/web"), r#"{"name":"web"}"#);
+
+    let store = Store::new(home.path().join("store"));
+    let registry = FixtureRegistry::new().with_tree(&[
+        ("lodash", "4.17.21", &[]),
+        ("alpha", "1.0.0", &[]),
+        ("beta", "1.0.0", &[]),
+    ]);
+    let web = ImporterPath::new("apps/web").unwrap();
+
+    install(
+        &Workspace::discover(root).unwrap(),
+        &web,
+        &store,
+        &registry,
+        &spec("alpha", VersionSpec::Exact("1.0.0".into())),
+    )
+    .unwrap();
+    assert_eq!(registry.packument_calls_for("lodash"), 1);
+
+    // Only apps/web changes.
+    write_manifest(
+        &root.join("apps/web"),
+        r#"{"name":"web","dependencies":{"alpha":"^1.0.0","beta":"^1.0.0"}}"#,
+    );
+
+    install(
+        &Workspace::discover(root).unwrap(),
+        &web,
+        &store,
+        &registry,
+        &spec("beta", VersionSpec::Exact("1.0.0".into())),
+    )
+    .unwrap();
+
+    assert_eq!(
+        registry.packument_calls_for("lodash"),
+        1,
+        "packages/ui was re-resolved even though its manifest never changed"
+    );
+    assert_eq!(registry.packument_calls_for("beta"), 1);
+
+    // And the untouched importer is still installed and still recorded.
+    assert_eq!(
+        linked_version(&root.join("packages/ui"), "lodash"),
+        "4.17.21"
+    );
+    let lock = read_json(&root.join("jerky-lock.json"));
+    assert_eq!(
+        lock["importers"]["packages/ui"]["dependencies"]["lodash"]["version"], "4.17.21",
+        "a reused importer was dropped from the lockfile"
+    );
+    assert!(
+        lock["packages"]["lodash@4.17.21"].is_object(),
+        "the reused importer's package was pruned out from under it"
+    );
+}
+
+#[test]
+fn a_dependency_deleted_by_hand_loses_its_subtree() {
+    // Spec 2 §12 deferred pruning until an `uninstall` command existed to
+    // trigger it; §2 now settles it the other way, so this is the behaviour
+    // that decision promises. `gamma` is reachable only through `alpha`, so it
+    // has to go with it — pruning the named package and leaving its subtree
+    // behind would be the worst of both.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let store = Store::new(home.path().join("store"));
+    let registry = FixtureRegistry::new().with_tree(&[
+        ("alpha", "1.0.0", &[("gamma", "^1.0.0")]),
+        ("gamma", "1.0.0", &[]),
+        ("beta", "1.0.0", &[]),
+    ]);
+    write_manifest(root, r#"{"name":"demo"}"#);
+
+    install(
+        &solo(root),
+        &ImporterPath::root(),
+        &store,
+        &registry,
+        &spec("alpha", VersionSpec::Exact("1.0.0".into())),
+    )
+    .unwrap();
+
+    let lock = read_json(&root.join("jerky-lock.json"));
+    assert!(lock["packages"]["alpha@1.0.0"].is_object());
+    assert!(
+        lock["packages"]["gamma@1.0.0"].is_object(),
+        "the transitive dependency was never recorded, so its removal proves nothing"
+    );
+
+    // The deletion an `uninstall` command would eventually make: the manifest
+    // no longer declares alpha. Any later install is what notices.
+    write_manifest(root, r#"{"name":"demo"}"#);
+
+    install(
+        &solo(root),
+        &ImporterPath::root(),
+        &store,
+        &registry,
+        &spec("beta", VersionSpec::Exact("1.0.0".into())),
+    )
+    .unwrap();
+
+    let lock = read_json(&root.join("jerky-lock.json"));
+    assert!(lock["packages"]["beta@1.0.0"].is_object());
+    assert!(
+        lock["packages"]["alpha@1.0.0"].is_null(),
+        "a dependency no importer declares survived in the lockfile"
+    );
+    assert!(
+        lock["packages"]["gamma@1.0.0"].is_null(),
+        "alpha was pruned but its subtree was left behind"
+    );
+    assert!(
+        lock["importers"]["."]["dependencies"]["alpha"].is_null(),
+        "the importer still records a dependency its manifest dropped"
+    );
+}
+
+#[test]
+fn a_lockfile_integrity_mismatch_stops_the_install() {
+    // The trust-on-first-use anchor spec 1 explicitly went without. The
+    // lockfile's hash is authoritative: if the registry later reports a
+    // different one for the same version, the install stops.
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    write_manifest(root, r#"{"name":"ws","workspaces":["packages/*"]}"#);
+    write_manifest(
+        &root.join("packages/ui"),
+        r#"{"name":"ui","dependencies":{"lodash":"^4.0.0"}}"#,
+    );
+
+    let registry = FixtureRegistry::new().with_tree(&[("lodash", "4.17.21", &[])]);
+    let first_home = TempDir::new().unwrap();
+    install(
+        &Workspace::discover(root).unwrap(),
+        &ImporterPath::root(),
+        &Store::new(first_home.path().join("store")),
+        &registry,
+        &spec("lodash", VersionSpec::Exact("4.17.21".into())),
+    )
+    .unwrap();
+
+    // Someone edits the committed lockfile, or the registry republishes the
+    // version under a different tarball. Either way the recorded hash and the
+    // reported one disagree.
+    let lock_path = root.join("jerky-lock.json");
+    let mut lock = read_json(&lock_path);
+    // Well-formed and the right length — sha512 of different bytes — so the
+    // refusal comes from the comparison rather than from a parse failure.
+    lock["packages"]["lodash@4.17.21"]["integrity"] = serde_json::Value::String(
+        "sha512-IsrOi3z1jfn6siSktZ62e0Sw0+tMBkqVpd1c21rXb70/VQu/Lp0xHuqJsgBtmbh5rCrKy4NYndU2byuYRUPePw=="
+            .into(),
+    );
+    std::fs::write(&lock_path, serde_json::to_string_pretty(&lock).unwrap()).unwrap();
+
+    // Force a re-resolution, so the registry's hash is fetched and compared.
+    write_manifest(
+        &root.join("packages/ui"),
+        r#"{"name":"ui","dependencies":{"lodash":"^4.17.0"}}"#,
+    );
+
+    // A fresh store, which is the realistic case: another machine cloning the
+    // repo with the lockfile committed. A store hit could not be wrong — the
+    // store key is the hash — so this is the only path where it can bite.
+    let second_home = TempDir::new().unwrap();
+    let err = install(
+        &Workspace::discover(root).unwrap(),
+        &ImporterPath::root(),
+        &Store::new(second_home.path().join("store")),
+        &registry,
+        &spec("lodash", VersionSpec::Exact("4.17.21".into())),
+    )
+    .unwrap_err();
+
+    match err {
+        InstallError::LockedIntegrityMismatch { name, version, .. } => {
+            assert_eq!(name, "lodash");
+            assert_eq!(version, "4.17.21");
+        }
+        other => panic!("expected a locked-integrity refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_warm_store_does_not_excuse_a_lockfile_mismatch() {
+    // The bytes being present proves only that they hash to their own key. It
+    // says nothing about whether that hash is the one the lockfile pinned, and
+    // a republished tarball is exactly the case where the two differ while the
+    // store is warm — the store is machine-global, so another project can have
+    // put the new bytes there already.
+    let work = TempDir::new().unwrap();
+    let home = TempDir::new().unwrap();
+    let root = work.path();
+    write_manifest(root, r#"{"name":"ws","workspaces":["packages/*"]}"#);
+    write_manifest(
+        &root.join("packages/ui"),
+        r#"{"name":"ui","dependencies":{"lodash":"^4.0.0"}}"#,
+    );
+
+    let registry = FixtureRegistry::new().with_tree(&[("lodash", "4.17.21", &[])]);
+    let store = Store::new(home.path().join("store"));
+    install(
+        &Workspace::discover(root).unwrap(),
+        &ImporterPath::root(),
+        &store,
+        &registry,
+        &spec("lodash", VersionSpec::Exact("4.17.21".into())),
+    )
+    .unwrap();
+
+    let lock_path = root.join("jerky-lock.json");
+    let mut lock = read_json(&lock_path);
+    lock["packages"]["lodash@4.17.21"]["integrity"] = serde_json::Value::String(
+        "sha512-IsrOi3z1jfn6siSktZ62e0Sw0+tMBkqVpd1c21rXb70/VQu/Lp0xHuqJsgBtmbh5rCrKy4NYndU2byuYRUPePw=="
+            .into(),
+    );
+    std::fs::write(&lock_path, serde_json::to_string_pretty(&lock).unwrap()).unwrap();
+    write_manifest(
+        &root.join("packages/ui"),
+        r#"{"name":"ui","dependencies":{"lodash":"^4.17.0"}}"#,
+    );
+
+    // Same store as the first install, so the bytes are already there.
+    let err = install(
+        &Workspace::discover(root).unwrap(),
+        &ImporterPath::root(),
+        &store,
+        &registry,
+        &spec("lodash", VersionSpec::Exact("4.17.21".into())),
+    )
+    .unwrap_err();
+
+    assert!(
+        matches!(err, InstallError::LockedIntegrityMismatch { .. }),
+        "a warm store let a lockfile mismatch through, got {err:?}"
+    );
+}

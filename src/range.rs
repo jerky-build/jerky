@@ -50,6 +50,15 @@ impl Version {
     pub fn as_str(&self) -> &str {
         &self.raw
     }
+
+    /// Is this a prerelease — `5.0.0-beta.1` rather than `5.0.0`?
+    ///
+    /// Asked of the parsed form rather than by looking for a `-`, which would
+    /// also find one inside build metadata: `1.0.0+build-7` is not a
+    /// prerelease.
+    pub fn is_prerelease(&self) -> bool {
+        !self.parsed.pre_release.is_empty()
+    }
 }
 
 // Ordering and equality are semantic, delegating to the parsed form. Comparing
@@ -94,6 +103,32 @@ impl Range {
 
     pub fn matches(&self, version: &Version) -> bool {
         self.0.satisfies(&version.parsed)
+    }
+
+    /// Does this range rule nothing out?
+    ///
+    /// `*` has several spellings — `x`, `X`, `*.*.*`, `>=0.0.0`, and any union
+    /// containing one — so the question is asked of what the range *admits*
+    /// rather than of how it was written. A blocklist of literals would catch
+    /// whichever spellings its author thought of.
+    ///
+    /// The ceiling is not a sentinel chosen for being large. js-semver, like
+    /// node-semver before it, refuses a version component above
+    /// `MAX_SAFE_INTEGER`, so this is the highest version the domain can
+    /// express and no range can place a bound above it — which is what stops
+    /// a genuinely bounded `<9999999.0.0` being mistaken for unbounded.
+    pub fn admits_everything(&self) -> bool {
+        // 2^53 - 1: the largest integer a JavaScript number holds exactly, and
+        // the limit js-semver enforces on every version component.
+        const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+
+        let floor = Version::parse("0.0.0").expect("a literal version parses");
+        let ceiling = Version::parse(&format!(
+            "{MAX_SAFE_INTEGER}.{MAX_SAFE_INTEGER}.{MAX_SAFE_INTEGER}"
+        ))
+        .expect("the highest expressible version parses");
+
+        self.matches(&floor) && self.matches(&ceiling)
     }
 
     /// The highest published version satisfying this range, matching npm's
@@ -175,6 +210,51 @@ mod tests {
             Range::parse("not a range"),
             Err(RangeError::Unparseable(_))
         ));
+    }
+
+    #[test]
+    fn admits_everything_finds_every_spelling_of_the_wildcard() {
+        for r in ["*", "x", "X", "*.*.*", "x.x.x", ">=0.0.0", "1.0.0 || *"] {
+            assert!(
+                Range::parse(r).unwrap().admits_everything(),
+                "{r} rules nothing out"
+            );
+        }
+    }
+
+    #[test]
+    fn admits_everything_is_not_fooled_by_a_merely_large_bound() {
+        // The reason the ceiling is the highest *expressible* version rather
+        // than a large-looking one: `<9999999.0.0` excludes something, and a
+        // smaller probe would have reported it unbounded.
+        for r in [
+            "<9999999.0.0",
+            "^0.0.0",
+            "0.x",
+            ">=1.0.0",
+            "^4.0.0",
+            "~4.17.0",
+            ">=4 <5",
+        ] {
+            assert!(
+                !Range::parse(r).unwrap().admits_everything(),
+                "{r} rules something out"
+            );
+        }
+    }
+
+    #[test]
+    fn is_prerelease_ignores_build_metadata() {
+        // A `-` inside build metadata is not a prerelease marker, which is
+        // why this asks the parsed form rather than searching the string.
+        assert!(Version::parse("5.0.0-beta.1").unwrap().is_prerelease());
+        assert!(!Version::parse("5.0.0").unwrap().is_prerelease());
+        assert!(!Version::parse("1.0.0+build-7").unwrap().is_prerelease());
+        assert!(
+            Version::parse("1.0.0-rc.1+build-7")
+                .unwrap()
+                .is_prerelease()
+        );
     }
 
     #[test]

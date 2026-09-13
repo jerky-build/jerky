@@ -58,18 +58,57 @@ parses into an untyped `Value` to preserve unknown fields, so the pattern that
 would hit this is one jerky already uses. The mainstream Rust YAML serde crates
 are also deprecated or unmaintained.
 
-**`jerky install` now writes a caret range.** `jerky install lodash` records
-`"lodash": "^4.17.21"`, matching npm and pnpm. Spec 1 pinned exactly for a
-stated reason that this spec removes:
+**`jerky install` keeps writing an exact pin.** `jerky install lodash` records
+`"lodash": "4.17.21"`, not `"^4.17.21"`. Spec 1 pinned for a reason this spec
+does remove:
 
 > jerky should not yet: spec 1 has no range resolution, so a caret would put a
 > constraint in `package.json` that the tool cannot honour on the next install
 > — the file would claim more than jerky can do. **Switch to caret in spec 2,
 > when ranges actually resolve.**
 
-This is a user-visible behaviour change and needs a changelog note. It also
-means the manifest now contains ranges the resolver must handle, so the root
-project is just another node with ranges, not a special case.
+Ranges do resolve now, so the stated obstacle is gone — but the conclusion it
+was holding up does not follow from its removal. Being *able* to honour a caret
+is not a reason to write one. A caret is standing permission for some later
+install to pick a version the user never asked for, and it is exercised by
+whichever machine re-resolves first rather than at a moment anyone chose. The
+failure it produces is the one that is hardest to see: an install that
+succeeds, with different bytes.
+
+The pin is a *default*, not an override, and the distinction is the whole
+design. A request that named no version gets the pin, because the user
+expressed no preference and something has to be written. A request that named a
+range is recorded as written — `jerky install lodash@^4.0.0` puts `"^4.0.0"` in
+the manifest — because flattening it would be the tool overruling an
+instruction rather than supplying a missing one. A dist-tag is neither: it does
+not parse as a range, and `latest` in a manifest names whatever the registry
+decides later rather than constraining it, so a tag pins to the version it
+meant — `next` included, which is the one request that reaches a prerelease.
+Hand-written ranges are honoured exactly as npm honours them.
+
+The exception is a range that rules nothing out. `jerky install lodash@*` is
+refused rather than answered, because both answers are wrong: recording `"*"`
+contradicts the default outright, and pinning silently would substitute a
+question for the one that was asked. This is decided on what the range admits
+rather than on how it was spelled, so `x`, `*.*.*` and `>=0.0.0` are the same
+request and get the same refusal, while `^0.0.0`, `0.x` and `>=1.0.0` each rule
+something out and stand. Only the command line is policed; a `"*"` already
+written in a manifest still resolves, because refusing it would be jerky
+declining to install an existing project rather than declining to write
+something new.
+
+The asymmetry is the argument for the default — widening a pin later is cheap,
+while discovering that a dependency drifted three weeks ago is not.
+
+This departs from npm and pnpm, which default to the caret. It matches what a
+lockfile-bearing tool actually promises, and it is the same instinct as
+`--save-exact`.
+
+Default behaviour is therefore unchanged from spec 1, so there is no migration
+and nothing an existing `package.json` has to be rewritten for. The manifest
+can still contain ranges the resolver must handle, because a user may write
+one, so the root project is still just another node with ranges rather than a
+special case.
 
 **The lockfile is named `jerky-lock.json`.** #11 called it `jerky.lock`, by
 analogy with `Cargo.lock` and `yarn.lock`. Since the format is JSON, the
@@ -78,6 +117,32 @@ JSON tool work on it without being told what it is, and a reviewer opening it
 in a diff gets folding and structure for free. `package-lock.json` is the
 closer precedent anyway. Deciding this now is cheap; deciding it after anyone
 has committed one is a migration.
+
+**The lockfile is pruned on every write.** A package no importer can reach,
+directly or transitively, is dropped. §12 deferred this until an `uninstall`
+command existed to trigger it; that framing turned out to be wrong, because
+pruning is not a feature waiting for a caller — it is a property the file
+already had.
+
+A full resolution produces exactly the reachable set, so every lockfile jerky
+has ever written was pruned by construction. Reuse is what breaks that: merging
+a reused importer's packages with a re-resolved importer's accumulates entries
+nothing references. Deferring the decision would therefore not preserve the
+status quo, it would end it — and quietly, since nothing fails when a lockfile
+carries a package no one asked for. It just grows, and every diff that touches
+it gets noisier, which costs the flat format the minimal-diff property it was
+flattened to get.
+
+Deciding it now also settles the case §12 was actually about. A dependency
+deleted from a `package.json` by hand loses its subtree on the next install,
+which is what anyone deleting it expects. An `uninstall` command, when it
+lands, needs no pruning logic of its own: it edits the manifest, and the next
+write does the rest.
+
+The cost is that a lockfile cannot carry an entry deliberately kept out of the
+graph — a pin for something not yet depended on, say. Nothing wants that today,
+and an `overrides` field would be the honest way to express it if something
+ever does.
 
 **Parallel downloads are deferred.** Spec 1's design placed them here, but
 spec 2 is already a transitive resolver plus a lockfile format, and both are
@@ -96,7 +161,7 @@ follow-up lands. That is acceptable for a spec whose job is correctness.
 - Virtual store wiring for nested dependencies — each package sees its own deps
 - `jerky-lock.json`: deterministic, diffable, versioned, integrity-bearing
 - Reading the lockfile back to skip re-resolution when it is still valid
-- `jerky install <pkg>` recording a caret range
+- `jerky install <pkg>` recording an exact pin, with hand-written ranges honoured
 
 ### Explicitly out of scope
 
@@ -443,10 +508,11 @@ trivial once bare install can read the lockfile this spec writes.
 
 ## 12. Open questions
 
-**When does the lockfile get pruned?** Removing a dependency from
-`package.json` should eventually remove its subtree from the lockfile, but
-jerky has no `uninstall` command yet, so there is no operation that would
-trigger it. Deferred until one exists.
+None left.
 
-*(The lockfile filename was an open question here and is now settled — see
-§2.)*
+*(Both questions raised here are now settled in §2: the lockfile filename, and
+when the lockfile gets pruned. Pruning was deferred here "until an `uninstall`
+command exists"; implementing reuse showed that to be the wrong shape of
+question, since a full resolution already emitted only the reachable set and it
+was reuse, not deletion, that could start accumulating dead entries. Deferring
+would have changed the behaviour rather than preserved it.)*
