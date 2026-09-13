@@ -69,10 +69,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   resolver can honour a range now, which is what spec 1 was waiting for, but
   the default is a pin rather than a caret: a caret is standing permission for
   some later install to choose a version nobody asked for, and it is exercised
-  on whichever machine happens to re-resolve first. A range is an edit the user
-  can make deliberately, and the resolver honours it — `"^4.0.0"` written by
-  hand resolves as a range. Widening later is easy; discovering that a
-  dependency already drifted is not.
+  on whichever machine happens to re-resolve first. Widening a pin later is an
+  edit; discovering that a dependency already drifted is not.
+- A range you *ask* for is recorded as you wrote it: `jerky install
+  lodash@^4.0.0` puts `"^4.0.0"` in `package.json`, not the version it selected
+  today. The pin is the default for a request that named no version, not an
+  override of one that did. A dist-tag still pins — `jerky install lodash@latest`
+  records the version `latest` meant, since a tag in a manifest is a moving
+  pointer rather than a constraint.
 - Lockfile entries no importer can reach are dropped on write. A full
   resolution only ever produced the reachable set, so this keeps that property
   true under partial reuse rather than deciding lockfile pruning as a policy;

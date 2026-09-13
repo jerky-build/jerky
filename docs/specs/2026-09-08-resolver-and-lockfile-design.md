@@ -75,10 +75,18 @@ whichever machine re-resolves first rather than at a moment anyone chose. The
 failure it produces is the one that is hardest to see: an install that
 succeeds, with different bytes.
 
-Writing a range stays available, deliberately: a hand-written `"^4.0.0"` is
-honoured exactly as npm would honour it, and widening a pin is a one-line edit.
-The asymmetry is the argument — widening later is cheap, while discovering that
-a dependency drifted three weeks ago is not.
+The pin is a *default*, not an override, and the distinction is the whole
+design. A request that named no version gets the pin, because the user
+expressed no preference and something has to be written. A request that named a
+range is recorded as written — `jerky install lodash@^4.0.0` puts `"^4.0.0"` in
+the manifest — because flattening it would be the tool overruling an
+instruction rather than supplying a missing one. A dist-tag is neither: it does
+not parse as a range, and `latest` in a manifest names whatever the registry
+decides later rather than constraining it, so a tag pins to the version it
+meant. Hand-written ranges are honoured exactly as npm honours them.
+
+The asymmetry is the argument for the default — widening a pin later is cheap,
+while discovering that a dependency drifted three weeks ago is not.
 
 This departs from npm and pnpm, which default to the caret. It matches what a
 lockfile-bearing tool actually promises, and it is the same instinct as

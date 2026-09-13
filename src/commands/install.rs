@@ -9,6 +9,7 @@ use crate::integrity::{Integrity, IntegrityError};
 use crate::linker::{self, LinkError};
 use crate::lockfile::{self, LockfileError};
 use crate::manifest::{Manifest, ManifestError};
+use crate::range::{Range, Version};
 use crate::registry::{RegistryClient, RegistryError};
 use crate::resolver::{
     self, Importer, ImporterPath, PackageId, Resolution, ResolveError, ResolvedGraph,
@@ -278,13 +279,22 @@ pub fn install(
 
     let requested = graph.importers[importer].dependencies[&spec.name].clone();
     let (recorded, reported) = match &requested.resolution {
-        // The exact version that was chosen, never a range over it. jerky
-        // pins by default: a caret would hand the next install permission to
-        // pick a version nobody asked for, and the difference only shows up
-        // later, on a machine that resolved at a different time. Widening it
-        // is an edit the user can make and the resolver now honours; narrowing
-        // a range back down after it has already drifted is not.
-        Resolution::Registry(id) => (id.version.clone(), id.version.clone()),
+        // The exact version that was chosen, never a range invented over it.
+        // jerky pins by *default*: a caret would hand the next install
+        // permission to pick a version nobody asked for, and the difference
+        // only surfaces later, on whichever machine re-resolved first.
+        //
+        // A range the user typed is not the default, though, and overwriting
+        // it with a pin would be the tool overruling an instruction rather
+        // than supplying a missing one. `jerky install lodash@^4.0.0` records
+        // `^4.0.0`; a dist-tag still pins, because `latest` in a manifest is a
+        // moving pointer rather than a constraint.
+        Resolution::Registry(id) => (
+            declared_range(&spec.version)
+                .unwrap_or(&id.version)
+                .to_string(),
+            id.version.clone(),
+        ),
         // `jerky install ui@workspace:*` names a member on purpose. The link
         // is already written by the loop above; what differs is what gets
         // recorded — the protocol as asked for, never a version, because the
@@ -370,10 +380,27 @@ fn already_satisfies(recorded: &Importer, spec: &PackageSpec) -> bool {
         // shortcoming of the lockfile.
         VersionSpec::Latest => false,
         // Either the request is the specifier verbatim — which is how
-        // `workspace:*` matches — or it names the version that was chosen.
+        // `workspace:*` and a typed range both match — or it names the
+        // version that was chosen.
         VersionSpec::Exact(requested) => {
             dependency.specifier == *requested
                 || matches!(&dependency.resolution, Resolution::Registry(id) if id.version == *requested)
         }
     }
+}
+
+/// The range the user typed, when what they typed was a range.
+///
+/// A bare version is excluded on purpose: `4.17.21` is a valid range matching
+/// exactly itself, but recording it as one would make every pin
+/// indistinguishable from a deliberate constraint. So is a dist-tag, which
+/// does not parse as a range at all — and must not be recorded verbatim,
+/// because `latest` in a manifest names whatever the registry means by it on
+/// some later day rather than the thing that was installed.
+fn declared_range(requested: &VersionSpec) -> Option<&str> {
+    let VersionSpec::Exact(specifier) = requested else {
+        return None;
+    };
+    (Range::parse(specifier).is_ok() && Version::parse(specifier).is_err())
+        .then_some(specifier.as_str())
 }

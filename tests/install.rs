@@ -621,6 +621,90 @@ fn an_exact_request_still_installs_that_exact_version() {
 }
 
 #[test]
+fn a_range_the_user_typed_is_recorded_as_they_typed_it() {
+    // The pin is a default, not an override. Someone who writes a range has
+    // stated a preference, and flattening it to the version it happens to
+    // select today would be the tool overruling an instruction rather than
+    // supplying a missing one. 5.0.0 exists and must not be selected, which is
+    // what makes this a range rather than a synonym for `latest`.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let store = Store::new(home.path().join("store"));
+    let registry = FixtureRegistry::new().with_packument(
+        "lodash",
+        &[("4.17.21", &[]), ("4.18.0", &[]), ("5.0.0", &[])],
+    );
+    write_manifest(root, r#"{"name":"demo"}"#);
+
+    let installed = install(
+        &solo(root),
+        &ImporterPath::root(),
+        &store,
+        &registry,
+        &spec("lodash", VersionSpec::Exact("^4.0.0".into())),
+    )
+    .unwrap();
+
+    assert_eq!(installed.version, "4.18.0");
+    assert_eq!(
+        read_json(&root.join("package.json"))["dependencies"]["lodash"],
+        "^4.0.0"
+    );
+
+    // The lockfile carries the same specifier the manifest declares, which is
+    // what lets the next install recognise it as answered.
+    let recorded =
+        &read_json(&root.join("jerky-lock.json"))["importers"]["."]["dependencies"]["lodash"];
+    assert_eq!(recorded["specifier"], "^4.0.0");
+    assert_eq!(recorded["version"], "4.18.0");
+
+    let after_first = registry.packument_calls();
+    install(
+        &solo(root),
+        &ImporterPath::root(),
+        &store,
+        &registry,
+        &spec("lodash", VersionSpec::Exact("^4.0.0".into())),
+    )
+    .unwrap();
+    assert_eq!(
+        registry.packument_calls(),
+        after_first,
+        "a repeated range request re-resolved what the lockfile already answered"
+    );
+}
+
+#[test]
+fn a_dist_tag_is_pinned_rather_than_recorded_as_a_tag() {
+    // `latest` parses as no range at all, and recording it verbatim would put
+    // a moving pointer in the manifest — worse than the caret this default
+    // exists to avoid, because it names whatever the registry decides later
+    // rather than a constraint on it.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let store = Store::new(home.path().join("store"));
+    let registry =
+        FixtureRegistry::new().with_packument("lodash", &[("4.17.21", &[]), ("4.18.0", &[])]);
+    write_manifest(root, r#"{"name":"demo"}"#);
+
+    install(
+        &solo(root),
+        &ImporterPath::root(),
+        &store,
+        &registry,
+        &spec("lodash", VersionSpec::Exact("latest".into())),
+    )
+    .unwrap();
+
+    assert_eq!(
+        read_json(&root.join("package.json"))["dependencies"]["lodash"],
+        "4.18.0"
+    );
+}
+
+#[test]
 fn a_pinned_dependency_does_not_drift_when_its_importer_is_re_resolved() {
     // The reason the pin is the default. Installing something *else* makes
     // the importer stale, so lodash is resolved a second time — and a caret
