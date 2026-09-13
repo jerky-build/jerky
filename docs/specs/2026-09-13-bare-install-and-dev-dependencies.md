@@ -119,14 +119,23 @@ declared: BTreeMap<ImporterPath, BTreeMap<String, String>>
 ```
 
 and a request is applied by inserting its `(name, seed)` pair into
-`declared[request.importer]` *before* anything else runs. Downstream, nothing
-knows a request happened. `reusable_importers` sees that importer no longer
-matches what the lockfile recorded, marks it stale, and re-resolves it — which
-is precisely what the current code hand-rolls by mutating `stale` after
-computing reuse, and what the `if let Some(deps) = stale.get_mut(importer)`
-branch exists to arrange.
+`declared[request.importer]` *before* anything else runs, rather than into
+`stale` after reuse has been computed. Downstream, resolution and linking need
+know nothing about a request having happened.
 
-**One reconciliation survives, and gets a name.** `jerky install lodash` must
+> **Corrected during implementation (#53).** An earlier draft of this section
+> went further and claimed the fold lets `already_satisfies` be deleted
+> outright. That is wrong, and the implementation does not do it. A request
+> naming the version the lockfile already resolved to — `lodash@4.18.0` where
+> the manifest declares `^4.0.0` — *is* answered, but it differs from the
+> declared specifier, so folding it in marks the importer stale and re-resolves
+> a question that already has its answer. Measured: one packument request
+> without the fold, two with it. The freshness test for the target importer is
+> therefore genuinely two-part — the manifest still agrees with the lockfile,
+> **and** the request is already satisfied — and only the second half is about
+> the request. `tests/install.rs` now guards this.
+
+**A second reconciliation survives, and gets a name.** `jerky install lodash` must
 seed the dist-tag `latest`, because that is what the registry is asked, but
 what gets *recorded* is the exact resolved version — `declared_range` returns
 `None` for a tag on purpose, so a manifest never carries a moving pointer. Seed
@@ -135,7 +144,13 @@ the recorded value before the lockfile is written, or the next install finds its
 own lockfile stale and re-resolves a workspace nobody touched. This is inherent
 to pinning by default rather than an artifact of the current structure, so it
 survives the refactor. It moves from three scattered points in a 300-line
-function into one place with a name.
+function into one place with a name — `record_for`.
+
+The seam is worth extracting for what it *is*, then, rather than for how much
+it deletes: two of the three special cases in the old function were genuinely
+about the request and stay, and what the extraction buys is that they are now
+named and sit at the edge instead of being interleaved with resolution. The
+deletion argument was the weaker one and it did not survive contact.
 
 **Why extract rather than add an `Option<PackageSpec>` parameter.** The smaller
 change would thread `if let Some(spec)` through three separate points of the
