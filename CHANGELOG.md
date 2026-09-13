@@ -10,6 +10,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `jerky install` with no package installs what the workspace declares. This is
+  the command you run after cloning a repo, and until now there was no way to
+  say it: `spec` was a required argument, so jerky could add a dependency but
+  not reproduce one. Every importer is covered, whatever directory you run it
+  from, and with a lockfile that already matches the manifests it reaches the
+  registry not at all. It reports what it did as `installed 12 packages across
+  3 importers` — packages rather than links, because two importers on one
+  version share a store entry and counting links would make the same install
+  read differently in a monorepo
+  ([#19](https://github.com/jerky-build/jerky/issues/19)).
+- A bare `jerky install` works from a directory that belongs to no workspace
+  member, such as `tools/scripts`, where `jerky install <pkg>` is still an
+  error. Ambiguity needs alternatives, and a command that acts on every
+  importer has nothing to guess.
 - `devDependencies` are now installed. Every workspace member's are followed,
   not only the root project's — in a monorepo each member is a first-party
   project, and a `packages/ui` declaring nothing but devDependencies previously

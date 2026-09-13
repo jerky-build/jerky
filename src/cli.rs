@@ -16,10 +16,11 @@ pub struct Cli {
 pub enum Command {
     /// Create a package.json in the current directory
     Init,
-    /// Install a package into node_modules
+    /// Install what the workspace declares, or add one package to it
     Install {
-        /// Package to install, e.g. `lodash` or `lodash@4.17.21`
-        spec: String,
+        /// Package to add, e.g. `lodash` or `lodash@4.17.21`. Omit it to
+        /// install what every importer's package.json already declares.
+        spec: Option<String>,
     },
 }
 
@@ -110,6 +111,22 @@ pub fn parse_package_spec(input: &str) -> Result<PackageSpec, CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn install_accepts_no_spec_at_all() {
+        // The post-clone command. `spec` being required is what has meant
+        // there was no way to say *install what this repo declares*.
+        let cli = Cli::parse_from(["jerky", "install"]);
+        assert!(matches!(cli.command, Command::Install { spec: None }));
+    }
+
+    #[test]
+    fn install_still_accepts_a_spec() {
+        let cli = Cli::parse_from(["jerky", "install", "lodash@4.17.21"]);
+        assert!(
+            matches!(cli.command, Command::Install { spec: Some(ref s) } if s == "lodash@4.17.21")
+        );
+    }
 
     #[test]
     fn bare_name_resolves_to_latest() {

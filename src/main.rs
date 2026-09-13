@@ -37,7 +37,10 @@ fn run(cli: Cli) -> Result<(), JerkyError> {
             Ok(())
         }
         Command::Install { spec } => {
-            let spec = jerky::cli::parse_package_spec(&spec)?;
+            let spec = spec
+                .as_deref()
+                .map(jerky::cli::parse_package_spec)
+                .transpose()?;
 
             let root = Workspace::find_root(&project_dir)
                 .ok_or_else(|| JerkyError::NoManifestAnywhere(project_dir.clone()))?;
@@ -50,16 +53,36 @@ fn run(cli: Cli) -> Result<(), JerkyError> {
                 }
             }
 
-            let importer = importer_for(&workspace, &project_dir)?;
-
             let store = jerky::store::Store::new(store_root()?);
             let registry = jerky::registry::HttpRegistry::new();
-            let installed =
-                jerky::commands::install::install(&workspace, &importer, &store, &registry, &spec)?;
-            println!(
-                "added {}@{} to {importer}",
-                installed.name, installed.version
-            );
+
+            match spec {
+                // Which importer the user is standing in is asked *only* here.
+                // A bare install acts on every one of them, so there is no
+                // guess for `importer_for` to refuse — see its own doc comment.
+                Some(spec) => {
+                    let importer = importer_for(&workspace, &project_dir)?;
+                    let installed = jerky::commands::install::install(
+                        &workspace, &importer, &store, &registry, &spec,
+                    )?;
+                    println!(
+                        "added {}@{} to {importer}",
+                        installed.name, installed.version
+                    );
+                }
+                None => {
+                    let outcome =
+                        jerky::commands::install::sync(&workspace, &store, &registry, None)?;
+                    // The packages, not the links: two importers on one version
+                    // share a store entry, and reporting the link count would
+                    // make the same install read differently in a monorepo.
+                    println!(
+                        "installed {} across {}",
+                        plural(outcome.linked.len(), "package"),
+                        plural(workspace.members().len(), "importer")
+                    );
+                }
+            }
             Ok(())
         }
     }
@@ -101,4 +124,102 @@ fn importer_for(workspace: &Workspace, dir: &Path) -> Result<ImporterPath, Jerky
 fn store_root() -> Result<PathBuf, JerkyError> {
     let home = dirs::home_dir().ok_or(JerkyError::NoHomeDirectory)?;
     Ok(home.join(".jerky").join("store"))
+}
+
+/// `1 package`, `2 packages`.
+///
+/// Small, but this line is the first thing a developer sees after cloning a
+/// repo, and `installed 1 packages across 1 importers` is not the impression
+/// to make there.
+fn plural(count: usize, noun: &str) -> String {
+    if count == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{count} {noun}s")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use tempfile::TempDir;
+
+    fn write_manifest(dir: &Path, json: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("package.json"), json).unwrap();
+    }
+
+    /// A root with two members, plus a `tools/scripts` that is neither.
+    fn monorepo(root: &Path) -> Workspace {
+        write_manifest(root, r#"{"name":"ws","workspaces":["packages/*"]}"#);
+        write_manifest(&root.join("packages/ui"), r#"{"name":"ui"}"#);
+        write_manifest(&root.join("packages/api"), r#"{"name":"api"}"#);
+        std::fs::create_dir_all(root.join("tools/scripts")).unwrap();
+        Workspace::discover(root).unwrap()
+    }
+
+    #[test]
+    fn a_spec_from_a_directory_belonging_to_no_member_is_refused() {
+        // The nearest enclosing member of `tools/scripts` is the root, and
+        // taking that answer would install into the root because the user
+        // happened to be standing somewhere jerky does not manage. With other
+        // members to have meant, that is a guess rather than an answer.
+        let work = TempDir::new().unwrap();
+        let workspace = monorepo(work.path());
+
+        let err = importer_for(&workspace, &work.path().join("tools/scripts"))
+            .expect_err("a directory belonging to no member is ambiguous");
+
+        let JerkyError::NotInAMember { members, .. } = err else {
+            panic!("expected NotInAMember, got {err}");
+        };
+        assert_eq!(members, [".", "packages/api", "packages/ui"]);
+    }
+
+    #[test]
+    fn a_bare_install_asks_no_such_question() {
+        // The asymmetry the CLI depends on: the same directory that cannot
+        // name an importer still names a workspace, and a bare install wants
+        // nothing else. If this ever stopped resolving, bare install in
+        // `tools/scripts` would fail where `jerky install lodash` is merely
+        // ambiguous.
+        let work = TempDir::new().unwrap();
+        monorepo(work.path());
+
+        let root = Workspace::find_root(&work.path().join("tools/scripts"))
+            .expect("the root manifest sits above it");
+        assert_eq!(root, work.path().canonicalize().unwrap());
+    }
+
+    #[test]
+    fn a_spec_from_inside_a_member_names_that_member() {
+        let work = TempDir::new().unwrap();
+        let workspace = monorepo(work.path());
+
+        let importer = importer_for(&workspace, &work.path().join("packages/ui")).unwrap();
+        assert_eq!(importer.to_string(), "packages/ui");
+    }
+
+    #[test]
+    fn a_workspace_of_one_has_nothing_to_be_ambiguous_about() {
+        // Ambiguity needs alternatives. In a single-project repo the root is
+        // the only thing `tools/scripts` could have meant, so it is the
+        // answer rather than an error.
+        let work = TempDir::new().unwrap();
+        let root = work.path();
+        write_manifest(root, r#"{"name":"solo"}"#);
+        std::fs::create_dir_all(root.join("tools/scripts")).unwrap();
+        let workspace = Workspace::discover(root).unwrap();
+
+        let importer = importer_for(&workspace, &root.join("tools/scripts")).unwrap();
+        assert!(importer.is_root());
+    }
+
+    #[test]
+    fn the_summary_line_counts_in_the_singular() {
+        assert_eq!(plural(0, "package"), "0 packages");
+        assert_eq!(plural(1, "importer"), "1 importer");
+        assert_eq!(plural(12, "package"), "12 packages");
+    }
 }
