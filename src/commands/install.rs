@@ -71,52 +71,91 @@ pub struct Installed {
     pub version: String,
 }
 
-/// Install one package into `importer`, resolving the whole workspace.
+/// One dependency to add on top of what the manifests already declare.
 ///
-/// The phase structure from the single-project version holds — resolve, then
-/// fill the store, then link, then record. What changes is the breadth: one
-/// walk seeds from every importer's ranges, so two projects wanting the same
-/// package share the request and the store entry, and linking then runs per
-/// importer because each owns its own `node_modules`.
+/// Adding a package is otherwise an ordinary sync: the request changes what
+/// the target importer asks for, and the rest of the workspace is resolved,
+/// linked and recorded exactly as it would be with nothing requested at all.
+#[derive(Debug, Clone)]
+pub struct Request {
+    pub importer: ImporterPath,
+    pub name: String,
+    /// What the registry is asked: a range, an exact version, or a dist-tag.
+    ///
+    /// Deliberately still a `VersionSpec` rather than the string
+    /// `as_request` flattens it to. Two of the three questions asked of it —
+    /// does it rule nothing out, is it a range worth recording — do give the
+    /// same answer for `Latest` as for a literal `latest`. The third does not:
+    /// a manifest may declare `"lodash": "latest"`, and against one that does,
+    /// a flattened seed would match the recorded specifier and reuse the
+    /// lockfile. A bare `jerky install <pkg>` must always ask, because only
+    /// the registry can say what a tag means today.
+    pub seed: VersionSpec,
+}
+
+/// What a manifest should record for a requested package.
+#[derive(Debug, Clone)]
+pub struct Recorded {
+    pub name: String,
+    /// The specifier to write: the range the user typed, or a pin.
+    pub specifier: String,
+    /// The concrete version that specifier resolved to.
+    pub version: String,
+}
+
+/// What a sync did.
+#[derive(Debug, Clone, Default)]
+pub struct Outcome {
+    /// Every registry package the workspace now has linked.
+    pub linked: Vec<Installed>,
+    /// Present only when there was a request to record.
+    pub recorded: Option<Recorded>,
+}
+
+/// Make the workspace match what its manifests declare, plus `request`.
+///
+/// One walk seeds from every importer's ranges, so two projects wanting the
+/// same package share the request and the store entry, and linking then runs
+/// per importer because each owns its own `node_modules`.
 ///
 /// A workspace of one is not a special case. It is a single importer keyed
 /// `.`, and takes this path like any other.
 ///
-/// Ordering is deliberate and unchanged. The manifest write is last, so a
-/// failure anywhere leaves at worst an installed-but-unrecorded package —
-/// harmless and self-healing on rerun — rather than a `package.json` claiming
-/// a dependency that is not on disk.
-pub fn install(
+/// Writing the lockfile is the last thing this does, and writing the manifest
+/// is deliberately *not* its job — that belongs to the caller, above this, so
+/// a failure anywhere leaves at worst an installed-but-unrecorded package
+/// rather than a `package.json` claiming a dependency that is not on disk.
+pub fn sync(
     workspace: &Workspace,
-    importer: &ImporterPath,
     store: &Store,
     registry: &dyn RegistryClient,
-    spec: &PackageSpec,
-) -> Result<Installed, InstallError> {
-    // Before anything is looked up or written. A request that rules nothing
-    // out is refused rather than pinned, because either reading of it is a
-    // guess: recording `*` would put the widest possible drift permission in
-    // a manifest whose whole default exists to avoid one, and quietly pinning
-    // it instead would answer a question the user did not ask.
-    if let Some(unconstrained) = unconstrained_range(&spec.version) {
-        return Err(InstallError::UnconstrainedRange {
-            name: spec.name.clone(),
-            requested: unconstrained.to_string(),
-        });
-    }
+    request: Option<&Request>,
+) -> Result<Outcome, InstallError> {
+    if let Some(request) = request {
+        // Before anything is looked up or written. A request that rules
+        // nothing out is refused rather than pinned, because either reading of
+        // it is a guess: recording `*` would put the widest possible drift
+        // permission in a manifest whose whole default exists to avoid one,
+        // and quietly pinning it instead would answer a question the user did
+        // not ask.
+        if let Some(unconstrained) = unconstrained_range(request.seed.as_request()) {
+            return Err(InstallError::UnconstrainedRange {
+                name: request.name.clone(),
+                requested: unconstrained.to_string(),
+            });
+        }
 
-    let target =
-        workspace
-            .members()
-            .get(importer)
-            .ok_or_else(|| InstallError::UnknownImporter {
-                importer: importer.to_string(),
+        if !workspace.members().contains_key(&request.importer) {
+            return Err(InstallError::UnknownImporter {
+                importer: request.importer.to_string(),
                 members: workspace
                     .members()
                     .keys()
                     .map(ImporterPath::to_string)
                     .collect(),
-            })?;
+            });
+        }
+    }
 
     // Every importer's declared ranges seed the walk, not just the one being
     // installed into. That is what lets a single resolution answer for the
@@ -146,7 +185,7 @@ pub fn install(
     // single block of ranges: editing `apps/web` must not invalidate what the
     // root already resolved.
     let locked = lockfile::load(workspace.root())?;
-    let reused = reusable_importers(locked.as_ref(), &declared, importer, spec);
+    let reused = reusable_importers(locked.as_ref(), &declared, request);
 
     // Kept past the point where `locked` is consumed into the graph. When an
     // importer is reused these are the same bytes; it is a re-resolution that
@@ -165,8 +204,10 @@ pub fn install(
     // Folded in only where the target is being re-resolved. If it was reused,
     // the request is already satisfied by what the lockfile recorded, and
     // adding it back would be asking a question that has an answer.
-    if let Some(deps) = stale.get_mut(importer) {
-        deps.insert(spec.name.clone(), spec.version.as_request().to_string());
+    if let Some(request) = request
+        && let Some(deps) = stale.get_mut(&request.importer)
+    {
+        deps.insert(request.name.clone(), request.seed.as_request().to_string());
     }
 
     let mut graph = match (stale.is_empty(), locked) {
@@ -305,8 +346,51 @@ pub fn install(
         }
     }
 
-    let requested = graph.importers[importer].dependencies[&spec.name].clone();
-    let (recorded, reported) = match &requested.resolution {
+    let recorded = request.map(|request| record_for(request, &graph, workspace, &members));
+
+    // The lockfile records what the manifest declares, so the specifier it
+    // carries for this request is the one about to be written rather than the
+    // seed resolution was given. Were they allowed to differ, every install
+    // would find its own lockfile stale and re-resolve a workspace nothing had
+    // touched.
+    if let Some(recorded) = &recorded {
+        let request = request.expect("a recording implies a request");
+        graph
+            .importers
+            .get_mut(&request.importer)
+            .and_then(|resolved| resolved.dependencies.get_mut(&request.name))
+            .expect("the request was either resolved into the target or reused from it")
+            .specifier = recorded.specifier.clone();
+    }
+
+    lockfile::save(&graph, workspace.root())?;
+
+    Ok(Outcome {
+        linked: graph
+            .packages
+            .keys()
+            .map(|id| Installed {
+                name: id.name.clone(),
+                version: id.version.clone(),
+            })
+            .collect(),
+        recorded,
+    })
+}
+
+/// What the manifest should record for a request, and what it resolved to.
+///
+/// The two differ more often than they look like they should, which is why
+/// this is one named function rather than an expression at the call site.
+fn record_for(
+    request: &Request,
+    graph: &ResolvedGraph,
+    workspace: &Workspace,
+    members: &BTreeMap<String, ImporterPath>,
+) -> Recorded {
+    let resolved = &graph.importers[&request.importer].dependencies[&request.name];
+
+    let (specifier, version) = match &resolved.resolution {
         // The exact version that was chosen, never a range invented over it.
         // jerky pins by *default*: a caret would hand the next install
         // permission to pick a version nobody asked for, and the difference
@@ -318,7 +402,7 @@ pub fn install(
         // `^4.0.0`; a dist-tag still pins, because `latest` in a manifest is a
         // moving pointer rather than a constraint.
         Resolution::Registry(id) => (
-            declared_range(&spec.version)
+            declared_range(request.seed.as_request())
                 .unwrap_or(&id.version)
                 .to_string(),
             id.version.clone(),
@@ -330,38 +414,62 @@ pub fn install(
         // would go stale on the next commit to that member.
         Resolution::Local(_) => {
             let member = members
-                .get(&spec.name)
+                .get(&request.name)
                 .and_then(|importer| workspace.members().get(importer))
                 .expect("a local resolution named a member the resolver found");
             (
-                requested.specifier.clone(),
+                resolved.specifier.clone(),
                 member.manifest.version().unwrap_or("local").to_string(),
             )
         }
     };
 
-    // The lockfile records what the manifest declares, so the specifier it
-    // carries for this request is the one about to be written rather than the
-    // seed resolution was given. Were they allowed to differ, every install
-    // would find its own lockfile stale and re-resolve a workspace nothing had
-    // touched.
-    graph
-        .importers
-        .get_mut(importer)
-        .and_then(|resolved| resolved.dependencies.get_mut(&spec.name))
-        .expect("the request was either resolved into the target or reused from it")
-        .specifier = recorded.clone();
+    Recorded {
+        name: request.name.clone(),
+        specifier,
+        version,
+    }
+}
 
-    lockfile::save(&graph, workspace.root())?;
+/// Install one package into `importer`, resolving the whole workspace.
+///
+/// A thin shell over `sync`: turn the command's spec into a request, let the
+/// sync do the work, then record the result.
+///
+/// Ordering is deliberate and unchanged. The manifest write is last, so a
+/// failure anywhere leaves at worst an installed-but-unrecorded package —
+/// harmless and self-healing on rerun — rather than a `package.json` claiming
+/// a dependency that is not on disk.
+pub fn install(
+    workspace: &Workspace,
+    importer: &ImporterPath,
+    store: &Store,
+    registry: &dyn RegistryClient,
+    spec: &PackageSpec,
+) -> Result<Installed, InstallError> {
+    let request = Request {
+        importer: importer.clone(),
+        name: spec.name.clone(),
+        seed: spec.version.clone(),
+    };
+
+    let outcome = sync(workspace, store, registry, Some(&request))?;
+    let recorded = outcome
+        .recorded
+        .expect("a sync given a request always reports what to record");
+
+    // `sync` validated membership before touching anything, so the target is
+    // known to exist by the time this runs.
+    let target = &workspace.members()[importer];
 
     // Last: never record something that is not already true on disk.
     let mut manifest = Manifest::load(&target.path)?;
-    manifest.add_dependency(&spec.name, &recorded);
+    manifest.add_dependency(&recorded.name, &recorded.specifier);
     manifest.save()?;
 
     Ok(Installed {
-        name: spec.name.clone(),
-        version: reported,
+        name: recorded.name,
+        version: recorded.version,
     })
 }
 
@@ -374,8 +482,7 @@ pub fn install(
 fn reusable_importers(
     locked: Option<&ResolvedGraph>,
     declared: &BTreeMap<ImporterPath, BTreeMap<String, String>>,
-    target: &ImporterPath,
-    spec: &PackageSpec,
+    request: Option<&Request>,
 ) -> BTreeMap<ImporterPath, Importer> {
     let Some(locked) = locked else {
         return BTreeMap::new();
@@ -385,8 +492,9 @@ fn reusable_importers(
         .iter()
         .filter_map(|(path, manifest_declares)| {
             let recorded = locked.importers.get(path)?;
+            let targeted = request.filter(|request| &request.importer == path);
             let fresh = recorded.matches(manifest_declares)
-                && (path != target || already_satisfies(recorded, spec));
+                && targeted.is_none_or(|request| already_satisfies(recorded, request));
             fresh.then(|| (path.clone(), recorded.clone()))
         })
         .collect()
@@ -397,15 +505,23 @@ fn reusable_importers(
 /// The manifest can match the lockfile perfectly and still not answer the
 /// question being asked — `jerky install lodash@4.18.0` against a lockfile
 /// holding 4.17.21 is a new request, not a no-op.
-fn already_satisfies(recorded: &Importer, spec: &PackageSpec) -> bool {
-    let Some(dependency) = recorded.dependencies.get(&spec.name) else {
+///
+/// This is deliberately *not* expressible as folding the request into what the
+/// importer declares and then asking `matches`. A request naming the version
+/// the lockfile already resolved to — `lodash@4.18.0` where the manifest says
+/// `^4.0.0` — is answered, yet differs from the declared specifier, so the
+/// fold would re-resolve a question that already has its answer.
+fn already_satisfies(recorded: &Importer, request: &Request) -> bool {
+    let Some(dependency) = recorded.dependencies.get(&request.name) else {
         return false;
     };
 
-    match &spec.version {
+    match &request.seed {
         // Only the registry can say what `latest` means today, so a bare
         // `jerky install <pkg>` always asks. That is the request, not a
-        // shortcoming of the lockfile.
+        // shortcoming of the lockfile — and it is why the seed is not
+        // flattened to a string, since a manifest declaring `"lodash":
+        // "latest"` would otherwise match here.
         VersionSpec::Latest => false,
         // Either the request is the specifier verbatim — which is how
         // `workspace:*` and a typed range both match — or it names the
@@ -421,28 +537,19 @@ fn already_satisfies(recorded: &Importer, spec: &PackageSpec) -> bool {
 ///
 /// What counts as ruling nothing out is `Range`'s question, not this module's
 /// — `*` has several spellings and the test is on what a range admits.
-fn unconstrained_range(requested: &VersionSpec) -> Option<&str> {
-    let VersionSpec::Exact(specifier) = requested else {
-        return None;
-    };
-    Range::parse(specifier)
-        .ok()?
-        .admits_everything()
-        .then_some(specifier.as_str())
+fn unconstrained_range(seed: &str) -> Option<&str> {
+    Range::parse(seed).ok()?.admits_everything().then_some(seed)
 }
 
 /// The range the user typed, when what they typed was a range.
 ///
 /// A bare version is excluded on purpose: `4.17.21` is a valid range matching
 /// exactly itself, but recording it as one would make every pin
-/// indistinguishable from a deliberate constraint. So is a dist-tag, which
-/// does not parse as a range at all — and must not be recorded verbatim,
-/// because `latest` in a manifest names whatever the registry means by it on
-/// some later day rather than the thing that was installed.
-fn declared_range(requested: &VersionSpec) -> Option<&str> {
-    let VersionSpec::Exact(specifier) = requested else {
-        return None;
-    };
-    (Range::parse(specifier).is_ok() && Version::parse(specifier).is_err())
-        .then_some(specifier.as_str())
+/// indistinguishable from a deliberate constraint. A dist-tag is excluded by
+/// the same test without needing its own arm — `latest` does not parse as a
+/// range at all — and must not be recorded verbatim, because in a manifest it
+/// names whatever the registry means by it on some later day rather than the
+/// thing that was installed.
+fn declared_range(seed: &str) -> Option<&str> {
+    (Range::parse(seed).is_ok() && Version::parse(seed).is_err()).then_some(seed)
 }
