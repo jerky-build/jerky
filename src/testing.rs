@@ -282,9 +282,19 @@ impl FixtureRegistry {
             .versions
             .insert(version.to_string(), metadata.clone());
 
-        let highest = packument
-            .versions_sorted()
-            .last()
+        // The highest *stable* version, not simply the highest. A registry
+        // does not point `latest` at a prerelease, and a fixture that does
+        // makes `latest` reach 5.0.0-beta.1 in a packument holding 4.17.21 —
+        // quietly turning any test that registers a prerelease into a test of
+        // behaviour npm does not have. Falling back to the highest overall
+        // keeps a fixture of nothing but prereleases resolvable, which is the
+        // only case where a real registry would do the same.
+        let sorted = packument.versions_sorted();
+        let highest = sorted
+            .iter()
+            .rev()
+            .find(|candidate| !candidate.is_prerelease())
+            .or_else(|| sorted.last())
             .map(|v| v.as_str().to_string())
             .unwrap_or_else(|| version.to_string());
         packument
@@ -392,6 +402,34 @@ mod tests {
         );
         assert_eq!(p.versions["1.0.0"].dependencies["b"], "^1.0.0");
         assert_eq!(p.versions["1.2.0"].dependencies["b"], "^2.0.0");
+    }
+
+    #[test]
+    fn latest_does_not_point_at_a_prerelease() {
+        // A registry does not tag a prerelease `latest`, and a fixture that
+        // did would make every test registering one exercise behaviour npm
+        // does not have — silently, since `latest` is what a bare
+        // `jerky install` asks for.
+        let registry =
+            FixtureRegistry::new().with_packument("a", &[("4.17.21", &[]), ("5.0.0-beta.1", &[])]);
+
+        assert_eq!(
+            registry.packument("a").unwrap().resolve_tag("latest"),
+            Some("4.17.21")
+        );
+    }
+
+    #[test]
+    fn latest_falls_back_when_every_version_is_a_prerelease() {
+        // Nothing stable to point at, and an unresolvable `latest` would be a
+        // worse fixture than an imprecise one. A real registry does the same.
+        let registry = FixtureRegistry::new()
+            .with_packument("a", &[("1.0.0-alpha.1", &[]), ("1.0.0-alpha.2", &[])]);
+
+        assert_eq!(
+            registry.packument("a").unwrap().resolve_tag("latest"),
+            Some("1.0.0-alpha.2")
+        );
     }
 
     #[test]

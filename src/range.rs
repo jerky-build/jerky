@@ -50,6 +50,15 @@ impl Version {
     pub fn as_str(&self) -> &str {
         &self.raw
     }
+
+    /// Is this a prerelease — `5.0.0-beta.1` rather than `5.0.0`?
+    ///
+    /// Asked of the parsed form rather than by looking for a `-`, which would
+    /// also find one inside build metadata: `1.0.0+build-7` is not a
+    /// prerelease.
+    pub fn is_prerelease(&self) -> bool {
+        !self.parsed.pre_release.is_empty()
+    }
 }
 
 // Ordering and equality are semantic, delegating to the parsed form. Comparing
@@ -175,6 +184,20 @@ mod tests {
             Range::parse("not a range"),
             Err(RangeError::Unparseable(_))
         ));
+    }
+
+    #[test]
+    fn is_prerelease_ignores_build_metadata() {
+        // A `-` inside build metadata is not a prerelease marker, which is
+        // why this asks the parsed form rather than searching the string.
+        assert!(Version::parse("5.0.0-beta.1").unwrap().is_prerelease());
+        assert!(!Version::parse("5.0.0").unwrap().is_prerelease());
+        assert!(!Version::parse("1.0.0+build-7").unwrap().is_prerelease());
+        assert!(
+            Version::parse("1.0.0-rc.1+build-7")
+                .unwrap()
+                .is_prerelease()
+        );
     }
 
     #[test]
