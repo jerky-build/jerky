@@ -68,7 +68,7 @@ fn installs_a_package_end_to_end() {
     // The manifest records the concrete version, with no caret.
     let raw = std::fs::read_to_string(project_dir.join("package.json")).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
-    assert_eq!(parsed["dependencies"]["lodash"], "^4.17.21");
+    assert_eq!(parsed["dependencies"]["lodash"], "4.17.21");
 }
 
 #[test]
@@ -91,8 +91,7 @@ fn the_recorded_version_comes_from_the_registry_not_the_request() {
 
     let raw = std::fs::read_to_string(project_dir.join("package.json")).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
-    // Pinned to what came back, then recorded as a caret range over it.
-    assert_eq!(parsed["dependencies"]["react"], "^18.2.0");
+    assert_eq!(parsed["dependencies"]["react"], "18.2.0");
 }
 
 #[test]
@@ -566,10 +565,11 @@ fn a_lockfile_target_is_one_climb_short_of_the_symlink() {
 }
 
 #[test]
-fn the_manifest_records_a_caret_range() {
-    // What spec 1 deferred to "spec 2, when ranges actually resolve". The
-    // caret goes on the version the registry chose, never on the request:
-    // asking for a dist-tag must still pin what came back.
+fn the_manifest_records_an_exact_pin() {
+    // Even now that ranges resolve, `jerky install <pkg>` pins. What gets
+    // recorded is the version the registry chose, not the request that found
+    // it, so a dist-tag lands in the manifest as the version it meant today
+    // rather than as a range that will mean something else tomorrow.
     let home = TempDir::new().unwrap();
     let work = TempDir::new().unwrap();
     let project_dir = project(work.path());
@@ -586,15 +586,15 @@ fn the_manifest_records_a_caret_range() {
 
     assert_eq!(
         read_json(&project_dir.join("package.json"))["dependencies"]["lodash"],
-        "^4.17.21"
+        "4.17.21"
     );
 }
 
 #[test]
 fn an_exact_request_still_installs_that_exact_version() {
-    // The caret is what gets *recorded*; it must not become what gets
-    // *resolved*. Seeding the resolver with `^4.17.21` would install 4.18.0
-    // when one exists, which is not what `lodash@4.17.21` asked for.
+    // A request for one version must not be widened on the way through the
+    // resolver: `^4.17.21` would select 4.18.0 where one exists, which is not
+    // what `lodash@4.17.21` asked for — in the manifest or in node_modules.
     let home = TempDir::new().unwrap();
     let work = TempDir::new().unwrap();
     let root = work.path();
@@ -616,7 +616,52 @@ fn an_exact_request_still_installs_that_exact_version() {
     assert_eq!(linked_version(&root.join("apps/web"), "lodash"), "4.17.21");
     assert_eq!(
         read_json(&root.join("apps/web/package.json"))["dependencies"]["lodash"],
-        "^4.17.21"
+        "4.17.21"
+    );
+}
+
+#[test]
+fn a_pinned_dependency_does_not_drift_when_its_importer_is_re_resolved() {
+    // The reason the pin is the default. Installing something *else* makes
+    // the importer stale, so lodash is resolved a second time — and a caret
+    // in the manifest is exactly the permission the resolver needs to move it
+    // to 4.18.0 at that point, without the user asking for anything. An exact
+    // specifier resolves to itself however often it is asked.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let store = Store::new(home.path().join("store"));
+    let registry = FixtureRegistry::new()
+        .with_packument("lodash", &[("4.17.21", &[]), ("4.18.0", &[])])
+        .with_tree(&[("alpha", "1.0.0", &[])]);
+    write_manifest(root, r#"{"name":"demo"}"#);
+
+    install(
+        &solo(root),
+        &ImporterPath::root(),
+        &store,
+        &registry,
+        &spec("lodash", VersionSpec::Exact("4.17.21".into())),
+    )
+    .unwrap();
+
+    install(
+        &solo(root),
+        &ImporterPath::root(),
+        &store,
+        &registry,
+        &spec("alpha", VersionSpec::Exact("1.0.0".into())),
+    )
+    .unwrap();
+
+    assert_eq!(linked_version(root, "lodash"), "4.17.21");
+    assert_eq!(
+        read_json(&root.join("package.json"))["dependencies"]["lodash"],
+        "4.17.21"
+    );
+    assert_eq!(
+        read_json(&root.join("jerky-lock.json"))["importers"]["."]["dependencies"]["lodash"]["version"],
+        "4.17.21"
     );
 }
 

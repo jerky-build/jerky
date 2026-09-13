@@ -58,18 +58,37 @@ parses into an untyped `Value` to preserve unknown fields, so the pattern that
 would hit this is one jerky already uses. The mainstream Rust YAML serde crates
 are also deprecated or unmaintained.
 
-**`jerky install` now writes a caret range.** `jerky install lodash` records
-`"lodash": "^4.17.21"`, matching npm and pnpm. Spec 1 pinned exactly for a
-stated reason that this spec removes:
+**`jerky install` keeps writing an exact pin.** `jerky install lodash` records
+`"lodash": "4.17.21"`, not `"^4.17.21"`. Spec 1 pinned for a reason this spec
+does remove:
 
 > jerky should not yet: spec 1 has no range resolution, so a caret would put a
 > constraint in `package.json` that the tool cannot honour on the next install
 > — the file would claim more than jerky can do. **Switch to caret in spec 2,
 > when ranges actually resolve.**
 
-This is a user-visible behaviour change and needs a changelog note. It also
-means the manifest now contains ranges the resolver must handle, so the root
-project is just another node with ranges, not a special case.
+Ranges do resolve now, so the stated obstacle is gone — but the conclusion it
+was holding up does not follow from its removal. Being *able* to honour a caret
+is not a reason to write one. A caret is standing permission for some later
+install to pick a version the user never asked for, and it is exercised by
+whichever machine re-resolves first rather than at a moment anyone chose. The
+failure it produces is the one that is hardest to see: an install that
+succeeds, with different bytes.
+
+Writing a range stays available, deliberately: a hand-written `"^4.0.0"` is
+honoured exactly as npm would honour it, and widening a pin is a one-line edit.
+The asymmetry is the argument — widening later is cheap, while discovering that
+a dependency drifted three weeks ago is not.
+
+This departs from npm and pnpm, which default to the caret. It matches what a
+lockfile-bearing tool actually promises, and it is the same instinct as
+`--save-exact`.
+
+Default behaviour is therefore unchanged from spec 1, so there is no migration
+and nothing an existing `package.json` has to be rewritten for. The manifest
+can still contain ranges the resolver must handle, because a user may write
+one, so the root project is still just another node with ranges rather than a
+special case.
 
 **The lockfile is named `jerky-lock.json`.** #11 called it `jerky.lock`, by
 analogy with `Cargo.lock` and `yarn.lock`. Since the format is JSON, the
@@ -96,7 +115,7 @@ follow-up lands. That is acceptable for a spec whose job is correctness.
 - Virtual store wiring for nested dependencies — each package sees its own deps
 - `jerky-lock.json`: deterministic, diffable, versioned, integrity-bearing
 - Reading the lockfile back to skip re-resolution when it is still valid
-- `jerky install <pkg>` recording a caret range
+- `jerky install <pkg>` recording an exact pin, with hand-written ranges honoured
 
 ### Explicitly out of scope
 

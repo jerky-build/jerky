@@ -278,15 +278,13 @@ pub fn install(
 
     let requested = graph.importers[importer].dependencies[&spec.name].clone();
     let (recorded, reported) = match &requested.resolution {
-        // A caret range over the version that was chosen, not the string that
-        // was asked for. Recording the exact version would freeze the
-        // dependency at whatever `latest` meant on the day it was installed,
-        // which is what spec 1 did only because it had no resolver able to
-        // honour a range. Resolution still seeded from the exact request —
-        // `lodash@4.17.21` installs 4.17.21 even where 4.18.0 exists — so the
-        // caret describes what future resolutions may accept, not what this
-        // one chose.
-        Resolution::Registry(id) => (format!("^{}", id.version), id.version.clone()),
+        // The exact version that was chosen, never a range over it. jerky
+        // pins by default: a caret would hand the next install permission to
+        // pick a version nobody asked for, and the difference only shows up
+        // later, on a machine that resolved at a different time. Widening it
+        // is an edit the user can make and the resolver now honours; narrowing
+        // a range back down after it has already drifted is not.
+        Resolution::Registry(id) => (id.version.clone(), id.version.clone()),
         // `jerky install ui@workspace:*` names a member on purpose. The link
         // is already written by the loop above; what differs is what gets
         // recorded — the protocol as asked for, never a version, because the

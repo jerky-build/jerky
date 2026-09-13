@@ -39,17 +39,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   that is not in the repo is an error rather than a fall back to the registry,
   because it is a typo.
 - `jerky-lock.json` is written at the workspace root, keyed by importer. There
-  is one lockfile per workspace, not one per project. It is not yet read back
+  is one lockfile per workspace, not one per project
   ([#47](https://github.com/jerky-build/jerky/issues/47)).
 
 ### Changed
 
-- **`jerky install lodash` now records `"^4.17.21"` where it previously
-  recorded `"4.17.21"`.** Spec 1 pinned the exact version only because it had
-  no resolver able to honour a range. The caret goes on the version that was
-  chosen, never on the request: `jerky install lodash@4.17.21` still installs
-  exactly 4.17.21 even where 4.18.0 exists, and records `^4.17.21` describing
-  what future resolutions may accept.
 - Two importers wanting the same version now share one store entry and one
   directory in the virtual store, which is why the store lives at the
   workspace root. Importers wanting different versions each get their own;
@@ -71,6 +65,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Notes
 
+- **`jerky install lodash` still records `"4.17.21"`, not `"^4.17.21"`.** The
+  resolver can honour a range now, which is what spec 1 was waiting for, but
+  the default is a pin rather than a caret: a caret is standing permission for
+  some later install to choose a version nobody asked for, and it is exercised
+  on whichever machine happens to re-resolve first. A range is an edit the user
+  can make deliberately, and the resolver honours it — `"^4.0.0"` written by
+  hand resolves as a range. Widening later is easy; discovering that a
+  dependency already drifted is not.
 - Lockfile entries no importer can reach are dropped on write. A full
   resolution only ever produced the reachable set, so this keeps that property
   true under partial reuse rather than deciding lockfile pruning as a policy;
