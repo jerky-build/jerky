@@ -86,6 +86,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Errors
 
+- `jerky install <pkg>@*` is refused rather than installed. A range that rules
+  nothing out has no good answer: recording `"*"` would put the widest possible
+  drift permission in a manifest, and pinning instead would answer a question
+  that was not asked. Every spelling is caught — `x`, `X`, `*.*.*`, `>=0.0.0` —
+  because the check is on what the range admits rather than on how it was
+  typed. Bounded ranges are untouched: `^0.0.0`, `0.x` and `>=1.0.0` each rule
+  something out and each still install.
 - Running `jerky install <pkg>` from a directory inside the workspace that
   belongs to no member is an error naming the members, rather than a silent
   install into the root. This applies only where the workspace has more than

@@ -151,6 +151,27 @@ impl FixtureRegistry {
         self
     }
 
+    /// Point a dist-tag at a version that is already registered.
+    ///
+    /// `latest` is maintained automatically by every other builder, so this is
+    /// for the tags that are not: `next`, `beta`, and anything else a
+    /// publisher invents. Panics if the version is unknown, because a dangling
+    /// tag is a thing to test deliberately rather than to create by typo.
+    pub fn with_dist_tag(mut self, name: &str, tag: &str, version: &str) -> Self {
+        let packument = self
+            .packuments
+            .get_mut(name)
+            .unwrap_or_else(|| panic!("no packument for `{name}`"));
+        assert!(
+            packument.versions.contains_key(version),
+            "`{name}` has no version `{version}` to tag `{tag}`"
+        );
+        packument
+            .dist_tags
+            .insert(tag.to_string(), version.to_string());
+        self
+    }
+
     /// Register several versions of one package, each with its own
     /// dependencies, as a registry would report them in one packument.
     ///

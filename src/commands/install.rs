@@ -51,6 +51,13 @@ pub enum InstallError {
         locked: String,
         reported: String,
     },
+    #[error(
+        "`{name}@{requested}` constrains nothing — it accepts every version of \
+         `{name}` the registry has today and every one it publishes later. Ask \
+         for the range you mean (`^4.0.0`, `~4.17.0`), or `jerky install {name}` \
+         to pin whatever `latest` resolves to now."
+    )]
+    UnconstrainedRange { name: String, requested: String },
     #[error("`{importer}` is not a member of this workspace (members: {})", members.join(", "))]
     UnknownImporter {
         importer: String,
@@ -86,6 +93,18 @@ pub fn install(
     registry: &dyn RegistryClient,
     spec: &PackageSpec,
 ) -> Result<Installed, InstallError> {
+    // Before anything is looked up or written. A request that rules nothing
+    // out is refused rather than pinned, because either reading of it is a
+    // guess: recording `*` would put the widest possible drift permission in
+    // a manifest whose whole default exists to avoid one, and quietly pinning
+    // it instead would answer a question the user did not ask.
+    if let Some(unconstrained) = unconstrained_range(&spec.version) {
+        return Err(InstallError::UnconstrainedRange {
+            name: spec.name.clone(),
+            requested: unconstrained.to_string(),
+        });
+    }
+
     let target =
         workspace
             .members()
@@ -397,6 +416,26 @@ fn already_satisfies(recorded: &Importer, spec: &PackageSpec) -> bool {
 /// does not parse as a range at all — and must not be recorded verbatim,
 /// because `latest` in a manifest names whatever the registry means by it on
 /// some later day rather than the thing that was installed.
+/// The request, when it is a range that rules nothing out.
+///
+/// Asked semantically rather than by spelling, because `*` has several: `x`,
+/// `X`, `*.*.*` and `>=0.0.0` all say the same nothing, and a blocklist of
+/// literals would catch whichever ones its author happened to think of.
+/// Satisfying both the lowest version expressible and an absurdly high one is
+/// the property they share and that no real constraint has — `^0.0.0` and
+/// `0.x` admit 0.0.0 but stop well below the ceiling, and `>=1.0.0` reaches
+/// the ceiling but excludes the floor.
+fn unconstrained_range(requested: &VersionSpec) -> Option<&str> {
+    let VersionSpec::Exact(specifier) = requested else {
+        return None;
+    };
+    let range = Range::parse(specifier).ok()?;
+
+    let floor = Version::parse("0.0.0").expect("a literal version parses");
+    let ceiling = Version::parse("999999.0.0").expect("a literal version parses");
+    (range.matches(&floor) && range.matches(&ceiling)).then_some(specifier.as_str())
+}
+
 fn declared_range(requested: &VersionSpec) -> Option<&str> {
     let VersionSpec::Exact(specifier) = requested else {
         return None;

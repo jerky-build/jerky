@@ -83,7 +83,19 @@ the manifest — because flattening it would be the tool overruling an
 instruction rather than supplying a missing one. A dist-tag is neither: it does
 not parse as a range, and `latest` in a manifest names whatever the registry
 decides later rather than constraining it, so a tag pins to the version it
-meant. Hand-written ranges are honoured exactly as npm honours them.
+meant — `next` included, which is the one request that reaches a prerelease.
+Hand-written ranges are honoured exactly as npm honours them.
+
+The exception is a range that rules nothing out. `jerky install lodash@*` is
+refused rather than answered, because both answers are wrong: recording `"*"`
+contradicts the default outright, and pinning silently would substitute a
+question for the one that was asked. This is decided on what the range admits
+rather than on how it was spelled, so `x`, `*.*.*` and `>=0.0.0` are the same
+request and get the same refusal, while `^0.0.0`, `0.x` and `>=1.0.0` each rule
+something out and stand. Only the command line is policed; a `"*"` already
+written in a manifest still resolves, because refusing it would be jerky
+declining to install an existing project rather than declining to write
+something new.
 
 The asymmetry is the argument for the default — widening a pin later is cheap,
 while discovering that a dependency drifted three weeks ago is not.

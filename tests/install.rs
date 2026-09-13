@@ -690,7 +690,6 @@ fn every_range_form_is_recorded_as_written() {
         ("4.17.x", "4.17.21"),
         ("4", "4.18.0"),
         (">=4 <5", "4.18.0"),
-        ("*", "5.0.0"),
     ];
 
     for (requested, expected) in cases {
@@ -723,6 +722,118 @@ fn every_range_form_is_recorded_as_written() {
             "`{requested}` was not recorded as written"
         );
     }
+}
+
+#[test]
+fn a_range_that_rules_nothing_out_is_refused() {
+    // `*` is the one range there is no good answer to. Recording it would put
+    // the widest possible drift permission in a manifest whose default exists
+    // to avoid one; pinning instead would answer a question nobody asked. So
+    // it is refused, before anything is fetched or written.
+    //
+    // Every spelling, because the check is on what the range admits rather
+    // than on how it was typed — a blocklist of literals would catch `*` and
+    // miss `x`.
+    for requested in ["*", "x", "X", "*.*.*", "x.x.x", ">=0.0.0"] {
+        let home = TempDir::new().unwrap();
+        let work = TempDir::new().unwrap();
+        let root = work.path();
+        let registry =
+            FixtureRegistry::new().with_packument("lodash", &[("4.17.21", &[]), ("5.0.0", &[])]);
+        write_manifest(root, r#"{"name":"demo"}"#);
+
+        let err = install(
+            &solo(root),
+            &ImporterPath::root(),
+            &Store::new(home.path().join("store")),
+            &registry,
+            &spec("lodash", VersionSpec::Exact(requested.into())),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(err, InstallError::UnconstrainedRange { .. }),
+            "`{requested}` was accepted, got {err:?}"
+        );
+        // Refused before the registry was asked and before anything was
+        // written, which is what makes this a rejection rather than a rollback.
+        assert_eq!(registry.packument_calls(), 0, "`{requested}` was resolved");
+        assert!(
+            read_json(&root.join("package.json"))
+                .get("dependencies")
+                .is_none(),
+            "`{requested}` reached the manifest"
+        );
+        assert!(!root.join("jerky-lock.json").exists());
+    }
+}
+
+#[test]
+fn a_bounded_range_is_not_mistaken_for_a_wildcard() {
+    // The refusal is narrow on purpose. `^0.0.0` and `0.x` admit 0.0.0, and
+    // `>=1.0.0` has no upper bound; each rules something out, so each stands.
+    let registry = FixtureRegistry::new().with_packument(
+        "lodash",
+        &[("0.0.0", &[]), ("0.1.0", &[]), ("4.17.21", &[])],
+    );
+
+    for (requested, expected) in [
+        ("^0.0.0", "0.0.0"),
+        ("0.x", "0.1.0"),
+        (">=1.0.0", "4.17.21"),
+    ] {
+        let home = TempDir::new().unwrap();
+        let work = TempDir::new().unwrap();
+        let root = work.path();
+        write_manifest(root, r#"{"name":"demo"}"#);
+
+        let installed = install(
+            &solo(root),
+            &ImporterPath::root(),
+            &Store::new(home.path().join("store")),
+            &registry,
+            &spec("lodash", VersionSpec::Exact(requested.into())),
+        )
+        .unwrap_or_else(|err| panic!("`{requested}` was refused: {err}"));
+
+        assert_eq!(installed.version, expected);
+        assert_eq!(
+            read_json(&root.join("package.json"))["dependencies"]["lodash"],
+            requested
+        );
+    }
+}
+
+#[test]
+fn a_dist_tag_other_than_latest_resolves_and_pins() {
+    // `next` is not a range, so it takes the tag path — and a tag is the one
+    // request that reaches a prerelease, since range resolution excludes them
+    // unless the range says otherwise. What lands in the manifest is the
+    // version the tag meant, never the tag: `next` names something different
+    // next week, which is the opposite of what a manifest is for.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let registry = FixtureRegistry::new()
+        .with_packument("lodash", &[("4.17.21", &[]), ("5.0.0-beta.1", &[])])
+        .with_dist_tag("lodash", "next", "5.0.0-beta.1");
+    write_manifest(root, r#"{"name":"demo"}"#);
+
+    let installed = install(
+        &solo(root),
+        &ImporterPath::root(),
+        &Store::new(home.path().join("store")),
+        &registry,
+        &spec("lodash", VersionSpec::Exact("next".into())),
+    )
+    .unwrap();
+
+    assert_eq!(installed.version, "5.0.0-beta.1");
+    assert_eq!(linked_version(root, "lodash"), "5.0.0-beta.1");
+    assert_eq!(
+        read_json(&root.join("package.json"))["dependencies"]["lodash"],
+        "5.0.0-beta.1"
+    );
 }
 
 #[test]
