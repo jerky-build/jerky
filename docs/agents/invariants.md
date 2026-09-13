@@ -85,13 +85,15 @@ Then, against the diff:
 - No module below `main.rs` reads the cwd or `$HOME`.
 - No literal `../` outside the linker's depth calculation.
 - `grep -rn 'devDependencies' src/` finds the name *read* in exactly two
-  places: `manifest.rs`, which reads a workspace member's section, and
+  modules: `manifest.rs`, which reads a member's sections, and
   `lockfile.rs`, where the on-disk block is named by a `serde(rename)` beside
-  the existing `lockfileVersion`. Every other hit must be prose — the comments
-  in `resolver.rs` and `registry.rs` saying why a dependency's are never
-  followed, and the `registry.rs` test proving deserialization drops them. A
-  third place that reads the name, and a `VersionMetadata` field for it above
-  all, is the bug this rule exists to prevent.
+  the existing `lockfileVersion`. Every other hit must be **prose or a test
+  fixture** — a comment saying why a dependency's are never followed, or a
+  fixture manifest that happens to declare some. The check is on what the
+  *code* reads, so count the reads and ignore the rest; do not try to keep a
+  list of permitted files, which goes stale the first time someone writes a
+  comment. A third place that reads the name, and a `VersionMetadata` field
+  for it above all, is the bug this rule exists to prevent.
 - At least one test exercises more than one importer. A suite that only ever
   sees `.` is not testing workspaces.
 - Any user-visible behaviour change is noted in `CHANGELOG.md`, under

@@ -212,17 +212,24 @@ pub fn sync(
     // the request is already satisfied by what the lockfile recorded, and
     // adding it back would be asking a question that has an answer.
     //
-    // Always `Prod`: there is no way yet to ask for anything else, since
-    // `--save-dev` is #21. A request that could name a kind changes only this
-    // line and what the manifest write below records.
+    // The kind is whatever the manifest already declares, and only `Prod` for
+    // a name it does not. A request cannot name a kind yet — that is #57's
+    // `--save-dev` — but hardcoding `Prod` here does not mean "no kind was
+    // asked for", it silently *rewrites* the section a user chose:
+    // `jerky install lodash@4.18.0` against a lodash in `devDependencies`
+    // would move it to `dependencies` without being asked. `already_satisfies`
+    // does not compare kinds, so nothing downstream would notice.
     if let Some(request) = request
         && let Some(deps) = stale.get_mut(&request.importer)
     {
+        let kind = deps
+            .get(&request.name)
+            .map_or(Kind::Prod, |declared| declared.kind);
         deps.insert(
             request.name.clone(),
             Declared {
                 specifier: request.seed.as_request().to_string(),
-                kind: Kind::Prod,
+                kind,
             },
         );
     }

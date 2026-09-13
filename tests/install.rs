@@ -1528,3 +1528,156 @@ fn a_name_in_both_sections_resolves_as_a_production_dependency() {
         "one name resolved to two entries; the graph is keyed by name"
     );
 }
+
+// The two tests below cover a bug the review found in the combined #54/#55
+// work: `jerky install <pkg>` against a package already declared in
+// `devDependencies` wrote it into `dependencies` as well, leaving it in both
+// sections permanently. The lockfile settled on the next install; the manifest
+// never did, because the prod-wins rule masks the duplicate rather than
+// resolving it.
+
+#[test]
+fn installing_a_dev_dependency_at_its_locked_version_does_not_duplicate_it() {
+    // The reused path: the request is already satisfied, so the importer is
+    // taken from the lockfile verbatim and the fold never runs. The manifest
+    // write is the only thing that happens, and it must not change the
+    // section.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let store = Store::new(home.path().join("store"));
+    let registry = FixtureRegistry::new().with_packument("lodash", &[("4.17.21", &[])]);
+    write_manifest(
+        root,
+        r#"{"name":"demo","devDependencies":{"lodash":"4.17.21"}}"#,
+    );
+
+    sync(
+        &Workspace::discover(root).unwrap(),
+        &store,
+        &registry,
+        None::<&Request>,
+    )
+    .unwrap();
+
+    install(
+        &solo(root),
+        &ImporterPath::root(),
+        &store,
+        &registry,
+        &spec("lodash", VersionSpec::Exact("4.17.21".into())),
+    )
+    .unwrap();
+
+    let manifest = read_json(&root.join("package.json"));
+    assert_eq!(manifest["devDependencies"]["lodash"], "4.17.21");
+    assert!(
+        manifest["dependencies"].is_null(),
+        "the section a user chose is not jerky's to change: {manifest}"
+    );
+
+    // And the lockfile still agrees with it, so the next install has nothing
+    // to re-resolve.
+    let lock = read_json(&root.join("jerky-lock.json"));
+    assert_eq!(
+        lock["importers"]["."]["devDependencies"]["lodash"]["version"],
+        "4.17.21"
+    );
+    assert!(lock["importers"]["."]["dependencies"].is_null());
+}
+
+#[test]
+fn installing_a_new_version_of_a_dev_dependency_keeps_it_a_dev_dependency() {
+    // The re-resolved path: a different version makes the importer stale, so
+    // the request *is* folded into what it declares. Hardcoding `Prod` there
+    // moved the package to `dependencies` without being asked, and because
+    // `already_satisfies` never compares kinds, nothing downstream noticed.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let store = Store::new(home.path().join("store"));
+    let registry =
+        FixtureRegistry::new().with_packument("lodash", &[("4.17.21", &[]), ("4.18.0", &[])]);
+    write_manifest(
+        root,
+        r#"{"name":"demo","devDependencies":{"lodash":"4.17.21"}}"#,
+    );
+
+    sync(
+        &Workspace::discover(root).unwrap(),
+        &store,
+        &registry,
+        None::<&Request>,
+    )
+    .unwrap();
+
+    install(
+        &solo(root),
+        &ImporterPath::root(),
+        &store,
+        &registry,
+        &spec("lodash", VersionSpec::Exact("4.18.0".into())),
+    )
+    .unwrap();
+
+    let manifest = read_json(&root.join("package.json"));
+    assert_eq!(manifest["devDependencies"]["lodash"], "4.18.0");
+    assert!(
+        manifest["dependencies"].is_null(),
+        "upgrading a dev dependency must not promote it: {manifest}"
+    );
+
+    let lock = read_json(&root.join("jerky-lock.json"));
+    assert_eq!(
+        lock["importers"]["."]["devDependencies"]["lodash"]["version"],
+        "4.18.0"
+    );
+    assert!(lock["importers"]["."]["dependencies"].is_null());
+}
+
+#[test]
+fn a_matching_lockfile_makes_no_registry_calls_for_dev_dependencies_either() {
+    // #55 pinned this for `dependencies` and #54 never extended it, because
+    // each ticket assumed the other owned it. It is the one assertion that
+    // catches drift in the kind round-tripping through save and load.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    write_manifest(root, r#"{"name":"ws","workspaces":["packages/*"]}"#);
+    write_manifest(
+        &root.join("packages/ui"),
+        r#"{"name":"ui","devDependencies":{"lodash":"4.17.21"},"dependencies":{"alpha":"1.0.0"}}"#,
+    );
+
+    let store = Store::new(home.path().join("store"));
+    let registry = FixtureRegistry::new()
+        .with_packument("lodash", &[("4.17.21", &[])])
+        .with_tree(&[("alpha", "1.0.0", &[])]);
+
+    sync(
+        &Workspace::discover(root).unwrap(),
+        &store,
+        &registry,
+        None::<&Request>,
+    )
+    .unwrap();
+    assert!(registry.packument_calls() > 0, "the first install resolves");
+
+    let before_packuments = registry.packument_calls();
+    let before_metadata = registry.metadata_calls();
+
+    sync(
+        &Workspace::discover(root).unwrap(),
+        &store,
+        &registry,
+        None::<&Request>,
+    )
+    .unwrap();
+
+    assert_eq!(
+        registry.packument_calls(),
+        before_packuments,
+        "a matching lockfile answers for devDependencies too"
+    );
+    assert_eq!(registry.metadata_calls(), before_metadata);
+}

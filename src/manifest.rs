@@ -159,10 +159,28 @@ impl Manifest {
             .unwrap_or_default()
     }
 
+    /// Record `name` at `version`, in whichever section already declares it.
+    ///
+    /// Writing unconditionally to `dependencies` would leave a name that lives
+    /// in `devDependencies` declared in *both*, and nothing ever takes it out
+    /// again: the resolver's prod-wins rule masks the duplicate rather than
+    /// resolving it, so the manifest never settles even though the lockfile
+    /// does. `jerky install lodash` against a lodash already in
+    /// `devDependencies` is a version change, not a request to promote it to a
+    /// runtime dependency — the section is the user's statement, not jerky's.
+    ///
+    /// Moving a dependency between sections *deliberately* is `--save-dev`,
+    /// which is #57 and will pass the section in rather than infer it.
     pub fn add_dependency(&mut self, name: &str, version: &str) {
+        let section = if self.declares_in("devDependencies", name) {
+            "devDependencies"
+        } else {
+            "dependencies"
+        };
+
         let deps = self
             .value
-            .entry("dependencies")
+            .entry(section)
             .or_insert_with(|| Value::Object(Map::new()));
 
         if !deps.is_object() {
@@ -170,8 +188,15 @@ impl Manifest {
         }
 
         deps.as_object_mut()
-            .expect("dependencies was just forced to an object")
+            .expect("the section was just forced to an object")
             .insert(name.to_string(), Value::String(version.to_string()));
+    }
+
+    fn declares_in(&self, section: &str, name: &str) -> bool {
+        self.value
+            .get(section)
+            .and_then(Value::as_object)
+            .is_some_and(|deps| deps.contains_key(name))
     }
 
     pub fn save(&self) -> Result<(), ManifestError> {
