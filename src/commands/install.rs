@@ -76,7 +76,7 @@ pub struct Installed {
 /// Adding a package is otherwise an ordinary sync: the request changes what
 /// the target importer asks for, and the rest of the workspace is resolved,
 /// linked and recorded exactly as it would be with nothing requested at all.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Request {
     pub importer: ImporterPath,
     pub name: String,
@@ -94,7 +94,7 @@ pub struct Request {
 }
 
 /// What a manifest should record for a requested package.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Recorded {
     pub name: String,
     /// The specifier to write: the range the user typed, or a pin.
@@ -104,9 +104,15 @@ pub struct Recorded {
 }
 
 /// What a sync did.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug)]
 pub struct Outcome {
-    /// Every registry package the workspace now has linked.
+    /// Every *registry* package the workspace now has linked, across every
+    /// importer, deduplicated by `name@version` because the virtual store
+    /// holds one entry per version however many importers asked for it.
+    ///
+    /// Workspace members are deliberately absent: they are linked in place
+    /// rather than installed, so counting them would report work that did not
+    /// happen and would change with nothing but a `workspaces` edit.
     pub linked: Vec<Installed>,
     /// Present only when there was a request to record.
     pub recorded: Option<Recorded>,
@@ -336,9 +342,8 @@ pub fn sync(
                 // back on would produce a path full of `..` components, and
                 // the linker compares paths lexically.
                 Resolution::Local(_) => {
-                    let local = members
-                        .get(name)
-                        .and_then(|importer| workspace.members().get(importer))
+                    let local = workspace
+                        .member_by_name(name)
                         .expect("a local resolution named a member the resolver found");
                     linker::symlink_local(&member.path, name, &local.path)?
                 }
@@ -346,22 +351,21 @@ pub fn sync(
         }
     }
 
-    let recorded = request.map(|request| record_for(request, &graph, workspace, &members));
-
     // The lockfile records what the manifest declares, so the specifier it
     // carries for this request is the one about to be written rather than the
     // seed resolution was given. Were they allowed to differ, every install
     // would find its own lockfile stale and re-resolve a workspace nothing had
     // touched.
-    if let Some(recorded) = &recorded {
-        let request = request.expect("a recording implies a request");
+    let recorded = request.map(|request| {
+        let recorded = record_for(request, &graph, workspace);
         graph
             .importers
             .get_mut(&request.importer)
             .and_then(|resolved| resolved.dependencies.get_mut(&request.name))
             .expect("the request was either resolved into the target or reused from it")
             .specifier = recorded.specifier.clone();
-    }
+        recorded
+    });
 
     lockfile::save(&graph, workspace.root())?;
 
@@ -382,12 +386,7 @@ pub fn sync(
 ///
 /// The two differ more often than they look like they should, which is why
 /// this is one named function rather than an expression at the call site.
-fn record_for(
-    request: &Request,
-    graph: &ResolvedGraph,
-    workspace: &Workspace,
-    members: &BTreeMap<String, ImporterPath>,
-) -> Recorded {
+fn record_for(request: &Request, graph: &ResolvedGraph, workspace: &Workspace) -> Recorded {
     let resolved = &graph.importers[&request.importer].dependencies[&request.name];
 
     let (specifier, version) = match &resolved.resolution {
@@ -413,9 +412,8 @@ fn record_for(
         // member's version is whatever the repo says today and pinning it
         // would go stale on the next commit to that member.
         Resolution::Local(_) => {
-            let member = members
-                .get(&request.name)
-                .and_then(|importer| workspace.members().get(importer))
+            let member = workspace
+                .member_by_name(&request.name)
                 .expect("a local resolution named a member the resolver found");
             (
                 resolved.specifier.clone(),

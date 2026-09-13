@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use jerky::cli::{PackageSpec, VersionSpec};
-use jerky::commands::install::{InstallError, install};
+use jerky::commands::install::{InstallError, Request, install, sync};
 use jerky::resolver::{ImporterPath, ResolveError};
 use jerky::store::Store;
 use jerky::testing::{FixtureRegistry, TarEntry, build_tarball};
@@ -1199,4 +1199,155 @@ fn a_warm_store_does_not_excuse_a_lockfile_mismatch() {
         matches!(err, InstallError::LockedIntegrityMismatch { .. }),
         "a warm store let a lockfile mismatch through, got {err:?}"
     );
+}
+
+// The three tests below guard decisions that #53's own ticket proposed
+// reversing. The review that caught them noted the suite passed *with* the
+// reversal applied, so each of these fails if someone reapplies it.
+
+#[test]
+fn a_request_naming_the_locked_version_does_not_re_resolve() {
+    // #53 proposed folding the request into the importer's declared ranges so
+    // that `already_satisfies` could be deleted. This is the case that makes
+    // the fold wrong: the request names the version the lockfile already
+    // resolved to, so it is answered — but it differs from the declared
+    // specifier `^4.0.0`, so a fold would mark the importer stale and ask the
+    // registry a question that already has its answer.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let store = Store::new(home.path().join("store"));
+    let registry =
+        FixtureRegistry::new().with_packument("lodash", &[("4.17.21", &[]), ("4.18.0", &[])]);
+    write_manifest(root, r#"{"name":"demo"}"#);
+
+    install(
+        &solo(root),
+        &ImporterPath::root(),
+        &store,
+        &registry,
+        &spec("lodash", VersionSpec::Exact("^4.0.0".into())),
+    )
+    .unwrap();
+    assert_eq!(registry.packument_calls_for("lodash"), 1);
+
+    install(
+        &solo(root),
+        &ImporterPath::root(),
+        &store,
+        &registry,
+        &spec("lodash", VersionSpec::Exact("4.18.0".into())),
+    )
+    .unwrap();
+
+    assert_eq!(
+        registry.packument_calls_for("lodash"),
+        1,
+        "naming the version already locked is answered by the lockfile"
+    );
+    assert_eq!(
+        read_json(&root.join("package.json"))["dependencies"]["lodash"],
+        "4.18.0",
+        "and the pin is still recorded, since a bare version is not a range"
+    );
+}
+
+#[test]
+fn a_bare_request_asks_even_when_the_manifest_declares_a_dist_tag() {
+    // #53 proposed flattening `Request::seed` to the string `as_request`
+    // produces. A manifest may declare `"lodash": "latest"` — it resolves, and
+    // the lockfile then records the specifier `latest`. Against one that does,
+    // a flattened seed would equal the recorded specifier and reuse the
+    // lockfile, so `jerky install lodash` would stop asking what `latest`
+    // means today. #47 requires that it always asks.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let store = Store::new(home.path().join("store"));
+    let registry = FixtureRegistry::new()
+        .with_packument("lodash", &[("4.17.21", &[]), ("4.18.0", &[])])
+        .with_tree(&[("alpha", "1.0.0", &[])]);
+    write_manifest(
+        root,
+        r#"{"name":"demo","dependencies":{"lodash":"latest"}}"#,
+    );
+
+    // Installing something else resolves the whole workspace, which is what
+    // gets `latest` into the lockfile as a specifier.
+    install(
+        &solo(root),
+        &ImporterPath::root(),
+        &store,
+        &registry,
+        &spec("alpha", VersionSpec::Latest),
+    )
+    .unwrap();
+    let before = registry.packument_calls_for("lodash");
+
+    install(
+        &solo(root),
+        &ImporterPath::root(),
+        &store,
+        &registry,
+        &spec("lodash", VersionSpec::Latest),
+    )
+    .unwrap();
+
+    assert!(
+        registry.packument_calls_for("lodash") > before,
+        "only the registry can say what `latest` means today"
+    );
+}
+
+#[test]
+fn a_sync_with_no_request_installs_what_the_manifests_declare() {
+    // The `None` path has no caller until #19, and an untested branch that
+    // exists only for a future ticket is one that ships broken. Two importers,
+    // because a suite that only ever sees `.` is not testing workspaces.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    write_manifest(root, r#"{"name":"ws","workspaces":["packages/*"]}"#);
+    write_manifest(
+        &root.join("packages/ui"),
+        r#"{"name":"ui","dependencies":{"lodash":"4.17.21"}}"#,
+    );
+    write_manifest(
+        &root.join("packages/api"),
+        r#"{"name":"api","dependencies":{"alpha":"1.0.0"}}"#,
+    );
+
+    let store = Store::new(home.path().join("store"));
+    let registry = FixtureRegistry::new()
+        .with_packument("lodash", &[("4.17.21", &[])])
+        .with_tree(&[("alpha", "1.0.0", &[])]);
+
+    let outcome = sync(
+        &Workspace::discover(root).unwrap(),
+        &store,
+        &registry,
+        None::<&Request>,
+    )
+    .unwrap();
+
+    assert!(outcome.recorded.is_none(), "nothing was requested");
+    assert_eq!(
+        linked_version(&root.join("packages/ui"), "lodash"),
+        "4.17.21"
+    );
+    assert_eq!(linked_version(&root.join("packages/api"), "alpha"), "1.0.0");
+
+    let mut linked: Vec<String> = outcome
+        .linked
+        .iter()
+        .map(|installed| format!("{}@{}", installed.name, installed.version))
+        .collect();
+    linked.sort();
+    assert_eq!(linked, vec!["alpha@1.0.0", "lodash@4.17.21"]);
+
+    // Written, and describing both importers rather than only the one a
+    // request would have named.
+    let lock = read_json(&root.join("jerky-lock.json"));
+    assert!(lock["importers"]["packages/ui"]["dependencies"]["lodash"].is_object());
+    assert!(lock["importers"]["packages/api"]["dependencies"]["alpha"].is_object());
 }

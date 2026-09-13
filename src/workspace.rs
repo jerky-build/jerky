@@ -183,6 +183,18 @@ impl Workspace {
     /// it belongs to the command rather than here: `Member::path` is the
     /// member's own directory, so a caller that cares can still tell "at the
     /// root" from "lost somewhere under it".
+    /// The member publishing `name`, if any.
+    ///
+    /// Membership is keyed by directory, so a lookup by package name is a scan
+    /// rather than an index. That is deliberate: the name is a property of the
+    /// manifest and may be absent or change, while the directory is what makes
+    /// an importer an importer.
+    pub fn member_by_name(&self, name: &str) -> Option<&Member> {
+        self.members
+            .values()
+            .find(|member| member.manifest.name() == Some(name))
+    }
+
     pub fn member_for(&self, dir: &Path) -> Option<&Member> {
         // A caller's `dir` is whatever the shell handed them, so it is
         // resolved to compare against the canonical root. Falling back to the
