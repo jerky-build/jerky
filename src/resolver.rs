@@ -264,12 +264,18 @@ enum Dependent {
 impl ResolvedGraph {
     /// The same graph with packages no importer can reach dropped.
     ///
-    /// A full resolution only ever produces the reachable set, so keeping that
-    /// true under partial reuse preserves an existing property rather than
-    /// deciding lockfile pruning as a policy: merging a reused importer's
-    /// packages with a re-resolved one's would otherwise accumulate entries
-    /// nothing references, and would cost the format the minimal-diff property
-    /// it was flattened to get.
+    /// A full resolution only ever produces the reachable set, so this keeps a
+    /// property the lockfile already had rather than adding one. Reuse is what
+    /// would break it: merging a reused importer's packages with a re-resolved
+    /// one's accumulates entries nothing references, and nothing fails when it
+    /// happens — the file just grows, and every diff touching it gets noisier,
+    /// which costs the flat format the minimal-diff property it was flattened
+    /// to get.
+    ///
+    /// Spec 2 §12 deferred pruning until an `uninstall` command existed to
+    /// trigger it, and §2 now settles it the other way: a dependency deleted
+    /// from a `package.json` by hand loses its subtree on the next install,
+    /// and an `uninstall` command will need no pruning of its own.
     pub fn reachable(self) -> Self {
         let mut reachable: BTreeSet<PackageId> = BTreeSet::new();
         let mut queue: VecDeque<PackageId> = self

@@ -1019,6 +1019,69 @@ fn editing_one_importer_re_resolves_only_what_it_must() {
 }
 
 #[test]
+fn a_dependency_deleted_by_hand_loses_its_subtree() {
+    // Spec 2 §12 deferred pruning until an `uninstall` command existed to
+    // trigger it; §2 now settles it the other way, so this is the behaviour
+    // that decision promises. `gamma` is reachable only through `alpha`, so it
+    // has to go with it — pruning the named package and leaving its subtree
+    // behind would be the worst of both.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let store = Store::new(home.path().join("store"));
+    let registry = FixtureRegistry::new().with_tree(&[
+        ("alpha", "1.0.0", &[("gamma", "^1.0.0")]),
+        ("gamma", "1.0.0", &[]),
+        ("beta", "1.0.0", &[]),
+    ]);
+    write_manifest(root, r#"{"name":"demo"}"#);
+
+    install(
+        &solo(root),
+        &ImporterPath::root(),
+        &store,
+        &registry,
+        &spec("alpha", VersionSpec::Exact("1.0.0".into())),
+    )
+    .unwrap();
+
+    let lock = read_json(&root.join("jerky-lock.json"));
+    assert!(lock["packages"]["alpha@1.0.0"].is_object());
+    assert!(
+        lock["packages"]["gamma@1.0.0"].is_object(),
+        "the transitive dependency was never recorded, so its removal proves nothing"
+    );
+
+    // The deletion an `uninstall` command would eventually make: the manifest
+    // no longer declares alpha. Any later install is what notices.
+    write_manifest(root, r#"{"name":"demo"}"#);
+
+    install(
+        &solo(root),
+        &ImporterPath::root(),
+        &store,
+        &registry,
+        &spec("beta", VersionSpec::Exact("1.0.0".into())),
+    )
+    .unwrap();
+
+    let lock = read_json(&root.join("jerky-lock.json"));
+    assert!(lock["packages"]["beta@1.0.0"].is_object());
+    assert!(
+        lock["packages"]["alpha@1.0.0"].is_null(),
+        "a dependency no importer declares survived in the lockfile"
+    );
+    assert!(
+        lock["packages"]["gamma@1.0.0"].is_null(),
+        "alpha was pruned but its subtree was left behind"
+    );
+    assert!(
+        lock["importers"]["."]["dependencies"]["alpha"].is_null(),
+        "the importer still records a dependency its manifest dropped"
+    );
+}
+
+#[test]
 fn a_lockfile_integrity_mismatch_stops_the_install() {
     // The trust-on-first-use anchor spec 1 explicitly went without. The
     // lockfile's hash is authoritative: if the registry later reports a

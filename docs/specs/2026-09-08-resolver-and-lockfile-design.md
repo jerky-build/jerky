@@ -118,6 +118,32 @@ in a diff gets folding and structure for free. `package-lock.json` is the
 closer precedent anyway. Deciding this now is cheap; deciding it after anyone
 has committed one is a migration.
 
+**The lockfile is pruned on every write.** A package no importer can reach,
+directly or transitively, is dropped. §12 deferred this until an `uninstall`
+command existed to trigger it; that framing turned out to be wrong, because
+pruning is not a feature waiting for a caller — it is a property the file
+already had.
+
+A full resolution produces exactly the reachable set, so every lockfile jerky
+has ever written was pruned by construction. Reuse is what breaks that: merging
+a reused importer's packages with a re-resolved importer's accumulates entries
+nothing references. Deferring the decision would therefore not preserve the
+status quo, it would end it — and quietly, since nothing fails when a lockfile
+carries a package no one asked for. It just grows, and every diff that touches
+it gets noisier, which costs the flat format the minimal-diff property it was
+flattened to get.
+
+Deciding it now also settles the case §12 was actually about. A dependency
+deleted from a `package.json` by hand loses its subtree on the next install,
+which is what anyone deleting it expects. An `uninstall` command, when it
+lands, needs no pruning logic of its own: it edits the manifest, and the next
+write does the rest.
+
+The cost is that a lockfile cannot carry an entry deliberately kept out of the
+graph — a pin for something not yet depended on, say. Nothing wants that today,
+and an `overrides` field would be the honest way to express it if something
+ever does.
+
 **Parallel downloads are deferred.** Spec 1's design placed them here, but
 spec 2 is already a transitive resolver plus a lockfile format, and both are
 things worth getting right before making fast. Resolution is serial in this
@@ -482,10 +508,11 @@ trivial once bare install can read the lockfile this spec writes.
 
 ## 12. Open questions
 
-**When does the lockfile get pruned?** Removing a dependency from
-`package.json` should eventually remove its subtree from the lockfile, but
-jerky has no `uninstall` command yet, so there is no operation that would
-trigger it. Deferred until one exists.
+None left.
 
-*(The lockfile filename was an open question here and is now settled — see
-§2.)*
+*(Both questions raised here are now settled in §2: the lockfile filename, and
+when the lockfile gets pruned. Pruning was deferred here "until an `uninstall`
+command exists"; implementing reuse showed that to be the wrong shape of
+question, since a full resolution already emitted only the reachable set and it
+was reuse, not deletion, that could start accumulating dead entries. Deferring
+would have changed the behaviour rather than preserved it.)*

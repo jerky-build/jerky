@@ -87,9 +87,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   records the version `latest` meant, since a tag in a manifest is a moving
   pointer rather than a constraint.
 - Lockfile entries no importer can reach are dropped on write. A full
-  resolution only ever produced the reachable set, so this keeps that property
-  true under partial reuse rather than deciding lockfile pruning as a policy;
-  the broader question in the resolver spec's §12 stays open.
+  resolution only ever produced the reachable set, so this keeps a property the
+  file already had, which reuse would otherwise end: merging a reused
+  importer's packages with a re-resolved one's accumulates entries nothing
+  references. A dependency deleted from a `package.json` by hand therefore
+  loses its subtree on the next install. This settles the resolver spec's §12,
+  which had deferred pruning until an `uninstall` command existed to trigger
+  it.
 
 ### Errors
 
