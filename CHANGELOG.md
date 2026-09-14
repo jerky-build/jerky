@@ -44,7 +44,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   rather than declaring it twice, and a section it empties by doing so is
   removed rather than left behind as `"dependencies": {}`. Without the flag the
   section is still whatever the manifest already says, so `jerky install
-  lodash@4.18.0` remains a version change and never a promotion. The lockfile
+  lodash@4.18.0` remains a version change and never a promotion — and a
+  manifest that declares the name in *both* sections keeps both, because
+  settling that contradiction is not something a version change was asked to
+  do. The lockfile
   is rewritten to agree, so the move is one diff rather than a manifest change
   the next install notices and repeats. `--save-dev` with no package is an
   error rather than a bare install that ignores the flag

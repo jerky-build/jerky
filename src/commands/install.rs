@@ -543,8 +543,20 @@ pub fn install(
     let target = &workspace.members()[importer];
 
     // Last: never record something that is not already true on disk.
+    //
+    // Which of the two writes is the whole difference `--save-dev` makes to
+    // the file. A command that named a section is moving the dependency into
+    // it, so the declaration it is leaving has to go. A command that named
+    // none is changing a version, and a manifest that happens to declare the
+    // name in both sections is a contradiction it was not asked to settle —
+    // deleting the other entry there would lose a line the user never
+    // mentioned, on an install that only asked for a different version.
     let mut manifest = Manifest::load(&target.path)?;
-    manifest.add_dependency(&recorded.name, &recorded.specifier, recorded.kind);
+    if kind.is_some() {
+        manifest.move_dependency(&recorded.name, &recorded.specifier, recorded.kind);
+    } else {
+        manifest.add_dependency(&recorded.name, &recorded.specifier, recorded.kind);
+    }
     manifest.save()?;
 
     Ok(Installed {
