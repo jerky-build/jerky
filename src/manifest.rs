@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value};
 use thiserror::Error;
 
+use crate::resolver::Kind;
+
 #[derive(Debug, Error)]
 pub enum ManifestError {
     #[error("no package.json found in {0}")]
@@ -159,24 +161,28 @@ impl Manifest {
             .unwrap_or_default()
     }
 
-    /// Record `name` at `version`, in whichever section already declares it.
+    /// Record `name` at `version` in the section `kind` names, and take it out
+    /// of the other one.
     ///
-    /// Writing unconditionally to `dependencies` would leave a name that lives
-    /// in `devDependencies` declared in *both*, and nothing ever takes it out
-    /// again: the resolver's prod-wins rule masks the duplicate rather than
-    /// resolving it, so the manifest never settles even though the lockfile
-    /// does. `jerky install lodash` against a lodash already in
-    /// `devDependencies` is a version change, not a request to promote it to a
-    /// runtime dependency — the section is the user's statement, not jerky's.
+    /// The removal is what makes this a move. Writing to one section without
+    /// clearing the other leaves a name declared in *both*, and nothing ever
+    /// takes it out again: the prod-wins rule that reconciles the two sections
+    /// for the resolver masks the duplicate rather than resolving it, so the
+    /// manifest never settles even though the lockfile does.
     ///
-    /// Moving a dependency between sections *deliberately* is `--save-dev`,
-    /// which is #57 and will pass the section in rather than infer it.
-    pub fn add_dependency(&mut self, name: &str, version: &str) {
-        let section = if self.declares_in("devDependencies", name) {
-            "devDependencies"
-        } else {
-            "dependencies"
+    /// Which section is asked for is the caller's answer and deliberately not
+    /// this type's to infer. `jerky install lodash` against a lodash already
+    /// in `devDependencies` is a version change rather than a request to
+    /// promote it, so the kind it passes is the one already declared;
+    /// `--save-dev` passes `Dev` and means it, and is the only thing that
+    /// moves a dependency between the two.
+    pub fn add_dependency(&mut self, name: &str, version: &str, kind: Kind) {
+        let (section, vacated) = match kind {
+            Kind::Prod => ("dependencies", "devDependencies"),
+            Kind::Dev => ("devDependencies", "dependencies"),
         };
+
+        self.undeclare(vacated, name);
 
         let deps = self
             .value
@@ -192,11 +198,30 @@ impl Manifest {
             .insert(name.to_string(), Value::String(version.to_string()));
     }
 
-    fn declares_in(&self, section: &str, name: &str) -> bool {
-        self.value
-            .get(section)
-            .and_then(Value::as_object)
-            .is_some_and(|deps| deps.contains_key(name))
+    /// Take `name` out of `section`, and the section out of the manifest if
+    /// that leaves it empty.
+    ///
+    /// An emptied section is dropped rather than left behind as
+    /// `"dependencies": {}`, because the object jerky is deleting the last
+    /// entry from is one jerky wrote in the first place. A section the user
+    /// wrote empty is never reached: there is nothing in it to remove, so the
+    /// early return fires before the question of deleting it comes up.
+    ///
+    /// `shift_remove` rather than `remove`, in both places. With
+    /// `preserve_order` enabled — which is the whole reason this type is
+    /// backed by a `Map` — `remove` is `swap_remove`, so taking a dependency
+    /// out of the middle would silently move the file's last key into the hole
+    /// and reorder a user's `package.json` around an edit they did not make.
+    fn undeclare(&mut self, section: &str, name: &str) {
+        let Some(deps) = self.value.get_mut(section).and_then(Value::as_object_mut) else {
+            return;
+        };
+        if deps.shift_remove(name).is_none() {
+            return;
+        }
+        if deps.is_empty() {
+            self.value.shift_remove(section);
+        }
     }
 
     pub fn save(&self) -> Result<(), ManifestError> {
@@ -320,7 +345,7 @@ mod tests {
         write(dir.path(), "{\n  \"name\": \"demo\"\n}\n");
 
         let mut manifest = Manifest::load(dir.path()).unwrap();
-        manifest.add_dependency("lodash", "4.17.21");
+        manifest.add_dependency("lodash", "4.17.21", Kind::Prod);
         manifest.save().unwrap();
 
         let raw = std::fs::read_to_string(dir.path().join("package.json")).unwrap();
@@ -335,12 +360,53 @@ mod tests {
         write(dir.path(), r#"{"dependencies":{"lodash":"3.0.0"}}"#);
 
         let mut manifest = Manifest::load(dir.path()).unwrap();
-        manifest.add_dependency("lodash", "4.17.21");
+        manifest.add_dependency("lodash", "4.17.21", Kind::Prod);
         manifest.save().unwrap();
 
         let raw = std::fs::read_to_string(dir.path().join("package.json")).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(parsed["dependencies"]["lodash"], "4.17.21");
+    }
+
+    #[test]
+    fn add_dependency_moves_a_name_out_of_the_section_it_left() {
+        // The manifest half of `--save-dev`. Leaving the old entry behind
+        // would declare lodash twice, which nothing downstream ever undoes.
+        let dir = TempDir::new().unwrap();
+        write(
+            dir.path(),
+            r#"{"dependencies":{"alpha":"1.0.0","lodash":"4.17.21"}}"#,
+        );
+
+        let mut manifest = Manifest::load(dir.path()).unwrap();
+        manifest.add_dependency("lodash", "4.17.21", Kind::Dev);
+        manifest.save().unwrap();
+
+        let raw = std::fs::read_to_string(dir.path().join("package.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed["devDependencies"]["lodash"], "4.17.21");
+        assert!(parsed["dependencies"]["lodash"].is_null());
+        assert_eq!(
+            parsed["dependencies"]["alpha"], "1.0.0",
+            "the rest of the section it left is not jerky's to touch"
+        );
+    }
+
+    #[test]
+    fn a_section_emptied_by_a_move_is_dropped() {
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), r#"{"dependencies":{"lodash":"4.17.21"}}"#);
+
+        let mut manifest = Manifest::load(dir.path()).unwrap();
+        manifest.add_dependency("lodash", "4.17.21", Kind::Dev);
+        manifest.save().unwrap();
+
+        let raw = std::fs::read_to_string(dir.path().join("package.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(
+            parsed["dependencies"].is_null(),
+            "an empty object jerky wrote is jerky's to take away: {parsed}"
+        );
     }
 
     #[test]

@@ -92,6 +92,15 @@ pub struct Request {
     /// lockfile. A bare `jerky install <pkg>` must always ask, because only
     /// the registry can say what a tag means today.
     pub seed: VersionSpec,
+    /// Which section to record it under, when the command named one.
+    ///
+    /// `None` is `jerky install <pkg>`, which names a package and not a
+    /// section. What it means is *whichever section this is already declared
+    /// in*, and the manifest is where that answer lives, so it is read there
+    /// rather than guessed here. `Some` is `--save-dev`: a statement about the
+    /// section that outranks what the manifest currently says, and the only
+    /// thing that moves a dependency between the two.
+    pub kind: Option<Kind>,
 }
 
 /// What a manifest should record for a requested package.
@@ -102,6 +111,10 @@ pub struct Recorded {
     pub specifier: String,
     /// The concrete version that specifier resolved to.
     pub version: String,
+    /// The section to write it to. Taken from the resolved graph rather than
+    /// from the request, because a request that named no section has its
+    /// answer only once the manifest's own has been folded in.
+    pub kind: Kind,
 }
 
 /// What a sync did.
@@ -212,19 +225,22 @@ pub fn sync(
     // the request is already satisfied by what the lockfile recorded, and
     // adding it back would be asking a question that has an answer.
     //
-    // The kind is whatever the manifest already declares, and only `Prod` for
-    // a name it does not. A request cannot name a kind yet — that is #57's
-    // `--save-dev` — but hardcoding `Prod` here does not mean "no kind was
-    // asked for", it silently *rewrites* the section a user chose:
-    // `jerky install lodash@4.18.0` against a lodash in `devDependencies`
-    // would move it to `dependencies` without being asked. `already_satisfies`
-    // does not compare kinds, so nothing downstream would notice.
+    // A request that names a section gets it, which is the whole of what
+    // `--save-dev` does below the CLI. One that names none keeps whatever the
+    // manifest already declares, and is `Prod` only for a name the manifest
+    // does not declare at all: `jerky install lodash@4.18.0` against a lodash
+    // in `devDependencies` is a version change, and hardcoding `Prod` here
+    // would not mean "no section was asked for" but would silently rewrite the
+    // section the user chose. Nothing downstream would catch that — the
+    // resolver is kind-blind by design, and `already_satisfies` compares only
+    // the section the command itself asked for.
     if let Some(request) = request
         && let Some(deps) = stale.get_mut(&request.importer)
     {
-        let kind = deps
-            .get(&request.name)
-            .map_or(Kind::Prod, |declared| declared.kind);
+        let kind = request.kind.unwrap_or_else(|| {
+            deps.get(&request.name)
+                .map_or(Kind::Prod, |declared| declared.kind)
+        });
         deps.insert(
             request.name.clone(),
             Declared {
@@ -479,6 +495,11 @@ fn record_for(request: &Request, graph: &ResolvedGraph, workspace: &Workspace) -
         name: request.name.clone(),
         specifier,
         version,
+        // Whatever the graph carries: the request's own section where it named
+        // one, the manifest's where it did not, and — on the reused path,
+        // where neither was folded in — the lockfile's, which is the
+        // manifest's by the definition of having been reusable at all.
+        kind: resolved.kind,
     }
 }
 
@@ -486,6 +507,12 @@ fn record_for(request: &Request, graph: &ResolvedGraph, workspace: &Workspace) -
 ///
 /// A thin shell over `sync`: turn the command's spec into a request, let the
 /// sync do the work, then record the result.
+///
+/// `kind` is the section the command asked for — `Some(Kind::Dev)` for
+/// `--save-dev`, and `None` where it asked for none, which leaves the section
+/// to whatever the manifest already says. Nothing here works that out: the
+/// answer comes back in `Recorded`, decided once inside the sync, where what
+/// each manifest declares has already been gathered.
 ///
 /// Ordering is deliberate and unchanged. The manifest write is last, so a
 /// failure anywhere leaves at worst an installed-but-unrecorded package —
@@ -497,11 +524,13 @@ pub fn install(
     store: &Store,
     registry: &dyn RegistryClient,
     spec: &PackageSpec,
+    kind: Option<Kind>,
 ) -> Result<Installed, InstallError> {
     let request = Request {
         importer: importer.clone(),
         name: spec.name.clone(),
         seed: spec.version.clone(),
+        kind,
     };
 
     let outcome = sync(workspace, store, registry, Some(&request))?;
@@ -515,7 +544,7 @@ pub fn install(
 
     // Last: never record something that is not already true on disk.
     let mut manifest = Manifest::load(&target.path)?;
-    manifest.add_dependency(&recorded.name, &recorded.specifier);
+    manifest.add_dependency(&recorded.name, &recorded.specifier, recorded.kind);
     manifest.save()?;
 
     Ok(Installed {
@@ -557,6 +586,10 @@ fn reusable_importers(
 /// question being asked — `jerky install lodash@4.18.0` against a lockfile
 /// holding 4.17.21 is a new request, not a no-op.
 ///
+/// Two axes, and the same two the lockfile records: the version asked for and
+/// the section asked for. Either one differing from what was recorded is a
+/// real request.
+///
 /// This is deliberately *not* expressible as folding the request into what the
 /// importer declares and then asking `matches`. A request naming the version
 /// the lockfile already resolved to — `lodash@4.18.0` where the manifest says
@@ -566,6 +599,18 @@ fn already_satisfies(recorded: &Importer, request: &Request) -> bool {
     let Some(dependency) = recorded.dependencies.get(&request.name) else {
         return false;
     };
+
+    // A section is as much of a request as a version is. `--save-dev` on a
+    // package recorded under `dependencies` is answered by no version the
+    // lockfile holds, and reusing the importer would move the manifest entry
+    // while leaving the lockfile describing the section the manifest just
+    // left — the same staleness `Importer::matches` refuses to overlook when
+    // that edit arrives by hand instead. Re-resolving the importer is what
+    // saying so costs; the alternative is a lockfile that disagrees with the
+    // manifest written by the same command.
+    if request.kind.is_some_and(|kind| kind != dependency.kind) {
+        return false;
+    }
 
     match &request.seed {
         // Only the registry can say what `latest` means today, so a bare
