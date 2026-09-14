@@ -4,6 +4,7 @@ use std::process::ExitCode;
 use clap::Parser;
 use jerky::cli::{Cli, Command};
 use jerky::error::JerkyError;
+use jerky::linker::{Unowned, UnownedReason};
 use jerky::resolver::{ImporterPath, Kind};
 use jerky::workspace::{Warning, Workspace};
 
@@ -68,17 +69,19 @@ fn run(cli: Cli) -> Result<(), JerkyError> {
                     // install reads the section off the manifest for the
                     // first, and would overwrite it for the second.
                     let kind = save_dev.then_some(Kind::Dev);
-                    let installed = jerky::commands::install::install(
+                    let outcome = jerky::commands::install::install(
                         &workspace, &importer, &store, &registry, &spec, kind,
                     )?;
-                    println!(
-                        "added {}@{} to {importer}",
-                        installed.name, installed.version
-                    );
+                    report_unowned(&outcome.left_alone);
+                    let added = outcome
+                        .recorded
+                        .expect("an install always reports what it recorded");
+                    println!("added {}@{} to {importer}", added.name, added.version);
                 }
                 None => {
                     let outcome =
                         jerky::commands::install::sync(&workspace, &store, &registry, None)?;
+                    report_unowned(&outcome.left_alone);
                     // The packages, not the links: two importers on one version
                     // share a store entry, and reporting the link count would
                     // make the same install read differently in a monorepo.
@@ -90,6 +93,29 @@ fn run(cli: Cli) -> Result<(), JerkyError> {
                 }
             }
             Ok(())
+        }
+    }
+}
+
+/// Say what convergence found in a `node_modules` and did not remove.
+///
+/// Warnings rather than failures, and written here rather than in the linker
+/// for the same reason `Warning::PatternMatchedNothing` is: the module knows
+/// what it found, and this is the layer that knows the user is reading a
+/// terminal. An install that stopped on a directory a previous `npm install`
+/// left behind would make the first jerky run in a half-migrated repository a
+/// thing to be afraid of; one that said nothing would leave the user wondering
+/// why a package they can still `require` is in no lockfile.
+fn report_unowned(entries: &[Unowned]) {
+    for entry in entries {
+        let path = entry.path.display();
+        match entry.reason {
+            UnownedReason::NotASymlink => {
+                eprintln!("warning: left {path} alone — jerky did not create it");
+            }
+            UnownedReason::PointsOutside => {
+                eprintln!("warning: left {path} alone — it links outside this workspace");
+            }
         }
     }
 }

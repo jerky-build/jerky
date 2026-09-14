@@ -70,6 +70,32 @@ have to be kept in agreement with it forever.
 **Nothing is recorded that is not already true on disk.** The manifest and the
 lockfile are both written after every package is linked.
 
+**Nothing stays on disk that is no longer recorded.** The converse, and the
+half that makes the first one more than permission to leave things lying
+around. Every install converges each importer's `node_modules` and prunes the
+virtual store, so a dependency dropped from a `package.json` loses its link
+and its unpacked tree. Without it the link still resolves, so `require` goes
+on finding a package the project no longer declares and the tree quietly
+disagrees with the manifest — the exact drift a lockfile that is pruned on
+every write exists to prevent, applied to disk.
+
+**Convergence removes only what it can prove jerky wrote.** A symlink whose
+target, normalized lexically, lands in the virtual store or on a member. A real
+directory a previous `npm install` left, or a link into someone's `npm link`
+checkout, is reported and kept: the failure on that side is deleting a user's
+files, which is worse than leaving some. Lexical rather than `canonicalize`,
+which fails on a dangling link and would make a broken link of jerky's own
+making permanent. The one non-symlink it removes is a scope directory it
+emptied itself, which it removes only because it has just taken the last
+package out — an `@foo` that was already empty on arrival is someone else's and
+stays.
+
+The virtual store under `node_modules/.jerky` is the deliberate exemption:
+everything in it was written by `populate_virtual_store`, so ownership there is
+settled by location and the pruner removes whatever the graph no longer names
+without asking about link targets. The rule is about an importer's
+`node_modules`, where jerky and other tools share a directory.
+
 ## Checking them
 
 Every change ends with all three of these passing:

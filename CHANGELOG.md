@@ -93,6 +93,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- `jerky install` is now convergent rather than additive: after it runs, each
+  importer's `node_modules` holds what its manifest declares and nothing else.
+  A dependency you delete from a `package.json` loses its link on the next
+  install, and its unpacked tree under `node_modules/.jerky` goes with it.
+  Previously the link survived and still resolved, so `require` kept finding a
+  package the project no longer declared
+  ([#56](https://github.com/jerky-build/jerky/issues/56)).
+- Only what jerky can prove it wrote is removed — a symlink pointing into this
+  workspace's virtual store or at one of its members. A real directory left by
+  a previous `npm install`, or a symlink into an `npm link` checkout, is left
+  exactly where it is and reported as a warning naming the path. The first
+  `jerky install` in a repository that has seen npm is not a destructive
+  surprise. The machine-global content store under `~/.jerky/store` is never
+  touched: it is shared by every project on the machine, so nothing
+  project-local gets to decide one of its entries is dead.
 - Two importers wanting the same version now share one store entry and one
   directory in the virtual store, which is why the store lives at the
   workspace root. Importers wanting different versions each get their own;
