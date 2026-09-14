@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use jerky::cli::{PackageSpec, VersionSpec};
-use jerky::commands::install::{InstallError, Outcome, Recorded, Request, install, sync};
+use jerky::commands::install::{InstallError, Mode, Outcome, Recorded, Request, install, sync};
 use jerky::linker::{Unowned, UnownedReason};
 use jerky::resolver::{ImporterPath, Kind, ResolveError};
 use jerky::store::Store;
@@ -1392,6 +1392,7 @@ fn a_sync_with_no_request_installs_what_the_manifests_declare() {
         &store,
         &registry,
         None::<&Request>,
+        Mode::Develop,
     )
     .unwrap();
 
@@ -1439,6 +1440,7 @@ fn a_members_dev_dependencies_are_installed() {
         &store,
         &registry,
         None::<&Request>,
+        Mode::Develop,
     )
     .unwrap();
 
@@ -1473,6 +1475,7 @@ fn every_importers_dev_dependencies_are_followed_not_only_the_roots() {
         &store,
         &registry,
         None::<&Request>,
+        Mode::Develop,
     )
     .unwrap();
 
@@ -1514,6 +1517,7 @@ fn moving_a_dependency_between_sections_makes_its_importer_stale() {
         &store,
         &registry,
         None::<&Request>,
+        Mode::Develop,
     )
     .unwrap();
     assert_eq!(registry.packument_calls_for("lodash"), 1);
@@ -1529,6 +1533,7 @@ fn moving_a_dependency_between_sections_makes_its_importer_stale() {
         &store,
         &registry,
         None::<&Request>,
+        Mode::Develop,
     )
     .unwrap();
 
@@ -1575,6 +1580,7 @@ fn a_name_in_both_sections_resolves_as_a_production_dependency() {
         &store,
         &registry,
         None::<&Request>,
+        Mode::Develop,
     )
     .unwrap();
 
@@ -1622,6 +1628,7 @@ fn installing_a_dev_dependency_at_its_locked_version_does_not_duplicate_it() {
         &store,
         &registry,
         None::<&Request>,
+        Mode::Develop,
     )
     .unwrap();
 
@@ -1715,6 +1722,7 @@ fn installing_a_new_version_of_a_dev_dependency_keeps_it_a_dev_dependency() {
         &store,
         &registry,
         None::<&Request>,
+        Mode::Develop,
     )
     .unwrap();
 
@@ -1880,6 +1888,7 @@ fn save_dev_moves_an_entry_the_lockfile_already_satisfies() {
         &store,
         &registry,
         None::<&Request>,
+        Mode::Develop,
     )
     .unwrap();
 
@@ -1932,6 +1941,7 @@ fn a_matching_lockfile_makes_no_registry_calls_for_dev_dependencies_either() {
         &store,
         &registry,
         None::<&Request>,
+        Mode::Develop,
     )
     .unwrap();
     assert!(registry.packument_calls() > 0, "the first install resolves");
@@ -1944,6 +1954,7 @@ fn a_matching_lockfile_makes_no_registry_calls_for_dev_dependencies_either() {
         &store,
         &registry,
         None::<&Request>,
+        Mode::Develop,
     )
     .unwrap();
 
@@ -1994,6 +2005,7 @@ fn a_bare_install_installs_everything_the_manifests_declare() {
         &store,
         &registry,
         None::<&Request>,
+        Mode::Develop,
     )
     .unwrap();
 
@@ -2056,6 +2068,7 @@ fn a_bare_install_covers_every_importer_whatever_the_cwd() {
         &store,
         &registry,
         None::<&Request>,
+        Mode::Develop,
     )
     .unwrap();
 
@@ -2102,6 +2115,7 @@ fn a_bare_install_with_a_matching_lockfile_makes_no_registry_calls() {
         &store,
         &fixtures(),
         None::<&Request>,
+        Mode::Develop,
     )
     .unwrap();
 
@@ -2111,6 +2125,7 @@ fn a_bare_install_with_a_matching_lockfile_makes_no_registry_calls() {
         &store,
         &registry,
         None::<&Request>,
+        Mode::Develop,
     )
     .unwrap();
 
@@ -2166,6 +2181,7 @@ fn a_bare_install_with_no_lockfile_resolves_from_scratch() {
         &store,
         &registry,
         None::<&Request>,
+        Mode::Develop,
     )
     .unwrap();
 
@@ -2228,6 +2244,7 @@ fn a_bare_install_from_a_directory_belonging_to_no_member_still_works() {
         &store,
         &registry,
         None::<&Request>,
+        Mode::Develop,
     )
     .unwrap();
 
@@ -2290,6 +2307,7 @@ fn bare_install(root: &Path, store: &Store, registry: &FixtureRegistry) -> Outco
         store,
         registry,
         None::<&Request>,
+        Mode::Develop,
     )
     .unwrap()
 }
@@ -2483,4 +2501,361 @@ fn the_content_store_is_never_touched() {
         stored(),
         "convergence reached into the machine-global content store"
     );
+}
+
+// --- `jerky install --production` -------------------------------------------
+
+/// A two-importer workspace where each importer declares one of each kind.
+///
+/// Two importers throughout, because `--production` acts on all of them at
+/// once and a suite that only ever saw `.` could not catch a mode applied to
+/// one importer and not the next. Each has a devDependency so that "installs
+/// `dependencies` only" is a claim with something to be false about.
+fn production_workspace(root: &Path) -> FixtureRegistry {
+    write_manifest(
+        root,
+        r#"{"name":"ws","workspaces":["packages/*"],"dependencies":{"alpha":"1.0.0"},"devDependencies":{"dev-root":"3.0.0"}}"#,
+    );
+    write_manifest(
+        &root.join("packages/ui"),
+        r#"{"name":"ui","dependencies":{"beta":"2.0.0"},"devDependencies":{"dev-ui":"4.0.0"}}"#,
+    );
+
+    FixtureRegistry::new().with_tree(&[
+        ("alpha", "1.0.0", &[]),
+        ("beta", "2.0.0", &[]),
+        ("dev-root", "3.0.0", &[]),
+        ("dev-ui", "4.0.0", &[]),
+    ])
+}
+
+fn production_install(
+    root: &Path,
+    store: &Store,
+    registry: &FixtureRegistry,
+) -> Result<Outcome, InstallError> {
+    sync(
+        &Workspace::discover(root).unwrap(),
+        store,
+        registry,
+        None::<&Request>,
+        Mode::Production,
+    )
+}
+
+#[test]
+fn production_installs_dependencies_and_not_dev_dependencies() {
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let store = Store::new(home.path().join("store"));
+    let registry = production_workspace(root);
+
+    bare_install(root, &store, &registry);
+    std::fs::remove_dir_all(root.join("node_modules")).unwrap();
+
+    production_install(root, &store, &registry).unwrap();
+
+    assert_eq!(linked_version(root, "alpha"), "1.0.0");
+    assert_eq!(linked_version(&root.join("packages/ui"), "beta"), "2.0.0");
+    assert!(
+        !still_there(&root.join("node_modules/dev-root")),
+        "the root's devDependency was linked by a production install"
+    );
+    assert!(
+        !still_there(&root.join("packages/ui/node_modules/dev-ui")),
+        "a member's devDependency was linked by a production install"
+    );
+}
+
+#[test]
+fn production_removes_dev_dependency_links_that_are_already_there() {
+    // Convergence is not selectively applied. A `node_modules` that has seen a
+    // normal install is not left half-production, because the mode describes
+    // the tree jerky guarantees rather than the work it happens to do.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let store = Store::new(home.path().join("store"));
+    let registry = production_workspace(root);
+
+    bare_install(root, &store, &registry);
+    assert!(still_there(&root.join("node_modules/dev-root")));
+    assert!(still_there(&root.join("packages/ui/node_modules/dev-ui")));
+
+    production_install(root, &store, &registry).unwrap();
+
+    assert!(
+        !still_there(&root.join("node_modules/dev-root")),
+        "a devDependency link survived a production install"
+    );
+    assert!(
+        !still_there(&root.join("packages/ui/node_modules/dev-ui")),
+        "a member's devDependency link survived a production install"
+    );
+    assert_eq!(linked_version(root, "alpha"), "1.0.0");
+    assert_eq!(linked_version(&root.join("packages/ui"), "beta"), "2.0.0");
+}
+
+#[test]
+fn production_leaves_the_lockfile_byte_identical() {
+    // Asserted on bytes, because bytes are the actual guarantee. A run that
+    // rewrote the file it exists to reproduce would be the bug, and a
+    // structural comparison would not notice a reordering or a reformat.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let store = Store::new(home.path().join("store"));
+    let registry = production_workspace(root);
+
+    bare_install(root, &store, &registry);
+    let before = std::fs::read(root.join("jerky-lock.json")).unwrap();
+
+    production_install(root, &store, &registry).unwrap();
+
+    let after = std::fs::read(root.join("jerky-lock.json")).unwrap();
+    assert_eq!(
+        before, after,
+        "`--production` rewrote the lockfile it exists to reproduce"
+    );
+}
+
+#[test]
+fn production_without_a_lockfile_errors() {
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    // Canonical, because the error names a path and this test compares it
+    // against one built here. See `workspace_root`.
+    let root = &workspace_root(&work);
+    let store = Store::new(home.path().join("store"));
+    let registry = production_workspace(root);
+
+    let err = production_install(root, &store, &registry)
+        .expect_err("a production install has nothing to reproduce without a lockfile");
+
+    let InstallError::ProductionLockfileMissing { path } = err else {
+        panic!("expected ProductionLockfileMissing, got {err}");
+    };
+    assert_eq!(path, root.join("jerky-lock.json"));
+}
+
+#[test]
+fn production_against_an_edited_manifest_errors_and_writes_nothing() {
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let store = Store::new(home.path().join("store"));
+    let registry = production_workspace(root);
+
+    bare_install(root, &store, &registry);
+    let lockfile_before = std::fs::read(root.join("jerky-lock.json")).unwrap();
+    std::fs::remove_dir_all(root.join("node_modules")).unwrap();
+
+    // A dependency bumped in the manifest and never reinstalled.
+    write_manifest(
+        &root.join("packages/ui"),
+        r#"{"name":"ui","dependencies":{"beta":"2.5.0"},"devDependencies":{"dev-ui":"4.0.0"}}"#,
+    );
+
+    let err = production_install(root, &store, &registry)
+        .expect_err("the lockfile no longer describes what packages/ui declares");
+
+    let InstallError::ProductionLockfileStale {
+        importer,
+        name,
+        declared,
+        locked,
+    } = err
+    else {
+        panic!("expected ProductionLockfileStale, got {err}");
+    };
+    assert_eq!(importer, "packages/ui");
+    assert_eq!(name, "beta");
+    assert!(declared.contains("2.5.0"), "declared was {declared}");
+    assert!(locked.contains("2.0.0"), "locked was {locked}");
+
+    assert_eq!(
+        std::fs::read(root.join("jerky-lock.json")).unwrap(),
+        lockfile_before,
+        "a refused production install rewrote the lockfile"
+    );
+    assert!(
+        !still_there(&root.join("node_modules")),
+        "a refused production install linked part of the tree anyway"
+    );
+}
+
+#[test]
+fn production_fails_on_a_stale_dev_dependency_too() {
+    // Even though no devDependency would have been linked. Ignoring it would
+    // let CI pass on a lockfile that is genuinely out of date, which is the one
+    // thing this mode exists to refuse.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let store = Store::new(home.path().join("store"));
+    let registry = production_workspace(root);
+
+    bare_install(root, &store, &registry);
+
+    write_manifest(
+        &root.join("packages/ui"),
+        r#"{"name":"ui","dependencies":{"beta":"2.0.0"},"devDependencies":{"dev-ui":"4.5.0"}}"#,
+    );
+
+    let err = production_install(root, &store, &registry)
+        .expect_err("a stale devDependency is still a stale lockfile");
+
+    let InstallError::ProductionLockfileStale { name, .. } = err else {
+        panic!("expected ProductionLockfileStale, got {err}");
+    };
+    assert_eq!(name, "dev-ui");
+}
+
+#[test]
+fn production_makes_no_metadata_requests() {
+    // With every importer reusable there is nothing to resolve, so the only
+    // traffic is tarballs the store does not already hold. Counted, because the
+    // resolved graph is identical either way and only the count can tell the
+    // paths apart.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let store = Store::new(home.path().join("store"));
+    let registry = production_workspace(root);
+
+    bare_install(root, &store, &registry);
+    std::fs::remove_dir_all(root.join("node_modules")).unwrap();
+    let metadata_before = registry.metadata_calls();
+    let packuments_before = registry.packument_calls();
+
+    production_install(root, &store, &registry).unwrap();
+
+    assert_eq!(
+        registry.metadata_calls(),
+        metadata_before,
+        "a production install asked the registry about a version"
+    );
+    assert_eq!(
+        registry.packument_calls(),
+        packuments_before,
+        "a production install fetched a packument"
+    );
+}
+
+#[test]
+fn production_fails_on_a_dependency_deleted_from_the_manifest() {
+    // Staleness from the far side: the manifest dropped a dependency the
+    // lockfile still records. Nothing would have been linked for it, and a
+    // check that only walked the manifest would never look at it — but the
+    // lockfile no longer describes the project, which is the whole question
+    // `--production` asks before it does anything.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let store = Store::new(home.path().join("store"));
+    let registry = production_workspace(root);
+
+    bare_install(root, &store, &registry);
+
+    write_manifest(
+        &root.join("packages/ui"),
+        r#"{"name":"ui","devDependencies":{"dev-ui":"4.0.0"}}"#,
+    );
+
+    let err = production_install(root, &store, &registry)
+        .expect_err("the lockfile records a dependency packages/ui no longer declares");
+
+    let InstallError::ProductionLockfileStale {
+        importer,
+        name,
+        declared,
+        locked,
+    } = err
+    else {
+        panic!("expected ProductionLockfileStale, got {err}");
+    };
+    assert_eq!(importer, "packages/ui");
+    assert_eq!(name, "beta");
+    assert_eq!(declared, "nothing");
+    assert!(locked.contains("2.0.0"), "locked was {locked}");
+}
+
+#[test]
+fn production_names_the_section_when_only_the_section_moved() {
+    // A dependency moved between sections at an unchanged specifier is a real
+    // edit. An error printing specifiers alone would read as `4.0.0`
+    // disagreeing with `4.0.0`, which tells the user nothing.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let store = Store::new(home.path().join("store"));
+    let registry = production_workspace(root);
+
+    bare_install(root, &store, &registry);
+
+    write_manifest(
+        &root.join("packages/ui"),
+        r#"{"name":"ui","dependencies":{"beta":"2.0.0","dev-ui":"4.0.0"}}"#,
+    );
+
+    let err = production_install(root, &store, &registry)
+        .expect_err("dev-ui moved sections without its specifier changing");
+
+    let InstallError::ProductionLockfileStale {
+        name,
+        declared,
+        locked,
+        ..
+    } = err
+    else {
+        panic!("expected ProductionLockfileStale, got {err}");
+    };
+    assert_eq!(name, "dev-ui");
+    assert_eq!(declared, "`4.0.0` in dependencies");
+    assert_eq!(locked, "`4.0.0` in devDependencies");
+}
+
+#[test]
+fn production_fails_when_the_lockfile_records_an_importer_the_workspace_lost() {
+    // The mode's own failure in miniature. A member dropped from `workspaces`
+    // and committed without reinstalling leaves a lockfile that `jerky install`
+    // would rewrite — so `--production` reporting success on it is CI passing
+    // on a stale file, which is the one thing this mode exists to refuse.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let store = Store::new(home.path().join("store"));
+    let registry = production_workspace(root);
+
+    bare_install(root, &store, &registry);
+
+    write_manifest(
+        root,
+        r#"{"name":"ws","dependencies":{"alpha":"1.0.0"},"devDependencies":{"dev-root":"3.0.0"}}"#,
+    );
+
+    let err = production_install(root, &store, &registry)
+        .expect_err("the lockfile still records an importer the workspace dropped");
+
+    let InstallError::ProductionLockfileImporterGone { importer } = err else {
+        panic!("expected ProductionLockfileImporterGone, got {err}");
+    };
+    assert_eq!(importer, "packages/ui");
+}
+
+#[test]
+fn production_accepts_a_workspace_whose_importers_all_still_exist() {
+    // The other side of the check above: it must refuse a *dropped* importer
+    // without refusing every ordinary workspace along with it.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let store = Store::new(home.path().join("store"));
+    let registry = production_workspace(root);
+
+    bare_install(root, &store, &registry);
+
+    production_install(root, &store, &registry)
+        .expect("nothing about this workspace changed between the two installs");
 }

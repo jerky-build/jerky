@@ -64,6 +64,55 @@ pub enum InstallError {
         importer: String,
         members: Vec<String>,
     },
+    #[error(
+        "`--production` installs what `{}` records, and there is no lockfile at that path. \
+         Run `jerky install` first and commit the lockfile it writes.",
+        path.display()
+    )]
+    ProductionLockfileMissing { path: PathBuf },
+    #[error(
+        "the lockfile does not match `{importer}`: `{name}` is declared as {declared} but the \
+         lockfile records {locked}. `--production` installs only what the lockfile already \
+         describes, so it refuses a manifest edited without reinstalling — including a \
+         `devDependencies` edit, which would otherwise let CI pass on a lockfile that is \
+         genuinely out of date. Run `jerky install` and commit the updated lockfile."
+    )]
+    ProductionLockfileStale {
+        importer: String,
+        name: String,
+        declared: String,
+        locked: String,
+    },
+    #[error(
+        "the lockfile records `{importer}`, which is no longer a member of this workspace. \
+         `--production` installs only what the lockfile already describes, and this one \
+         describes a project that is gone — `jerky install` would rewrite it. Run it and \
+         commit the updated lockfile."
+    )]
+    ProductionLockfileImporterGone { importer: String },
+}
+
+/// What a sync is for.
+///
+/// The two modes differ in what they are *allowed* to do, not in how much of
+/// the same work they perform, which is why this is a parameter to `sync`
+/// rather than a second function beside it: linking, convergence and pruning
+/// are identical either way, and a copy of them would drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Mode {
+    /// Every kind, every importer. Resolves what is stale and writes the
+    /// lockfile.
+    #[default]
+    Develop,
+    /// `dependencies` only, and a lockfile that must already match every
+    /// manifest. Never writes one.
+    ///
+    /// Requiring the match is what *earns* the read-only property rather than
+    /// enforcing it as a special case: with every importer reusable there is
+    /// nothing to resolve, so there is nothing to write. There is deliberately
+    /// no resolve-then-discard path — a result computed and then thrown away
+    /// invites someone to later "fix" it by saving.
+    Production,
 }
 
 #[derive(Debug, Clone)]
@@ -158,7 +207,14 @@ pub fn sync(
     store: &Store,
     registry: &dyn RegistryClient,
     request: Option<&Request>,
+    mode: Mode,
 ) -> Result<Outcome, InstallError> {
+    debug_assert!(
+        request.is_none() || mode == Mode::Develop,
+        "a production sync reproduces a lockfile and so has nothing to add to it; \
+         the CLI refuses the combination at parse time"
+    );
+
     if let Some(request) = request {
         // Before anything is looked up or written. A request that rules
         // nothing out is refused rather than pinned, because either reading of
@@ -213,6 +269,22 @@ pub fn sync(
     // single block of ranges: editing `apps/web` must not invalidate what the
     // root already resolved.
     let locked = lockfile::load(workspace.root())?;
+
+    // Before the store is touched and before a single link is written, so a
+    // refusal leaves the tree exactly as it was found. Everything below this
+    // point assumes the lockfile answers for every importer, which is what
+    // makes the production path resolve nothing and write nothing.
+    if mode == Mode::Production {
+        let Some(locked) = locked.as_ref() else {
+            return Err(InstallError::ProductionLockfileMissing {
+                path: workspace.root().join(lockfile::LOCKFILE_NAME),
+            });
+        };
+        if let Some(stale) = first_disagreement(locked, &declared) {
+            return Err(stale);
+        }
+    }
+
     let reused = reusable_importers(locked.as_ref(), &declared, request);
 
     // Kept past the point where `locked` is consumed into the graph. When an
@@ -279,6 +351,23 @@ pub fn sync(
             .reachable()
         }
     };
+
+    // `dependencies` only, which is the whole of what a production install
+    // differs by. Dropping the edges and recomputing reachability is enough:
+    // `reachable` keeps a package while some importer still leads to it, so a
+    // package only a devDependency wanted falls out on its own and nothing
+    // below here has to reason about kinds a second time. Convergence and the
+    // virtual store prune then follow the graph as they always do, which is
+    // why `--production` *removes* devDependency links rather than merely
+    // declining to write them.
+    if mode == Mode::Production {
+        for importer in graph.importers.values_mut() {
+            importer
+                .dependencies
+                .retain(|_, dep| dep.kind == Kind::Prod);
+        }
+        graph = graph.reachable();
+    }
 
     // The virtual store sits at the workspace root, which is the whole reason
     // two importers on one version share an entry rather than each unpacking
@@ -450,7 +539,14 @@ pub fn sync(
         recorded
     });
 
-    lockfile::save(&graph, workspace.root())?;
+    // Not on the production path, where the lockfile is the input rather than
+    // the output. There is nothing to write even in principle — every importer
+    // matched, so re-serializing would reproduce the same bytes — and saying so
+    // with a branch rather than relying on that is what keeps the guarantee
+    // from depending on serialization being perfectly stable.
+    if mode == Mode::Develop {
+        lockfile::save(&graph, workspace.root())?;
+    }
 
     Ok(Outcome {
         linked: graph
@@ -464,6 +560,107 @@ pub fn sync(
         left_alone,
         recorded,
     })
+}
+
+/// The first place the lockfile and the manifests disagree, as the error to
+/// raise for it.
+///
+/// Deliberately reports *one* dependency rather than a count or a list. The
+/// failure this guards is a manifest edited without reinstalling, so what the
+/// user needs is the edit — naming it, and both values, turns "your lockfile is
+/// stale" into something they can act on without a diff.
+///
+/// The walk is over both kinds, not only the ones a production install would
+/// link. A stale `devDependencies` block means the lockfile is genuinely out of
+/// date, and a mode that overlooked it would let CI pass on exactly the file it
+/// exists to verify.
+///
+/// An importer absent from the lockfile is read as one that records nothing,
+/// so a member added to `workspaces` without reinstalling reports its first
+/// dependency as unrecorded rather than needing a shape of its own. Both maps
+/// are `BTreeMap`s, so which disagreement comes first is a property of the
+/// names rather than of iteration luck.
+fn first_disagreement(
+    locked: &ResolvedGraph,
+    declared: &BTreeMap<ImporterPath, BTreeMap<String, Declared>>,
+) -> Option<InstallError> {
+    let empty = Importer::default();
+
+    for (path, manifest_declares) in declared {
+        let recorded = locked.importers.get(path).unwrap_or(&empty);
+
+        for (name, declared) in manifest_declares {
+            let disagrees = match recorded.dependencies.get(name) {
+                None => true,
+                Some(dependency) => {
+                    dependency.specifier != declared.specifier || dependency.kind != declared.kind
+                }
+            };
+            if disagrees {
+                return Some(InstallError::ProductionLockfileStale {
+                    importer: path.to_string(),
+                    name: name.clone(),
+                    declared: describe_declared(&declared.specifier, declared.kind),
+                    locked: recorded.dependencies.get(name).map_or_else(
+                        || "nothing".to_string(),
+                        |dependency| describe_declared(&dependency.specifier, dependency.kind),
+                    ),
+                });
+            }
+        }
+
+        // The other direction: a dependency deleted from the manifest lingers
+        // in the lockfile, which is the same staleness seen from the far side.
+        if let Some((name, dependency)) = recorded
+            .dependencies
+            .iter()
+            .find(|(name, _)| !manifest_declares.contains_key(*name))
+        {
+            return Some(InstallError::ProductionLockfileStale {
+                importer: path.to_string(),
+                name: name.clone(),
+                declared: "nothing".to_string(),
+                locked: describe_declared(&dependency.specifier, dependency.kind),
+            });
+        }
+    }
+
+    // And the same question one level up: a whole importer the lockfile
+    // records that the workspace no longer has, from a member dropped out of
+    // `workspaces` or a directory deleted. Nothing above can see it, because
+    // the walk is driven by what the manifests declare and this importer is
+    // exactly the one none of them do. Left unchecked it is the mode's own
+    // failure in miniature — `--production` would report success on a lockfile
+    // that `jerky install` rewrites, which is the CI-passes-on-a-stale-file
+    // case the whole mode exists to refuse.
+    //
+    // Reported after the per-dependency walk, so the more specific message
+    // wins when a repository manages both at once.
+    if let Some(path) = locked
+        .importers
+        .keys()
+        .find(|path| !declared.contains_key(*path))
+    {
+        return Some(InstallError::ProductionLockfileImporterGone {
+            importer: path.to_string(),
+        });
+    }
+
+    None
+}
+
+/// `` `^4.0.0` in dependencies `` — a specifier is not enough on its own.
+///
+/// A dependency moved between sections at an unchanged specifier is a real
+/// edit and a real staleness, and an error that printed only the specifier
+/// would read as `^4.0.0` disagreeing with `^4.0.0`.
+///
+/// The section name comes from `manifest`, which already owns that mapping,
+/// rather than being spelled again here: `docs/agents/invariants.md` counts
+/// the modules where these names appear, and a label is not a good enough
+/// reason to become a third.
+fn describe_declared(specifier: &str, kind: Kind) -> String {
+    format!("`{specifier}` in {}", crate::manifest::section_for(kind))
 }
 
 /// Everything one member declares, both sections in one map.
@@ -590,7 +787,7 @@ pub fn install(
         kind,
     };
 
-    let outcome = sync(workspace, store, registry, Some(&request))?;
+    let outcome = sync(workspace, store, registry, Some(&request), Mode::Develop)?;
     let recorded = outcome
         .recorded
         .as_ref()
