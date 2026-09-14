@@ -65,6 +65,34 @@ come from a manifest; both can name a directory outside the workspace, and
 neither may. `ImporterPath` owns this question — a second rule elsewhere would
 have to be kept in agreement with it forever.
 
+**A tar header chooses the bytes, never the permissions.** Exactly one bit of
+an entry's recorded mode reaches disk — owner-execute, which marks a CLI entry
+point — and everything else is replaced: files become `0o644` or `0o755`,
+directories `0o755`. The reason to replace rather than mask is the store. It is
+machine-global and hard-linked into every project, so an entry carries one set
+of permissions shared by all of them at once; a group- or world-writable file
+there is writable in every project simultaneously, and rewriting it changes
+what all of them import.
+
+Two things about this are easy to get wrong, and both were got wrong once:
+
+- **Whether an entry is a directory is read from the filesystem, not from the
+  type flag.** `tar` honours an old BSD rule that makes a non-ustar entry whose
+  name ends in `/` a directory while its flag still says `Regular`. Trusting
+  the flag puts that directory at `0o644`, which cannot be entered.
+- **Directories jerky creates itself are covered too.** `create_dir_all` takes
+  its mode from the process umask, so the parents `extract` fills in, the
+  staging directory the store renames into place, and the tree the linker
+  recreates inside a project are all `0o777` under a permissive umask unless
+  set explicitly. Normalising only what a tarball named leaves the file rule
+  intact and this open, and a writable directory in the store lets another user
+  add entries to a package every project imports.
+
+The setuid and setgid bits are dropped by `tar::Entry::unpack` before any of
+this runs, since `preserve_permissions` defaults to false. That is the tar
+crate's behaviour and not jerky's, so it is pinned by a test rather than relied
+upon — a crate bump would otherwise reopen it in silence.
+
 ## Writing to disk
 
 **Nothing is recorded that is not already true on disk.** The manifest and the
@@ -122,5 +150,12 @@ Then, against the diff:
   for it above all, is the bug this rule exists to prevent.
 - At least one test exercises more than one importer. A suite that only ever
   sees `.` is not testing workspaces.
+- No `create_dir`, `create_dir_all` or `unpack` writes a path that reaches the
+  store or a project without an explicit mode set after it. Run the suite under
+  `umask 0` as well as the default — a strict umask hides every directory-mode
+  hole, so the usual run proves nothing about them.
+- No `#[cfg(windows)]` or `#[cfg(not(unix))]`. jerky targets WSL, Linux and
+  macOS; a fallback for a platform nothing runs on is a second definition to
+  keep in agreement with the first, for nobody.
 - Any user-visible behaviour change is noted in `CHANGELOG.md`, under
   `## [Unreleased]`.
