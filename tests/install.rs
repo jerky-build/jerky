@@ -1681,3 +1681,286 @@ fn a_matching_lockfile_makes_no_registry_calls_for_dev_dependencies_either() {
     );
     assert_eq!(registry.metadata_calls(), before_metadata);
 }
+
+#[test]
+fn a_bare_install_installs_everything_the_manifests_declare() {
+    // The post-clone command. Three importers, each declaring a different
+    // package, none of them installed. The root declares one too, because a
+    // root holding nothing but `workspaces` is not the shape of a real
+    // monorepo and would leave the root importer untested.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    write_manifest(
+        root,
+        r#"{"name":"ws","workspaces":["packages/*"],"dependencies":{"alpha":"1.0.0"}}"#,
+    );
+    write_manifest(
+        &root.join("packages/ui"),
+        r#"{"name":"ui","dependencies":{"lodash":"4.17.21"}}"#,
+    );
+    write_manifest(
+        &root.join("packages/api"),
+        r#"{"name":"api","dependencies":{"beta":"2.0.0"}}"#,
+    );
+    let manifests = || -> Vec<String> {
+        ["", "packages/ui", "packages/api"]
+            .iter()
+            .map(|dir| std::fs::read_to_string(root.join(dir).join("package.json")).unwrap())
+            .collect()
+    };
+    let before = manifests();
+
+    let store = Store::new(home.path().join("store"));
+    let registry = FixtureRegistry::new()
+        .with_packument("lodash", &[("4.17.21", &[])])
+        .with_tree(&[("alpha", "1.0.0", &[]), ("beta", "2.0.0", &[])]);
+
+    let outcome = sync(
+        &Workspace::discover(root).unwrap(),
+        &store,
+        &registry,
+        None::<&Request>,
+    )
+    .unwrap();
+
+    assert_eq!(linked_version(root, "alpha"), "1.0.0");
+    assert_eq!(
+        linked_version(&root.join("packages/ui"), "lodash"),
+        "4.17.21"
+    );
+    assert_eq!(linked_version(&root.join("packages/api"), "beta"), "2.0.0");
+
+    let mut linked: Vec<String> = outcome
+        .linked
+        .iter()
+        .map(|installed| format!("{}@{}", installed.name, installed.version))
+        .collect();
+    linked.sort();
+    assert_eq!(linked, vec!["alpha@1.0.0", "beta@2.0.0", "lodash@4.17.21"]);
+
+    // Nothing was requested, so nothing is recorded — and no manifest is
+    // rewritten. A bare install answers the question the manifests already
+    // ask; one that edited them on the way would be changing the question.
+    assert!(outcome.recorded.is_none());
+    assert_eq!(before, manifests(), "a bare install rewrote a package.json");
+}
+
+#[test]
+fn a_bare_install_covers_every_importer_whatever_the_cwd() {
+    // Standing in `packages/ui` and linking only `packages/ui` would write a
+    // lockfile describing a root `node_modules` that does not exist — against
+    // *nothing is recorded that is not already true on disk*. The cwd reaches
+    // an install only through `find_root`, so this asks it the question
+    // `main.rs` asks from that directory and syncs what comes back.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    write_manifest(
+        root,
+        r#"{"name":"ws","workspaces":["packages/*"],"dependencies":{"alpha":"1.0.0"}}"#,
+    );
+    write_manifest(
+        &root.join("packages/ui"),
+        r#"{"name":"ui","dependencies":{"lodash":"4.17.21"}}"#,
+    );
+
+    let cwd = root.join("packages/ui");
+    let found = Workspace::find_root(&cwd).expect("the root manifest sits above packages/ui");
+    assert_eq!(
+        found,
+        root.canonicalize().unwrap(),
+        "a member's own manifest stopped the walk"
+    );
+
+    let store = Store::new(home.path().join("store"));
+    let registry = FixtureRegistry::new()
+        .with_packument("lodash", &[("4.17.21", &[])])
+        .with_tree(&[("alpha", "1.0.0", &[])]);
+
+    sync(
+        &Workspace::discover(&found).unwrap(),
+        &store,
+        &registry,
+        None::<&Request>,
+    )
+    .unwrap();
+
+    assert_eq!(linked_version(&cwd, "lodash"), "4.17.21");
+    assert_eq!(
+        linked_version(root, "alpha"),
+        "1.0.0",
+        "the importer the user was not standing in was left unlinked"
+    );
+
+    let lock = read_json(&root.join("jerky-lock.json"));
+    assert!(lock["importers"]["."]["dependencies"]["alpha"].is_object());
+    assert!(lock["importers"]["packages/ui"]["dependencies"]["lodash"].is_object());
+}
+
+#[test]
+fn a_bare_install_with_a_matching_lockfile_makes_no_registry_calls() {
+    // The resolved graph is identical either way, so only the call count can
+    // tell reuse from a re-resolution that happened to agree. The second run
+    // gets a fresh registry holding the same packages: had it asked, the ask
+    // would have succeeded and been counted, rather than failing for an
+    // unrelated reason.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    write_manifest(
+        root,
+        r#"{"name":"ws","workspaces":["packages/*"],"dependencies":{"alpha":"1.0.0"}}"#,
+    );
+    write_manifest(
+        &root.join("packages/ui"),
+        r#"{"name":"ui","dependencies":{"lodash":"4.17.21"}}"#,
+    );
+
+    let store = Store::new(home.path().join("store"));
+    let fixtures = || {
+        FixtureRegistry::new()
+            .with_packument("lodash", &[("4.17.21", &[])])
+            .with_tree(&[("alpha", "1.0.0", &[])])
+    };
+
+    sync(
+        &Workspace::discover(root).unwrap(),
+        &store,
+        &fixtures(),
+        None::<&Request>,
+    )
+    .unwrap();
+
+    let registry = fixtures();
+    sync(
+        &Workspace::discover(root).unwrap(),
+        &store,
+        &registry,
+        None::<&Request>,
+    )
+    .unwrap();
+
+    assert_eq!(
+        registry.packument_calls(),
+        0,
+        "a matching lockfile still asked the registry for a version list"
+    );
+    assert_eq!(
+        registry.metadata_calls(),
+        0,
+        "a matching lockfile still asked the registry for version metadata"
+    );
+    assert_eq!(
+        registry.tarball_calls(),
+        0,
+        "bytes the store already holds were downloaded again"
+    );
+    assert_eq!(linked_version(root, "alpha"), "1.0.0");
+    assert_eq!(
+        linked_version(&root.join("packages/ui"), "lodash"),
+        "4.17.21"
+    );
+}
+
+#[test]
+fn a_bare_install_with_no_lockfile_resolves_from_scratch() {
+    // The case the command exists for: `package.json` committed,
+    // `jerky-lock.json` and `node_modules` both absent because neither is.
+    // Ranges rather than pins, since a clone with nothing resolved is exactly
+    // where a range still has to be interpreted.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    write_manifest(
+        root,
+        r#"{"name":"ws","workspaces":["packages/*"],"dependencies":{"alpha":"^1.0.0"}}"#,
+    );
+    write_manifest(
+        &root.join("packages/ui"),
+        r#"{"name":"ui","dependencies":{"lodash":"^4.0.0"}}"#,
+    );
+    assert!(!root.join("jerky-lock.json").exists());
+    assert!(!root.join("node_modules").exists());
+
+    let store = Store::new(home.path().join("store"));
+    let registry = FixtureRegistry::new()
+        .with_packument("lodash", &[("4.17.21", &[])])
+        .with_tree(&[("alpha", "1.0.0", &[])]);
+
+    sync(
+        &Workspace::discover(root).unwrap(),
+        &store,
+        &registry,
+        None::<&Request>,
+    )
+    .unwrap();
+
+    assert!(
+        registry.packument_calls() > 0,
+        "nothing was asked, so the declared ranges were never interpreted"
+    );
+    assert_eq!(linked_version(root, "alpha"), "1.0.0");
+    assert_eq!(
+        linked_version(&root.join("packages/ui"), "lodash"),
+        "4.17.21"
+    );
+
+    // The lockfile now exists, and records the ranges rather than the versions
+    // they chose — which is what lets the next install recognise it as
+    // answered.
+    let lock = read_json(&root.join("jerky-lock.json"));
+    assert_eq!(
+        lock["importers"]["."]["dependencies"]["alpha"]["specifier"],
+        "^1.0.0"
+    );
+    assert_eq!(
+        lock["importers"]["packages/ui"]["dependencies"]["lodash"]["specifier"],
+        "^4.0.0"
+    );
+}
+
+#[test]
+fn a_bare_install_from_a_directory_belonging_to_no_member_still_works() {
+    // `jerky install lodash` in `tools/scripts` is ambiguous and errors —
+    // `importer_for` has its own test for that. A bare install is not
+    // ambiguous: the answer is every importer, so there is no guess to refuse
+    // and nothing above `find_root` to ask.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    write_manifest(root, r#"{"name":"ws","workspaces":["packages/*"]}"#);
+    write_manifest(
+        &root.join("packages/ui"),
+        r#"{"name":"ui","dependencies":{"lodash":"4.17.21"}}"#,
+    );
+    write_manifest(
+        &root.join("packages/api"),
+        r#"{"name":"api","dependencies":{"alpha":"1.0.0"}}"#,
+    );
+    let outsider = root.join("tools/scripts");
+    std::fs::create_dir_all(&outsider).unwrap();
+
+    let found = Workspace::find_root(&outsider)
+        .expect("the root manifest sits above a directory belonging to no member");
+    assert_eq!(found, root.canonicalize().unwrap());
+
+    let store = Store::new(home.path().join("store"));
+    let registry = FixtureRegistry::new()
+        .with_packument("lodash", &[("4.17.21", &[])])
+        .with_tree(&[("alpha", "1.0.0", &[])]);
+
+    sync(
+        &Workspace::discover(&found).unwrap(),
+        &store,
+        &registry,
+        None::<&Request>,
+    )
+    .unwrap();
+
+    assert_eq!(
+        linked_version(&root.join("packages/ui"), "lodash"),
+        "4.17.21"
+    );
+    assert_eq!(linked_version(&root.join("packages/api"), "alpha"), "1.0.0");
+}
