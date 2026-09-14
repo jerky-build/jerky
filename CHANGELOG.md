@@ -50,7 +50,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   fails even though no devDependency would have been linked — a mode that
   overlooked that would let CI pass on a lockfile that is genuinely out of
   date. A missing lockfile, or one that disagrees, is an error naming the
-  dependency and both values, raised before anything is linked. Convergence is
+  dependency and both values, raised before anything is linked — as is a
+  lockfile recording an importer the workspace no longer has, from a member
+  dropped out of `workspaces` without reinstalling. Convergence is
   not selectively applied: a `node_modules` from an earlier ordinary install
   has its devDependency links *removed*. `--production` conflicts with a
   package argument and with `--save-dev`, rejected by clap at parse time

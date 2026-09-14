@@ -184,11 +184,21 @@ mod tests {
     }
 
     #[test]
-    fn production_conflicts_with_save_dev() {
+    fn production_and_save_dev_together_are_refused() {
+        // Over-determined, and deliberately named for what it proves rather
+        // than for the constraint it looks like it tests. Every vector that
+        // sets both flags is already refused by the `spec` rules — with a
+        // package, `--production` conflicts with it; without one, `--save-dev`
+        // requires it — so this cannot isolate the `--production`/`--save-dev`
+        // conflict, and a test claiming to would pass with that conflict
+        // deleted. The conflict is declared anyway, because §7 asks for it and
+        // because it is what keeps the combination refused if `--save-dev`
+        // ever gains a meaning without a package.
         assert!(
             Cli::try_parse_from(["jerky", "install", "--production", "--save-dev", "lodash"])
                 .is_err()
         );
+        assert!(Cli::try_parse_from(["jerky", "install", "--production", "--save-dev"]).is_err());
     }
 
     #[test]

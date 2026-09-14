@@ -2813,3 +2813,47 @@ fn production_names_the_section_when_only_the_section_moved() {
     assert_eq!(declared, "`4.0.0` in dependencies");
     assert_eq!(locked, "`4.0.0` in devDependencies");
 }
+
+#[test]
+fn production_fails_when_the_lockfile_records_an_importer_the_workspace_lost() {
+    // The mode's own failure in miniature. A member dropped from `workspaces`
+    // and committed without reinstalling leaves a lockfile that `jerky install`
+    // would rewrite — so `--production` reporting success on it is CI passing
+    // on a stale file, which is the one thing this mode exists to refuse.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let store = Store::new(home.path().join("store"));
+    let registry = production_workspace(root);
+
+    bare_install(root, &store, &registry);
+
+    write_manifest(
+        root,
+        r#"{"name":"ws","dependencies":{"alpha":"1.0.0"},"devDependencies":{"dev-root":"3.0.0"}}"#,
+    );
+
+    let err = production_install(root, &store, &registry)
+        .expect_err("the lockfile still records an importer the workspace dropped");
+
+    let InstallError::ProductionLockfileImporterGone { importer } = err else {
+        panic!("expected ProductionLockfileImporterGone, got {err}");
+    };
+    assert_eq!(importer, "packages/ui");
+}
+
+#[test]
+fn production_accepts_a_workspace_whose_importers_all_still_exist() {
+    // The other side of the check above: it must refuse a *dropped* importer
+    // without refusing every ordinary workspace along with it.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let store = Store::new(home.path().join("store"));
+    let registry = production_workspace(root);
+
+    bare_install(root, &store, &registry);
+
+    production_install(root, &store, &registry)
+        .expect("nothing about this workspace changed between the two installs");
+}

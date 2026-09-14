@@ -83,6 +83,13 @@ pub enum InstallError {
         declared: String,
         locked: String,
     },
+    #[error(
+        "the lockfile records `{importer}`, which is no longer a member of this workspace. \
+         `--production` installs only what the lockfile already describes, and this one \
+         describes a project that is gone — `jerky install` would rewrite it. Run it and \
+         commit the updated lockfile."
+    )]
+    ProductionLockfileImporterGone { importer: String },
 }
 
 /// What a sync is for.
@@ -616,6 +623,27 @@ fn first_disagreement(
                 locked: describe_declared(&dependency.specifier, dependency.kind),
             });
         }
+    }
+
+    // And the same question one level up: a whole importer the lockfile
+    // records that the workspace no longer has, from a member dropped out of
+    // `workspaces` or a directory deleted. Nothing above can see it, because
+    // the walk is driven by what the manifests declare and this importer is
+    // exactly the one none of them do. Left unchecked it is the mode's own
+    // failure in miniature — `--production` would report success on a lockfile
+    // that `jerky install` rewrites, which is the CI-passes-on-a-stale-file
+    // case the whole mode exists to refuse.
+    //
+    // Reported after the per-dependency walk, so the more specific message
+    // wins when a repository manages both at once.
+    if let Some(path) = locked
+        .importers
+        .keys()
+        .find(|path| !declared.contains_key(*path))
+    {
+        return Some(InstallError::ProductionLockfileImporterGone {
+            importer: path.to_string(),
+        });
     }
 
     None
