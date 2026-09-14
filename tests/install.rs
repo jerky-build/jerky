@@ -2238,6 +2238,24 @@ fn a_bare_install_from_a_directory_belonging_to_no_member_still_works() {
     assert_eq!(linked_version(&root.join("packages/api"), "alpha"), "1.0.0");
 }
 
+/// A temp directory's path as the *workspace* will report it.
+///
+/// `Workspace::discover` canonicalizes the root, so every path an install
+/// hands back — an `Unowned`'s among them — is canonical. A raw
+/// `TempDir::path()` is not: on macOS a temp directory is reached through
+/// `/var`, which is a symlink to `/private/var`, so the two spell the same
+/// directory differently and a path comparison between them fails there while
+/// passing on Linux, where `/tmp` is a real directory. Canonicalizing here is
+/// what makes such a comparison test jerky rather than the host's layout.
+///
+/// Only comparisons need this. Reaching a file through either spelling works,
+/// which is why every other test in this file can use `TempDir::path()`.
+fn workspace_root(dir: &TempDir) -> PathBuf {
+    dir.path()
+        .canonicalize()
+        .expect("the temp directory was just created")
+}
+
 /// A two-importer workspace where `packages/ui` declares one dependency it is
 /// about to lose, installed once. Two importers throughout, because the whole
 /// risk convergence carries is deleting something it should not have — and a
@@ -2362,7 +2380,9 @@ fn a_real_directory_left_by_npm_survives_and_is_reported() {
     // `node_modules`, so a real directory is provably someone else's.
     let home = TempDir::new().unwrap();
     let work = TempDir::new().unwrap();
-    let root = work.path();
+    // Canonical, because this test compares a reported path against one it
+    // built itself. See `workspace_root`.
+    let root = &workspace_root(&work);
     let store = Store::new(home.path().join("store"));
     let registry = converging_workspace(root);
 
@@ -2394,7 +2414,8 @@ fn a_symlink_pointing_outside_the_workspace_survives_and_is_reported() {
     let home = TempDir::new().unwrap();
     let work = TempDir::new().unwrap();
     let elsewhere = TempDir::new().unwrap();
-    let root = work.path();
+    // Canonical, for the same reason as the test above.
+    let root = &workspace_root(&work);
     let store = Store::new(home.path().join("store"));
     let registry = converging_workspace(root);
 
