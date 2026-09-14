@@ -38,7 +38,6 @@ fn unique_suffix() -> String {
 /// could add or replace files inside a package every project on the machine
 /// imports. `archive::extract` normalises what it writes *into* the directory
 /// but never the directory itself, which the caller owns; this is that caller.
-#[cfg(unix)]
 fn set_traversable(path: &Path) -> Result<(), StagingError> {
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -48,11 +47,6 @@ fn set_traversable(path: &Path) -> Result<(), StagingError> {
             source,
         }
     })
-}
-
-#[cfg(not(unix))]
-fn set_traversable(_path: &Path) -> Result<(), StagingError> {
-    Ok(())
 }
 
 /// A staging directory that deletes itself on drop unless kept.

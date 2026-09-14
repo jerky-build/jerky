@@ -87,7 +87,6 @@ impl<'a> TarEntry<'a> {
 /// Shared rather than written twice: the extraction unit tests and the
 /// install tests both assert on modes, and two copies of the masking would be
 /// two chances to mask differently.
-#[cfg(unix)]
 pub fn mode_of(path: &std::path::Path) -> u32 {
     use std::os::unix::fs::PermissionsExt as _;
     std::fs::metadata(path).unwrap().permissions().mode() & 0o7777

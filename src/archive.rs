@@ -121,10 +121,6 @@ fn is_metadata(entry_type: tar::EntryType) -> bool {
 /// conservative direction: the cost is a binary that needs `chmod +x`, against
 /// a corrupt header being allowed to choose.
 ///
-/// Unix only, because `PermissionsExt` is. What the equivalent should be on
-/// Windows is not settled here and has not been tested; the issue flagged it
-/// as something to verify rather than assume, and nothing above does.
-#[cfg(unix)]
 fn normalise_mode(target: &Path, recorded: u32) -> Result<(), ArchiveError> {
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -152,14 +148,6 @@ fn normalise_mode(target: &Path, recorded: u32) -> Result<(), ArchiveError> {
     })
 }
 
-/// A no-op off unix, where there are no mode bits to normalise. The rule and
-/// the reasoning for it live on the unix twin above; this exists so `extract`
-/// has one shape on every platform rather than a `cfg` in its body.
-#[cfg(not(unix))]
-fn normalise_mode(_target: &Path, _recorded: u32) -> Result<(), ArchiveError> {
-    Ok(())
-}
-
 /// Put every directory between `dest` and `deepest` at 0o755.
 ///
 /// A tarball need not carry directory entries, and `extract` tolerates that
@@ -170,7 +158,6 @@ fn normalise_mode(_target: &Path, _recorded: u32) -> Result<(), ArchiveError> {
 /// hole open, and a world-writable directory in the machine-global store lets
 /// another user add or replace files inside a package every project on the
 /// machine imports.
-#[cfg(unix)]
 fn normalise_created_dirs(dest: &Path, deepest: &Path) -> Result<(), ArchiveError> {
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -191,11 +178,6 @@ fn normalise_created_dirs(dest: &Path, deepest: &Path) -> Result<(), ArchiveErro
         )?;
     }
 
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn normalise_created_dirs(_dest: &Path, _deepest: &Path) -> Result<(), ArchiveError> {
     Ok(())
 }
 
@@ -242,9 +224,7 @@ fn strip_prefix_component(raw: &Path, display: &str) -> Result<PathBuf, ArchiveE
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(unix)]
-    use crate::testing::mode_of;
-    use crate::testing::{TarEntry, build_tarball};
+    use crate::testing::{TarEntry, build_tarball, mode_of};
     use tempfile::TempDir;
 
     #[test]
@@ -344,11 +324,9 @@ mod tests {
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
-    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt as _;
 
     #[test]
-    #[cfg(unix)]
     fn a_world_writable_file_is_narrowed_to_its_owner() {
         // The store is machine-global and populated with hard links, so one
         // set of permissions is shared by every project that installs the
@@ -368,7 +346,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn an_executable_file_stays_executable() {
         // The one bit of the recorded mode that carries meaning: it marks a
         // CLI entry point. #20 links these into `node_modules/.bin`, and a
@@ -387,7 +364,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn setuid_and_setgid_do_not_survive_extraction() {
         // Already true before this module normalised anything, because
         // `tar::Entry::unpack` masks the recorded mode with `& 0o777` unless
@@ -408,7 +384,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn a_directory_is_always_traversable() {
         // A directory's execute bit is the right to descend into it, not the
         // right to run it, so the rule that reads owner-execute off a file
@@ -453,7 +428,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn a_directory_the_tarball_omitted_is_still_normalised() {
         // A tarball need not carry directory entries — `extract` tolerates
         // that deliberately — in which case `create_dir_all` makes them and
@@ -485,7 +459,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn a_directory_is_recognised_by_the_filesystem_not_the_type_flag() {
         // `tar` honours an old BSD rule: a non-ustar entry whose name ends in
         // `/` becomes a directory even though its type flag says regular

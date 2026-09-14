@@ -63,7 +63,6 @@ pub fn link_file(src: &Path, dst: &Path) -> Result<(), LinkError> {
 ///
 /// Files need no equivalent: a hard link shares the inode and therefore the
 /// mode, and the `EXDEV` copy fallback carries permissions itself.
-#[cfg(unix)]
 fn reproduce_dir_mode(src: &Path, dst: &Path) -> Result<(), LinkError> {
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -81,11 +80,6 @@ fn reproduce_dir_mode(src: &Path, dst: &Path) -> Result<(), LinkError> {
             source,
         }
     })
-}
-
-#[cfg(not(unix))]
-fn reproduce_dir_mode(_src: &Path, _dst: &Path) -> Result<(), LinkError> {
-    Ok(())
 }
 
 fn walk_tree(
@@ -743,7 +737,6 @@ fn remove_entry(path: &Path) -> Result<(), LinkError> {
 mod tests {
     use super::*;
     use std::os::unix::fs::MetadataExt as _;
-    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt as _;
     use tempfile::TempDir;
 
@@ -792,7 +785,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn hard_link_tree_reproduces_directory_modes() {
         // `create_dir_all` takes its mode from the process umask, so a tree
         // recreated in a project would otherwise discard whatever the store
