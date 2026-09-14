@@ -1,8 +1,9 @@
+use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 
 use thiserror::Error;
 
-use crate::staging::StagingDir;
+use crate::staging::{STAGING_DIR, StagingDir};
 
 /// `EXDEV`, "cross-device link". Both Linux and macOS use 18.
 /// `io::ErrorKind::CrossesDevices` would be cleaner but is still unstable.
@@ -311,6 +312,333 @@ pub fn symlink_dependency_from(
     link_at(&importer_dir.join("node_modules"), pkg_name, &entry)
 }
 
+/// An entry in a `node_modules` that convergence declined to remove, and why.
+///
+/// Not an error. A half-migrated repository should be told what jerky left
+/// where it found it, not stopped — so these travel up through the install's
+/// outcome and are printed as warnings, the way a `workspaces` pattern that
+/// matched nothing already is.
+#[derive(Debug, Clone)]
+pub struct Unowned {
+    pub path: PathBuf,
+    pub reason: UnownedReason,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum UnownedReason {
+    /// A real directory or file: a previous `npm install`, or something a
+    /// human put there by hand. jerky only ever writes symlinks into an
+    /// importer's `node_modules`, so this cannot be jerky's.
+    NotASymlink,
+    /// A symlink that resolves neither into this workspace's virtual store nor
+    /// onto one of its members — someone's `npm link`, most likely. Not ours,
+    /// so not ours to remove.
+    PointsOutside,
+}
+
+/// What convergence is allowed to do with one entry.
+enum Ownership {
+    /// jerky wrote this link, so jerky may remove it.
+    Jerkys,
+    /// Someone else's, carrying the reason to report it with.
+    Unowned(UnownedReason),
+}
+
+/// Remove the links in `importer_dir/node_modules` that `expected` does not
+/// account for, and report the entries left alone.
+///
+/// This is what makes an install convergent rather than additive. A dependency
+/// deleted from a `package.json` loses its link, rather than leaving behind a
+/// symlink that still resolves — so `require` stops finding a package the
+/// project no longer declares, and the tree stops quietly disagreeing with the
+/// manifest.
+///
+/// `expected` holds the names the importer should end up with, spelled as they
+/// appear in a manifest: `lodash`, `@types/node`.
+///
+/// **The ownership test.** An entry is jerky's when it is a symlink whose
+/// target, resolved against the link's own parent and normalized lexically,
+/// lands either inside `<workspace_root>/node_modules/.jerky` or exactly on one
+/// of `members`. Both arms are required, because the two functions that write
+/// these links aim at different places: [`symlink_dependency_from`] at the
+/// virtual store, [`symlink_local`] at a member's own directory. A test
+/// covering only the first would leak every local link, one importer at a time.
+///
+/// Normalization is lexical rather than [`Path::canonicalize`], consistent with
+/// how `relative_path` already compares paths — and, more sharply, because
+/// `canonicalize` fails on a dangling link. A link into the virtual store whose
+/// entry has since been pruned is jerky's own debris, and an ownership test
+/// that could not recognise it would preserve it forever.
+///
+/// Everything else is left exactly where it was found and returned to the
+/// caller. jerky's layout makes ownership provable, which is what lets
+/// convergence be total over what jerky manages without ever deleting what
+/// another tool or a person put there: the first `jerky install` in a
+/// repository that has seen npm must not be a destructive surprise.
+pub fn converge(
+    importer_dir: &Path,
+    workspace_root: &Path,
+    members: &BTreeSet<PathBuf>,
+    expected: &BTreeSet<String>,
+) -> Result<Vec<Unowned>, LinkError> {
+    let node_modules = importer_dir.join("node_modules");
+    let virtual_store = workspace_root.join("node_modules").join(VIRTUAL_STORE_DIR);
+    let mut left_alone = Vec::new();
+
+    for path in entries(&node_modules)? {
+        let name = file_name(&path);
+
+        // The virtual store is jerky's, not an importer's dependency, and what
+        // belongs in it is a question `prune_virtual_store` answers with the
+        // resolved graph rather than with an importer's declared names. It is
+        // also a real directory, so falling through would report it as
+        // something jerky declined to touch — which would be a lie, and one the
+        // root importer sees on every single install.
+        if name == VIRTUAL_STORE_DIR {
+            continue;
+        }
+
+        // A scope is a container, not a package: `@types/node` is one
+        // dependency whose link lives two levels down. Descending is what
+        // builds the name to compare against `expected`, and it is written now
+        // even though nothing scoped installs yet (#22), because the
+        // alternative is #22 discovering that convergence silently ignores half
+        // the tree.
+        //
+        // Only a real directory is descended into. A symlink named `@foo` is an
+        // ordinary entry, and following one would let a link pointing anywhere
+        // at all decide what gets deleted.
+        if name.starts_with('@') && is_real_dir(&path)? {
+            for child in entries(&path)? {
+                let scoped = format!("{name}/{}", file_name(&child));
+                converge_entry(
+                    &child,
+                    &scoped,
+                    &virtual_store,
+                    members,
+                    expected,
+                    &mut left_alone,
+                )?;
+            }
+
+            // A scope directory exists only to hold packages. One that no
+            // longer holds any would otherwise outlive every package it was
+            // created for, leaving an empty `@types` where `@types/node` used
+            // to be. An entry that was left alone keeps the directory
+            // non-empty, which is the answer that wants to be given anyway.
+            if entries(&path)?.is_empty() {
+                std::fs::remove_dir(&path).map_err(|source| LinkError::Access {
+                    path: path.clone(),
+                    source,
+                })?;
+            }
+            continue;
+        }
+
+        converge_entry(
+            &path,
+            &name,
+            &virtual_store,
+            members,
+            expected,
+            &mut left_alone,
+        )?;
+    }
+
+    Ok(left_alone)
+}
+
+/// Decide one `node_modules` entry and act on the answer.
+///
+/// A name the importer still declares is left alone without asking who owns it:
+/// the link was just written by this very install, and an *unowned* entry under
+/// a declared name never reaches here — `place_symlink` refuses to overwrite
+/// anything but a symlink, so a real directory shadowing a declared dependency
+/// has already failed the install with `ConflictingEntry`.
+fn converge_entry(
+    path: &Path,
+    name: &str,
+    virtual_store: &Path,
+    members: &BTreeSet<PathBuf>,
+    expected: &BTreeSet<String>,
+    left_alone: &mut Vec<Unowned>,
+) -> Result<(), LinkError> {
+    if expected.contains(name) {
+        return Ok(());
+    }
+
+    match ownership(path, virtual_store, members)? {
+        // `remove_file` on a symlink removes the link and never the directory
+        // it names, which is the whole reason a dependency can be unlinked from
+        // one importer while another goes on using it.
+        Ownership::Jerkys => std::fs::remove_file(path).map_err(|source| LinkError::Access {
+            path: path.to_path_buf(),
+            source,
+        }),
+        Ownership::Unowned(reason) => {
+            left_alone.push(Unowned {
+                path: path.to_path_buf(),
+                reason,
+            });
+            Ok(())
+        }
+    }
+}
+
+/// Can jerky prove it wrote this entry?
+fn ownership(
+    path: &Path,
+    virtual_store: &Path,
+    members: &BTreeSet<PathBuf>,
+) -> Result<Ownership, LinkError> {
+    // symlink_metadata rather than metadata, so a link is judged as a link
+    // rather than as whatever it happens to point at — and so a dangling one is
+    // seen at all instead of reported as missing.
+    let metadata = std::fs::symlink_metadata(path).map_err(|source| LinkError::Access {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !metadata.file_type().is_symlink() {
+        return Ok(Ownership::Unowned(UnownedReason::NotASymlink));
+    }
+
+    let target = std::fs::read_link(path).map_err(|source| LinkError::Access {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let parent = path
+        .parent()
+        .expect("an entry read out of a directory has that directory as its parent");
+    // `join` takes an absolute target as-is, so a hand-written absolute link is
+    // judged where it actually points rather than somewhere under the importer.
+    let resolved = normalize(&parent.join(target));
+
+    Ok(
+        if resolved.starts_with(virtual_store) || members.contains(&resolved) {
+            Ownership::Jerkys
+        } else {
+            Ownership::Unowned(UnownedReason::PointsOutside)
+        },
+    )
+}
+
+/// Resolve `.` and `..` away without touching the filesystem.
+///
+/// A `..` is only collapsed when there is a plain directory name in front of it
+/// to collapse, so climbing past the root leaves the `..` in place rather than
+/// inventing a path the link does not name. Such a path then matches neither
+/// the virtual store nor a member, which is the honest answer: a link that
+/// climbs out of the filesystem is not one jerky wrote.
+fn normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => match normalized.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    normalized.pop();
+                }
+                _ => normalized.push(Component::ParentDir),
+            },
+            other => normalized.push(other),
+        }
+    }
+    normalized
+}
+
+/// Is this a directory in its own right, rather than a link to one?
+fn is_real_dir(path: &Path) -> Result<bool, LinkError> {
+    std::fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_dir())
+        .map_err(|source| LinkError::Access {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+/// Every entry in `dir`, sorted, or none at all when `dir` does not exist.
+///
+/// A missing directory is the ordinary state of a member that declares nothing
+/// and has never been installed into, so it is emptiness rather than a failure.
+/// Sorting makes what a run reports a property of the tree rather than of the
+/// order the filesystem happened to hand entries back in.
+fn entries(dir: &Path) -> Result<Vec<PathBuf>, LinkError> {
+    let read = match std::fs::read_dir(dir) {
+        Ok(read) => read,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => {
+            return Err(LinkError::Access {
+                path: dir.to_path_buf(),
+                source,
+            });
+        }
+    };
+
+    let mut paths = Vec::new();
+    for entry in read {
+        let entry = entry.map_err(|source| LinkError::Access {
+            path: dir.to_path_buf(),
+            source,
+        })?;
+        paths.push(entry.path());
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .expect("an entry read out of a directory has a final component")
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Remove the virtual store entries that `expected` does not name.
+///
+/// `expected` holds the `<name>@<version>` directory names the resolved graph
+/// still contains. Everything under `node_modules/.jerky` was written by
+/// [`populate_virtual_store`], so unlike an importer's `node_modules` there is
+/// no ownership question to ask here — only whether anything still points at
+/// it. Without this, deleting a dependency would leave its unpacked tree in the
+/// project forever, because nothing else ever removes one.
+///
+/// The machine-global content store under `~/.jerky/store` is deliberately not
+/// touched, and is not even reachable from here: it is shared by every project
+/// on the machine, so a project-local convergence has no basis for deciding one
+/// of its entries is dead. Collecting it is a separate command (#52).
+pub fn prune_virtual_store(
+    node_modules: &Path,
+    expected: &BTreeSet<String>,
+) -> Result<(), LinkError> {
+    let virtual_root = node_modules.join(VIRTUAL_STORE_DIR);
+
+    for path in entries(&virtual_root)? {
+        let name = file_name(&path);
+        // Staging is the linker's own scratch space rather than a package
+        // entry. It is emptied by the guard that creates it, and removing the
+        // directory itself would only have it recreated on the next install.
+        if name == STAGING_DIR || expected.contains(&name) {
+            continue;
+        }
+
+        // Branching on the type rather than reaching straight for
+        // `remove_dir_all`, which fails on anything that is not a directory.
+        // Nothing should ever have put a file here, and failing an otherwise
+        // good install over one would be a poor trade.
+        let removed = if is_real_dir(&path)? {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        removed.map_err(|source| LinkError::Access {
+            path: path.clone(),
+            source,
+        })?;
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -611,5 +939,156 @@ mod tests {
             link.join("package.json").is_file(),
             "the link does not resolve"
         );
+    }
+
+    /// Does anything at all still sit at `path`? `exists` follows links and so
+    /// answers `false` for a dangling one, which is precisely the entry these
+    /// tests are about.
+    fn still_there(path: &Path) -> bool {
+        std::fs::symlink_metadata(path).is_ok()
+    }
+
+    fn names(expected: &[&str]) -> BTreeSet<String> {
+        expected.iter().map(|name| name.to_string()).collect()
+    }
+
+    #[test]
+    fn a_dangling_link_into_the_virtual_store_is_recognised_as_ours_and_removed() {
+        // The reason ownership is decided lexically rather than by
+        // `canonicalize`, which fails outright on a link that resolves nowhere.
+        // Taking that failure as "not jerky's" would make a broken link of
+        // jerky's own making permanent, and pruning the virtual store is what
+        // creates one.
+        let root = TempDir::new().unwrap();
+        let workspace_root = root.path().join("ws");
+        let node_modules = workspace_root.join("node_modules");
+        std::fs::create_dir_all(&node_modules).unwrap();
+        std::os::unix::fs::symlink(
+            ".jerky/lodash@4.17.21/node_modules/lodash",
+            node_modules.join("lodash"),
+        )
+        .unwrap();
+
+        let left_alone = converge(
+            &workspace_root,
+            &workspace_root,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+
+        assert!(
+            left_alone.is_empty(),
+            "a link jerky wrote was reported as someone else's"
+        );
+        assert!(
+            !still_there(&node_modules.join("lodash")),
+            "the dangling link survived"
+        );
+    }
+
+    #[test]
+    fn a_link_to_a_workspace_member_is_ours() {
+        // `symlink_local` points at a member directory, not into `.jerky`. An
+        // ownership test covering only the virtual store would leak every local
+        // link, one importer at a time — and it would do so silently, since a
+        // local link always resolves.
+        let root = TempDir::new().unwrap();
+        let workspace_root = root.path().join("ws");
+        let importer_dir = workspace_root.join("apps/web");
+        let member_dir = workspace_root.join("packages/ui");
+        std::fs::create_dir_all(&importer_dir).unwrap();
+        std::fs::create_dir_all(&member_dir).unwrap();
+        std::fs::write(member_dir.join("package.json"), r#"{"name":"ui"}"#).unwrap();
+
+        symlink_local(&importer_dir, "ui", &member_dir).unwrap();
+        let members = BTreeSet::from([
+            workspace_root.clone(),
+            importer_dir.clone(),
+            member_dir.clone(),
+        ]);
+
+        let left_alone =
+            converge(&importer_dir, &workspace_root, &members, &BTreeSet::new()).unwrap();
+
+        assert!(
+            left_alone.is_empty(),
+            "a link at a workspace member read as unowned"
+        );
+        assert!(
+            !still_there(&importer_dir.join("node_modules/ui")),
+            "a link at a workspace member survived convergence"
+        );
+        assert!(
+            member_dir.join("package.json").is_file(),
+            "unlinking a member deleted the member"
+        );
+    }
+
+    #[test]
+    fn an_emptied_scope_directory_is_removed() {
+        // Removing `node_modules/@types/node` must not leave an empty `@types`
+        // behind. The contrast is the other half: a scope is descended into
+        // rather than judged as a unit, so one that still holds a declared
+        // package stays exactly where it is.
+        let root = TempDir::new().unwrap();
+        let workspace_root = root.path().join("ws");
+        let node_modules = workspace_root.join("node_modules");
+        for scope in ["@types", "@scope"] {
+            std::fs::create_dir_all(node_modules.join(scope)).unwrap();
+        }
+        // One climb, because the link sits inside the scope directory rather
+        // than directly in `node_modules`.
+        std::os::unix::fs::symlink(
+            "../.jerky/@types/node@20.0.0/node_modules/@types/node",
+            node_modules.join("@types/node"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            "../.jerky/@scope/live@1.0.0/node_modules/@scope/live",
+            node_modules.join("@scope/live"),
+        )
+        .unwrap();
+
+        let left_alone = converge(
+            &workspace_root,
+            &workspace_root,
+            &BTreeSet::new(),
+            &names(&["@scope/live"]),
+        )
+        .unwrap();
+
+        assert!(left_alone.is_empty());
+        assert!(
+            !still_there(&node_modules.join("@types")),
+            "the scope outlived every package that was ever in it"
+        );
+        assert!(
+            still_there(&node_modules.join("@scope/live")),
+            "a declared scoped package lost its link"
+        );
+    }
+
+    #[test]
+    fn the_virtual_store_is_pruned_to_the_graph() {
+        // `.jerky` is not judged by the ownership test at all — everything in
+        // it was written by `populate_virtual_store` — so what governs is
+        // whether the graph still names the entry.
+        let root = TempDir::new().unwrap();
+        let src = store_entry(root.path());
+        let node_modules = root.path().join("ws").join("node_modules");
+        populate_virtual_store(&src, &node_modules, "lodash@4.17.21", "lodash").unwrap();
+        populate_virtual_store(&src, &node_modules, "lodash@3.10.1", "lodash").unwrap();
+
+        prune_virtual_store(&node_modules, &names(&["lodash@4.17.21"])).unwrap();
+
+        assert!(node_modules.join(".jerky/lodash@4.17.21").is_dir());
+        assert!(
+            !still_there(&node_modules.join(".jerky/lodash@3.10.1")),
+            "an entry the graph no longer contains stayed unpacked in the project"
+        );
+        // Staging is the linker's own scratch space, recreated on the next
+        // install, so pruning has no business deciding it is dead.
+        assert!(node_modules.join(".jerky/.staging").is_dir());
     }
 }

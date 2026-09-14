@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use thiserror::Error;
@@ -6,7 +6,7 @@ use thiserror::Error;
 use crate::archive::{self, ArchiveError};
 use crate::cli::{PackageSpec, VersionSpec};
 use crate::integrity::{Integrity, IntegrityError};
-use crate::linker::{self, LinkError};
+use crate::linker::{self, LinkError, Unowned};
 use crate::lockfile::{self, LockfileError};
 use crate::manifest::{Manifest, ManifestError};
 use crate::range::{Range, Version};
@@ -128,6 +128,14 @@ pub struct Outcome {
     /// rather than installed, so counting them would report work that did not
     /// happen and would change with nothing but a `workspaces` edit.
     pub linked: Vec<Installed>,
+    /// Entries convergence found in an importer's `node_modules` and could not
+    /// prove jerky had written, so left where they were.
+    ///
+    /// Carried rather than raised. A repository half-migrated from npm should
+    /// be told what jerky declined to touch, not stopped — and the caller is
+    /// the layer that knows how to say so, which is the same division
+    /// `Workspace::warnings()` already draws.
+    pub left_alone: Vec<Unowned>,
     /// Present only when there was a request to record.
     pub recorded: Option<Recorded>,
 }
@@ -385,6 +393,47 @@ pub fn sync(
         }
     }
 
+    // Then, per importer, the other half of the same job: remove the links
+    // nothing declares any more. An install that only ever added would leave a
+    // symlink that still resolves behind every deleted dependency, so `require`
+    // would go on finding a package the manifest has dropped. The lockfile is
+    // already pruned on every write; this is that property applied to disk.
+    //
+    // It runs after linking rather than before, so that what convergence sees
+    // is the finished tree: an entry that is about to be rewritten has already
+    // been rewritten, and the only entries left to judge are the ones no
+    // importer asked for.
+    //
+    // Every member's directory, so that a link at one is recognised as jerky's.
+    // A local link points straight at the member rather than into the virtual
+    // store, and an ownership test that knew only about the store would delete
+    // every local link on the install after it was created.
+    let member_dirs: BTreeSet<PathBuf> = workspace
+        .members()
+        .values()
+        .map(|member| member.path.clone())
+        .collect();
+    let mut left_alone = Vec::new();
+    for (path, resolved) in &graph.importers {
+        let member = workspace
+            .members()
+            .get(path)
+            .expect("every importer in the graph was seeded from a member");
+        let expected: BTreeSet<String> = resolved.dependencies.keys().cloned().collect();
+
+        left_alone.extend(linker::converge(
+            &member.path,
+            workspace.root(),
+            &member_dirs,
+            &expected,
+        )?);
+    }
+
+    // The links go first and the entries they named go second, so that nothing
+    // is ever pointed at by a link jerky still considers live.
+    let reachable: BTreeSet<String> = graph.packages.keys().map(PackageId::to_string).collect();
+    linker::prune_virtual_store(&node_modules, &reachable)?;
+
     // The lockfile records what the manifest declares, so the specifier it
     // carries for this request is the one about to be written rather than the
     // seed resolution was given. Were they allowed to differ, every install
@@ -412,6 +461,7 @@ pub fn sync(
                 version: id.version.clone(),
             })
             .collect(),
+        left_alone,
         recorded,
     })
 }
@@ -518,6 +568,13 @@ fn record_for(request: &Request, graph: &ResolvedGraph, workspace: &Workspace) -
 /// failure anywhere leaves at worst an installed-but-unrecorded package —
 /// harmless and self-healing on rerun — rather than a `package.json` claiming
 /// a dependency that is not on disk.
+///
+/// The sync's whole `Outcome` comes back rather than only the package that was
+/// added, because what was added is not the only thing above this that has to
+/// be said out loud: convergence reports the entries it declined to touch, and
+/// swallowing them here would leave `jerky install <pkg>` silent about exactly
+/// the half-migrated repository that report exists for. `recorded` is always
+/// `Some` on this path — a sync given a request always reports what to record.
 pub fn install(
     workspace: &Workspace,
     importer: &ImporterPath,
@@ -525,7 +582,7 @@ pub fn install(
     registry: &dyn RegistryClient,
     spec: &PackageSpec,
     kind: Option<Kind>,
-) -> Result<Installed, InstallError> {
+) -> Result<Outcome, InstallError> {
     let request = Request {
         importer: importer.clone(),
         name: spec.name.clone(),
@@ -536,6 +593,7 @@ pub fn install(
     let outcome = sync(workspace, store, registry, Some(&request))?;
     let recorded = outcome
         .recorded
+        .as_ref()
         .expect("a sync given a request always reports what to record");
 
     // `sync` validated membership before touching anything, so the target is
@@ -559,10 +617,7 @@ pub fn install(
     }
     manifest.save()?;
 
-    Ok(Installed {
-        name: recorded.name,
-        version: recorded.version,
-    })
+    Ok(outcome)
 }
 
 /// The importers whose recorded specifiers still match their manifests.

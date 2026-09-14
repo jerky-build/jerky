@@ -1,7 +1,8 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use jerky::cli::{PackageSpec, VersionSpec};
-use jerky::commands::install::{InstallError, Request, install, sync};
+use jerky::commands::install::{InstallError, Outcome, Recorded, Request, install, sync};
+use jerky::linker::{Unowned, UnownedReason};
 use jerky::resolver::{ImporterPath, Kind, ResolveError};
 use jerky::store::Store;
 use jerky::testing::{FixtureRegistry, TarEntry, build_tarball};
@@ -31,6 +32,16 @@ fn solo(dir: &Path) -> Workspace {
     Workspace::discover(dir).unwrap()
 }
 
+/// What an install added, which is what most of these tests are about.
+///
+/// `install` returns the whole sync outcome, because convergence has entries to
+/// report that are nothing to do with the package being added.
+fn added(outcome: Outcome) -> Recorded {
+    outcome
+        .recorded
+        .expect("an install always reports what it recorded")
+}
+
 fn spec(name: &str, version: VersionSpec) -> PackageSpec {
     PackageSpec {
         name: name.to_string(),
@@ -46,15 +57,17 @@ fn installs_a_package_end_to_end() {
     let store = Store::new(home.path().join("store"));
     let registry = FixtureRegistry::new().with_package("lodash", "4.17.21", lodash_tarball());
 
-    let installed = install(
-        &solo(project_dir),
-        &ImporterPath::root(),
-        &store,
-        &registry,
-        &spec("lodash", VersionSpec::Latest),
-        None,
-    )
-    .unwrap();
+    let installed = added(
+        install(
+            &solo(project_dir),
+            &ImporterPath::root(),
+            &store,
+            &registry,
+            &spec("lodash", VersionSpec::Latest),
+            None,
+        )
+        .unwrap(),
+    );
 
     assert_eq!(installed.version, "4.17.21");
 
@@ -436,15 +449,17 @@ fn a_single_importer_workspace_installs_exactly_as_before() {
     let store = Store::new(home.path().join("store"));
     let workspace = Workspace::discover(root).unwrap();
 
-    let installed = install(
-        &workspace,
-        &ImporterPath::root(),
-        &store,
-        &FixtureRegistry::new().with_package("lodash", "4.17.21", lodash_tarball()),
-        &spec("lodash", VersionSpec::Latest),
-        None,
-    )
-    .unwrap();
+    let installed = added(
+        install(
+            &workspace,
+            &ImporterPath::root(),
+            &store,
+            &FixtureRegistry::new().with_package("lodash", "4.17.21", lodash_tarball()),
+            &spec("lodash", VersionSpec::Latest),
+            None,
+        )
+        .unwrap(),
+    );
 
     assert_eq!(installed.version, "4.17.21");
     assert_eq!(
@@ -490,15 +505,17 @@ fn installing_a_member_by_the_workspace_protocol_links_it() {
     let store = Store::new(home.path().join("store"));
     let registry = two_versions_of_lodash();
 
-    let installed = install(
-        &workspace,
-        &ImporterPath::new("apps/web").unwrap(),
-        &store,
-        &registry,
-        &spec("ui", VersionSpec::Exact("workspace:*".into())),
-        None,
-    )
-    .unwrap();
+    let installed = added(
+        install(
+            &workspace,
+            &ImporterPath::new("apps/web").unwrap(),
+            &store,
+            &registry,
+            &spec("ui", VersionSpec::Exact("workspace:*".into())),
+            None,
+        )
+        .unwrap(),
+    );
 
     assert_eq!(installed.version, "1.0.0", "reported the member's version");
     assert_eq!(linked_version(&root.join("apps/web"), "ui"), "1.0.0");
@@ -619,15 +636,17 @@ fn an_exact_request_still_installs_that_exact_version() {
     let registry =
         FixtureRegistry::new().with_packument("lodash", &[("4.17.21", &[]), ("4.18.0", &[])]);
 
-    let installed = install(
-        &workspace,
-        &ImporterPath::new("apps/web").unwrap(),
-        &store,
-        &registry,
-        &spec("lodash", VersionSpec::Exact("4.17.21".into())),
-        None,
-    )
-    .unwrap();
+    let installed = added(
+        install(
+            &workspace,
+            &ImporterPath::new("apps/web").unwrap(),
+            &store,
+            &registry,
+            &spec("lodash", VersionSpec::Exact("4.17.21".into())),
+            None,
+        )
+        .unwrap(),
+    );
 
     assert_eq!(installed.version, "4.17.21");
     assert_eq!(linked_version(&root.join("apps/web"), "lodash"), "4.17.21");
@@ -654,15 +673,17 @@ fn a_range_the_user_typed_is_recorded_as_they_typed_it() {
     );
     write_manifest(root, r#"{"name":"demo"}"#);
 
-    let installed = install(
-        &solo(root),
-        &ImporterPath::root(),
-        &store,
-        &registry,
-        &spec("lodash", VersionSpec::Exact("^4.0.0".into())),
-        None,
-    )
-    .unwrap();
+    let installed = added(
+        install(
+            &solo(root),
+            &ImporterPath::root(),
+            &store,
+            &registry,
+            &spec("lodash", VersionSpec::Exact("^4.0.0".into())),
+            None,
+        )
+        .unwrap(),
+    );
 
     assert_eq!(installed.version, "4.18.0");
     assert_eq!(
@@ -722,15 +743,17 @@ fn every_range_form_is_recorded_as_written() {
         );
         write_manifest(root, r#"{"name":"demo"}"#);
 
-        let installed = install(
-            &solo(root),
-            &ImporterPath::root(),
-            &store,
-            &registry,
-            &spec("lodash", VersionSpec::Exact(requested.into())),
-            None,
-        )
-        .unwrap();
+        let installed = added(
+            install(
+                &solo(root),
+                &ImporterPath::root(),
+                &store,
+                &registry,
+                &spec("lodash", VersionSpec::Exact(requested.into())),
+                None,
+            )
+            .unwrap(),
+        );
 
         assert_eq!(
             installed.version, expected,
@@ -812,15 +835,17 @@ fn a_bounded_range_is_not_mistaken_for_a_wildcard() {
         let root = work.path();
         write_manifest(root, r#"{"name":"demo"}"#);
 
-        let installed = install(
-            &solo(root),
-            &ImporterPath::root(),
-            &Store::new(home.path().join("store")),
-            &registry,
-            &spec("lodash", VersionSpec::Exact(requested.into())),
-            None,
-        )
-        .unwrap_or_else(|err| panic!("`{requested}` was refused: {err}"));
+        let installed = added(
+            install(
+                &solo(root),
+                &ImporterPath::root(),
+                &Store::new(home.path().join("store")),
+                &registry,
+                &spec("lodash", VersionSpec::Exact(requested.into())),
+                None,
+            )
+            .unwrap_or_else(|err| panic!("`{requested}` was refused: {err}")),
+        );
 
         assert_eq!(installed.version, expected);
         assert_eq!(
@@ -845,15 +870,17 @@ fn a_dist_tag_other_than_latest_resolves_and_pins() {
         .with_dist_tag("lodash", "next", "5.0.0-beta.1");
     write_manifest(root, r#"{"name":"demo"}"#);
 
-    let installed = install(
-        &solo(root),
-        &ImporterPath::root(),
-        &Store::new(home.path().join("store")),
-        &registry,
-        &spec("lodash", VersionSpec::Exact("next".into())),
-        None,
-    )
-    .unwrap();
+    let installed = added(
+        install(
+            &solo(root),
+            &ImporterPath::root(),
+            &Store::new(home.path().join("store")),
+            &registry,
+            &spec("lodash", VersionSpec::Exact("next".into())),
+            None,
+        )
+        .unwrap(),
+    );
 
     assert_eq!(installed.version, "5.0.0-beta.1");
     assert_eq!(linked_version(root, "lodash"), "5.0.0-beta.1");
@@ -2209,4 +2236,230 @@ fn a_bare_install_from_a_directory_belonging_to_no_member_still_works() {
         "4.17.21"
     );
     assert_eq!(linked_version(&root.join("packages/api"), "alpha"), "1.0.0");
+}
+
+/// A two-importer workspace where `packages/ui` declares one dependency it is
+/// about to lose, installed once. Two importers throughout, because the whole
+/// risk convergence carries is deleting something it should not have — and a
+/// suite that only ever sees `.` cannot catch a removal that reaches an
+/// importer it was never asked about.
+fn converging_workspace(root: &Path) -> FixtureRegistry {
+    write_manifest(
+        root,
+        r#"{"name":"ws","workspaces":["packages/*"],"dependencies":{"alpha":"1.0.0"}}"#,
+    );
+    write_manifest(
+        &root.join("packages/ui"),
+        r#"{"name":"ui","dependencies":{"lodash":"4.17.21","beta":"2.0.0"}}"#,
+    );
+
+    FixtureRegistry::new()
+        .with_packument("lodash", &[("4.17.21", &[])])
+        .with_tree(&[("alpha", "1.0.0", &[]), ("beta", "2.0.0", &[])])
+}
+
+/// `packages/ui` after someone deleted `beta` from it by hand.
+fn drop_beta(root: &Path) {
+    write_manifest(
+        &root.join("packages/ui"),
+        r#"{"name":"ui","dependencies":{"lodash":"4.17.21"}}"#,
+    );
+}
+
+fn bare_install(root: &Path, store: &Store, registry: &FixtureRegistry) -> Outcome {
+    sync(
+        &Workspace::discover(root).unwrap(),
+        store,
+        registry,
+        None::<&Request>,
+    )
+    .unwrap()
+}
+
+/// Does anything at all still sit here? `exists` follows links, so it answers
+/// `false` for a dangling one — and a link left dangling is exactly the failure
+/// these tests are watching for.
+fn still_there(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
+}
+
+#[test]
+fn a_dependency_removed_from_the_manifest_loses_its_link() {
+    // Install is convergent, not additive. Without this the symlink survives
+    // and still resolves, so `require("beta")` goes on working for a
+    // dependency the project no longer declares and the tree quietly disagrees
+    // with the manifest.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let store = Store::new(home.path().join("store"));
+    let registry = converging_workspace(root);
+
+    bare_install(root, &store, &registry);
+    assert_eq!(linked_version(&root.join("packages/ui"), "beta"), "2.0.0");
+
+    drop_beta(root);
+    let outcome = bare_install(root, &store, &registry);
+
+    assert!(
+        !still_there(&root.join("packages/ui/node_modules/beta")),
+        "a dependency the manifest no longer declares kept its link"
+    );
+    assert!(
+        outcome.left_alone.is_empty(),
+        "a link jerky wrote was reported as someone else's rather than removed"
+    );
+
+    // The two directions convergence must not confuse: a sibling in the same
+    // importer, and another importer entirely.
+    assert_eq!(
+        linked_version(&root.join("packages/ui"), "lodash"),
+        "4.17.21",
+        "convergence took a dependency the manifest still declares"
+    );
+    assert_eq!(
+        linked_version(root, "alpha"),
+        "1.0.0",
+        "converging packages/ui reached into the root importer"
+    );
+}
+
+#[test]
+fn its_virtual_store_entry_goes_with_it() {
+    // The link is only half of what an install put on disk. Leaving the
+    // unpacked tree behind would mean a deleted dependency stays in the project
+    // forever, because nothing else ever removes one.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let store = Store::new(home.path().join("store"));
+    let registry = converging_workspace(root);
+
+    bare_install(root, &store, &registry);
+    assert!(root.join("node_modules/.jerky/beta@2.0.0").is_dir());
+
+    drop_beta(root);
+    bare_install(root, &store, &registry);
+
+    assert!(
+        !still_there(&root.join("node_modules/.jerky/beta@2.0.0")),
+        "the unpacked tree outlived the dependency it belongs to"
+    );
+    assert!(
+        root.join("node_modules/.jerky/lodash@4.17.21").is_dir(),
+        "an entry the graph still contains was pruned with it"
+    );
+    assert!(
+        root.join("node_modules/.jerky/alpha@1.0.0").is_dir(),
+        "the root importer's entry was pruned by converging packages/ui"
+    );
+}
+
+#[test]
+fn a_real_directory_left_by_npm_survives_and_is_reported() {
+    // The first `jerky install` in a repository that has seen npm must not be a
+    // destructive surprise. jerky only ever writes symlinks into an importer's
+    // `node_modules`, so a real directory is provably someone else's.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let store = Store::new(home.path().join("store"));
+    let registry = converging_workspace(root);
+
+    let stray = root.join("packages/ui/node_modules/left-by-npm");
+    write_manifest(&stray, r#"{"name":"left-by-npm","version":"0.0.1"}"#);
+
+    let outcome = bare_install(root, &store, &registry);
+
+    assert_eq!(
+        std::fs::read_to_string(stray.join("package.json")).unwrap(),
+        r#"{"name":"left-by-npm","version":"0.0.1"}"#,
+        "jerky deleted a directory it did not write"
+    );
+
+    let reported: Vec<&Unowned> = outcome
+        .left_alone
+        .iter()
+        .filter(|entry| entry.path == stray)
+        .collect();
+    assert_eq!(reported.len(), 1, "left alone: {:?}", outcome.left_alone);
+    assert!(matches!(reported[0].reason, UnownedReason::NotASymlink));
+}
+
+#[test]
+fn a_symlink_pointing_outside_the_workspace_survives_and_is_reported() {
+    // Someone's `npm link`. It is a symlink, so the shape is jerky's, but it
+    // resolves neither into this workspace's virtual store nor onto a member —
+    // not ours, so not ours to remove.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let elsewhere = TempDir::new().unwrap();
+    let root = work.path();
+    let store = Store::new(home.path().join("store"));
+    let registry = converging_workspace(root);
+
+    let checkout = elsewhere.path().join("my-lib");
+    write_manifest(&checkout, r#"{"name":"my-lib","version":"9.9.9"}"#);
+    let link = root.join("packages/ui/node_modules/my-lib");
+    std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&checkout, &link).unwrap();
+
+    let outcome = bare_install(root, &store, &registry);
+
+    assert_eq!(
+        linked_version(&root.join("packages/ui"), "my-lib"),
+        "9.9.9",
+        "a link jerky did not write was removed"
+    );
+
+    let reported: Vec<&Unowned> = outcome
+        .left_alone
+        .iter()
+        .filter(|entry| entry.path == link)
+        .collect();
+    assert_eq!(reported.len(), 1, "left alone: {:?}", outcome.left_alone);
+    assert!(matches!(reported[0].reason, UnownedReason::PointsOutside));
+}
+
+#[test]
+fn the_content_store_is_never_touched() {
+    // `~/.jerky/store` is machine-global and shared by every project on the
+    // machine, so a project-local convergence has no basis for deciding one of
+    // its entries is dead. Collecting it is a separate command (#52); pruning a
+    // project's virtual store must leave it exactly as it found it.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let store = Store::new(home.path().join("store"));
+    let registry = converging_workspace(root);
+
+    // Content-addressed entries only. The store's own `.staging` scratch
+    // directory sits beside them and is nobody's package.
+    let stored = || -> Vec<PathBuf> {
+        let mut entries: Vec<PathBuf> = std::fs::read_dir(store.entry_path_root())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| !path.file_name().unwrap().to_string_lossy().starts_with('.'))
+            .collect();
+        entries.sort();
+        entries
+    };
+
+    bare_install(root, &store, &registry);
+    let before = stored();
+    assert_eq!(before.len(), 3, "three packages were installed");
+
+    drop_beta(root);
+    bare_install(root, &store, &registry);
+
+    assert!(
+        !still_there(&root.join("node_modules/.jerky/beta@2.0.0")),
+        "the last project-local reference to beta was not actually pruned, so \
+         this proves nothing about the store"
+    );
+    assert_eq!(
+        before,
+        stored(),
+        "convergence reached into the machine-global content store"
+    );
 }
