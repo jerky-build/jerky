@@ -1,1 +1,6 @@
 /target
+
+# Local agent tooling state. Holds session settings and, when an agent runs in
+# an isolated worktree, a nested git repository — which `git add -A` will
+# happily stage as a gitlink to a commit that exists on one machine only.
+/.claude
