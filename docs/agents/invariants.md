@@ -85,7 +85,16 @@ directory a previous `npm install` left, or a link into someone's `npm link`
 checkout, is reported and kept: the failure on that side is deleting a user's
 files, which is worse than leaving some. Lexical rather than `canonicalize`,
 which fails on a dangling link and would make a broken link of jerky's own
-making permanent.
+making permanent. The one non-symlink it removes is a scope directory it
+emptied itself, which it removes only because it has just taken the last
+package out — an `@foo` that was already empty on arrival is someone else's and
+stays.
+
+The virtual store under `node_modules/.jerky` is the deliberate exemption:
+everything in it was written by `populate_virtual_store`, so ownership there is
+settled by location and the pruner removes whatever the graph no longer names
+without asking about link targets. The rule is about an importer's
+`node_modules`, where jerky and other tools share a directory.
 
 ## Checking them
 

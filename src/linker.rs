@@ -409,9 +409,10 @@ pub fn converge(
         // ordinary entry, and following one would let a link pointing anywhere
         // at all decide what gets deleted.
         if name.starts_with('@') && is_real_dir(&path)? {
+            let mut emptied_it = false;
             for child in entries(&path)? {
                 let scoped = format!("{name}/{}", file_name(&child));
-                converge_entry(
+                emptied_it |= converge_entry(
                     &child,
                     &scoped,
                     &virtual_store,
@@ -421,12 +422,21 @@ pub fn converge(
                 )?;
             }
 
-            // A scope directory exists only to hold packages. One that no
-            // longer holds any would otherwise outlive every package it was
-            // created for, leaving an empty `@types` where `@types/node` used
-            // to be. An entry that was left alone keeps the directory
+            // A scope directory exists only to hold packages, so one this
+            // very loop just emptied would otherwise outlive every package it
+            // was created for, leaving an empty `@types` where `@types/node`
+            // used to be. An entry that was left alone keeps the directory
             // non-empty, which is the answer that wants to be given anyway.
-            if entries(&path)?.is_empty() {
+            //
+            // `emptied_it` is what keeps this inside the rule the rest of
+            // convergence obeys: a scope directory is not a symlink, so the
+            // ownership test can say nothing about it, and the only thing that
+            // makes removing one provable is having just taken its last
+            // package out. An empty `@foo` that was already empty on arrival
+            // is someone else's — jerky never creates one it does not
+            // immediately fill — so it stays, and removing it would be the one
+            // place convergence deleted a real directory it did not write.
+            if emptied_it && entries(&path)?.is_empty() {
                 std::fs::remove_dir(&path).map_err(|source| LinkError::Access {
                     path: path.clone(),
                     source,
@@ -448,7 +458,12 @@ pub fn converge(
     Ok(left_alone)
 }
 
-/// Decide one `node_modules` entry and act on the answer.
+/// Decide one `node_modules` entry and act on the answer, reporting whether it
+/// was removed.
+///
+/// The answer is what tells a scope directory whether it is jerky's to take
+/// away: an `@types` this loop just emptied is jerky's debris, one that was
+/// already empty is someone else's.
 ///
 /// A name the importer still declares is left alone without asking who owns it:
 /// the link was just written by this very install, and an *unowned* entry under
@@ -462,25 +477,28 @@ fn converge_entry(
     members: &BTreeSet<PathBuf>,
     expected: &BTreeSet<String>,
     left_alone: &mut Vec<Unowned>,
-) -> Result<(), LinkError> {
+) -> Result<bool, LinkError> {
     if expected.contains(name) {
-        return Ok(());
+        return Ok(false);
     }
 
     match ownership(path, virtual_store, members)? {
         // `remove_file` on a symlink removes the link and never the directory
         // it names, which is the whole reason a dependency can be unlinked from
         // one importer while another goes on using it.
-        Ownership::Jerkys => std::fs::remove_file(path).map_err(|source| LinkError::Access {
-            path: path.to_path_buf(),
-            source,
-        }),
+        Ownership::Jerkys => {
+            std::fs::remove_file(path).map_err(|source| LinkError::Access {
+                path: path.to_path_buf(),
+                source,
+            })?;
+            Ok(true)
+        }
         Ownership::Unowned(reason) => {
             left_alone.push(Unowned {
                 path: path.to_path_buf(),
                 reason,
             });
-            Ok(())
+            Ok(false)
         }
     }
 }
@@ -617,26 +635,72 @@ pub fn prune_virtual_store(
         // Staging is the linker's own scratch space rather than a package
         // entry. It is emptied by the guard that creates it, and removing the
         // directory itself would only have it recreated on the next install.
-        if name == STAGING_DIR || expected.contains(&name) {
+        if name == STAGING_DIR {
             continue;
         }
 
-        // Branching on the type rather than reaching straight for
-        // `remove_dir_all`, which fails on anything that is not a directory.
-        // Nothing should ever have put a file here, and failing an otherwise
-        // good install over one would be a poor trade.
-        let removed = if is_real_dir(&path)? {
-            std::fs::remove_dir_all(&path)
-        } else {
-            std::fs::remove_file(&path)
-        };
-        removed.map_err(|source| LinkError::Access {
-            path: path.clone(),
-            source,
-        })?;
+        // A scoped entry is nested, because its directory name contains a
+        // `/`: `PackageId`'s `Display` is `{name}@{version}`, so `@types/node`
+        // at 20.0.0 is the name `@types/node@20.0.0`, and the `join` in
+        // `populate_virtual_store` turns that single name into two levels —
+        // `.jerky/@types/node@20.0.0`.
+        //
+        // So this has to descend for the same reason `converge` does, and the
+        // cost of not descending is worse here: a flat read sees `@types`,
+        // finds it in no `expected` set (which holds `@types/node@20.0.0`, not
+        // `@types`), and takes it for a dead entry — deleting a live store
+        // directory and dangling every link into it, silently, on every
+        // install. Written now even though nothing scoped resolves yet (#22),
+        // because that is exactly the shape of a landmine.
+        if name.starts_with('@') && is_real_dir(&path)? {
+            for child in entries(&path)? {
+                let scoped = format!("{name}/{}", file_name(&child));
+                if expected.contains(&scoped) {
+                    continue;
+                }
+                remove_entry(&child)?;
+            }
+
+            // Unlike a scope directory in an importer's `node_modules`, an
+            // empty one here needs no proof of ownership and so is removed
+            // whether or not this loop is what emptied it: everything under
+            // `.jerky` was written by `populate_virtual_store`, so ownership
+            // is settled by location rather than by a link target.
+            if entries(&path)?.is_empty() {
+                std::fs::remove_dir(&path).map_err(|source| LinkError::Access {
+                    path: path.clone(),
+                    source,
+                })?;
+            }
+            continue;
+        }
+
+        if expected.contains(&name) {
+            continue;
+        }
+
+        remove_entry(&path)?;
     }
 
     Ok(())
+}
+
+/// Remove one virtual store entry, whatever kind of thing it turned out to be.
+///
+/// Branching on the type rather than reaching straight for `remove_dir_all`,
+/// which fails on anything that is not a directory. Nothing should ever have
+/// put a file here, and failing an otherwise good install over one would be a
+/// poor trade.
+fn remove_entry(path: &Path) -> Result<(), LinkError> {
+    let removed = if is_real_dir(path)? {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    };
+    removed.map_err(|source| LinkError::Access {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 #[cfg(test)]
@@ -1090,5 +1154,93 @@ mod tests {
         // Staging is the linker's own scratch space, recreated on the next
         // install, so pruning has no business deciding it is dead.
         assert!(node_modules.join(".jerky/.staging").is_dir());
+    }
+
+    #[test]
+    fn a_scoped_store_entry_the_graph_still_names_survives_the_prune() {
+        // A scoped entry's directory name contains a `/`, so it is nested two
+        // levels deep — `.jerky/@types/node@20.0.0`. A prune that read one
+        // level would see `@types`, find it in no `expected` set, and
+        // `remove_dir_all` a live entry, dangling every link into it silently
+        // on every install.
+        // Built directly rather than through `populate_virtual_store`, which
+        // cannot create a scoped entry today: it renames staging onto
+        // `.jerky/@types/node@20.0.0` without creating the `@types` level
+        // first, so the rename fails with `ENOENT`. That is #22's to fix —
+        // what is under test here is that the prune agrees with the layout
+        // `populate_virtual_store` names, whenever it can write it.
+        let root = TempDir::new().unwrap();
+        let node_modules = root.path().join("ws").join("node_modules");
+        for version in ["20.0.0", "18.0.0"] {
+            std::fs::create_dir_all(
+                node_modules
+                    .join(".jerky")
+                    .join("@types")
+                    .join(format!("node@{version}"))
+                    .join("node_modules")
+                    .join("@types")
+                    .join("node"),
+            )
+            .unwrap();
+        }
+
+        prune_virtual_store(&node_modules, &names(&["@types/node@20.0.0"])).unwrap();
+
+        assert!(
+            node_modules.join(".jerky/@types/node@20.0.0").is_dir(),
+            "the graph still names this entry and the prune deleted it anyway"
+        );
+        assert!(
+            !still_there(&node_modules.join(".jerky/@types/node@18.0.0")),
+            "a scoped entry the graph dropped stayed unpacked"
+        );
+        assert!(
+            node_modules.join(".jerky/@types").is_dir(),
+            "the scope still holds a live entry"
+        );
+    }
+
+    #[test]
+    fn a_scope_emptied_by_the_prune_goes_with_its_last_entry() {
+        let root = TempDir::new().unwrap();
+        let node_modules = root.path().join("ws").join("node_modules");
+        std::fs::create_dir_all(node_modules.join(".jerky/@types/node@20.0.0")).unwrap();
+
+        prune_virtual_store(&node_modules, &BTreeSet::new()).unwrap();
+
+        assert!(
+            !still_there(&node_modules.join(".jerky/@types")),
+            "the scope outlived the only entry it was created for"
+        );
+    }
+
+    #[test]
+    fn a_scope_directory_convergence_did_not_empty_is_left_alone() {
+        // The one place `converge` would otherwise remove something that is
+        // not a symlink. An empty `@foo` that was already empty on arrival is
+        // not jerky's — jerky never creates a scope directory it does not
+        // immediately fill — and deleting it would contradict the rule the
+        // rest of convergence obeys: remove only what jerky can prove it
+        // wrote.
+        let root = TempDir::new().unwrap();
+        let workspace_root = root.path().join("ws");
+        let node_modules = workspace_root.join("node_modules");
+        std::fs::create_dir_all(node_modules.join("@someone-elses")).unwrap();
+
+        let left_alone = converge(
+            &workspace_root,
+            &workspace_root,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+
+        assert!(
+            still_there(&node_modules.join("@someone-elses")),
+            "convergence deleted a real directory it never wrote"
+        );
+        // Not reported either: it holds no dependency, so there is nothing to
+        // tell the user jerky declined to touch.
+        assert!(left_alone.is_empty());
     }
 }
