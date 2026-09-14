@@ -2624,7 +2624,9 @@ fn production_leaves_the_lockfile_byte_identical() {
 fn production_without_a_lockfile_errors() {
     let home = TempDir::new().unwrap();
     let work = TempDir::new().unwrap();
-    let root = work.path();
+    // Canonical, because the error names a path and this test compares it
+    // against one built here. See `workspace_root`.
+    let root = &workspace_root(&work);
     let store = Store::new(home.path().join("store"));
     let registry = production_workspace(root);
 
