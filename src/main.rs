@@ -4,7 +4,7 @@ use std::process::ExitCode;
 use clap::Parser;
 use jerky::cli::{Cli, Command};
 use jerky::error::JerkyError;
-use jerky::resolver::ImporterPath;
+use jerky::resolver::{ImporterPath, Kind};
 use jerky::workspace::{Warning, Workspace};
 
 fn main() -> ExitCode {
@@ -36,7 +36,7 @@ fn run(cli: Cli) -> Result<(), JerkyError> {
             println!("wrote {}", path.display());
             Ok(())
         }
-        Command::Install { spec } => {
+        Command::Install { spec, save_dev } => {
             let spec = spec
                 .as_deref()
                 .map(jerky::cli::parse_package_spec)
@@ -62,8 +62,14 @@ fn run(cli: Cli) -> Result<(), JerkyError> {
                 // guess for `importer_for` to refuse — see its own doc comment.
                 Some(spec) => {
                     let importer = importer_for(&workspace, &project_dir)?;
+                    // `None` rather than `Some(Kind::Prod)`: without
+                    // `--save-dev` the command names a package and not a
+                    // section, and the two are not the same instruction. The
+                    // install reads the section off the manifest for the
+                    // first, and would overwrite it for the second.
+                    let kind = save_dev.then_some(Kind::Dev);
                     let installed = jerky::commands::install::install(
-                        &workspace, &importer, &store, &registry, &spec,
+                        &workspace, &importer, &store, &registry, &spec, kind,
                     )?;
                     println!(
                         "added {}@{} to {importer}",

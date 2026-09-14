@@ -2,7 +2,7 @@ use std::path::Path;
 
 use jerky::cli::{PackageSpec, VersionSpec};
 use jerky::commands::install::{InstallError, Request, install, sync};
-use jerky::resolver::{ImporterPath, ResolveError};
+use jerky::resolver::{ImporterPath, Kind, ResolveError};
 use jerky::store::Store;
 use jerky::testing::{FixtureRegistry, TarEntry, build_tarball};
 use jerky::workspace::{Workspace, WorkspaceError};
@@ -52,6 +52,7 @@ fn installs_a_package_end_to_end() {
         &store,
         &registry,
         &spec("lodash", VersionSpec::Latest),
+        None,
     )
     .unwrap();
 
@@ -86,6 +87,7 @@ fn the_recorded_version_comes_from_the_registry_not_the_request() {
         &store,
         &registry,
         &spec("react", VersionSpec::Exact("latest".into())),
+        None,
     )
     .unwrap();
 
@@ -110,6 +112,7 @@ fn files_are_hard_linked_from_the_store_not_copied() {
         &store,
         &registry,
         &spec("lodash", VersionSpec::Latest),
+        None,
     )
     .unwrap();
 
@@ -145,6 +148,7 @@ fn a_second_install_reuses_the_store_without_downloading() {
         &store,
         &registry,
         &spec("lodash", VersionSpec::Latest),
+        None,
     )
     .unwrap();
     assert_eq!(registry.tarball_calls(), 1);
@@ -155,6 +159,7 @@ fn a_second_install_reuses_the_store_without_downloading() {
         &store,
         &registry,
         &spec("lodash", VersionSpec::Latest),
+        None,
     )
     .unwrap();
 
@@ -182,6 +187,7 @@ fn an_integrity_mismatch_leaves_the_store_empty() {
         &store,
         &registry,
         &spec("evil", VersionSpec::Latest),
+        None,
     );
 
     assert!(matches!(result, Err(InstallError::Integrity { .. })));
@@ -212,7 +218,8 @@ fn reports_an_unknown_package() {
             &ImporterPath::root(),
             &store,
             &registry,
-            &spec("nope", VersionSpec::Latest)
+            &spec("nope", VersionSpec::Latest),
+            None
         ),
         // Reaches the caller through the resolver now: version selection is
         // what asks the registry, so that is where a missing package is found.
@@ -283,6 +290,7 @@ fn installing_from_one_importer_leaves_the_others_linked() {
         &store,
         &two_versions_of_lodash(),
         &spec("lodash", VersionSpec::Exact("4.17.21".into())),
+        None,
     )
     .unwrap();
 
@@ -320,6 +328,7 @@ fn two_importers_on_the_same_version_share_one_store_entry() {
         &store,
         &two_versions_of_lodash(),
         &spec("lodash", VersionSpec::Exact("4.17.21".into())),
+        None,
     )
     .unwrap();
 
@@ -370,6 +379,7 @@ fn a_local_dependency_is_linked_not_fetched() {
         &store,
         &registry,
         &spec("lodash", VersionSpec::Exact("4.17.21".into())),
+        None,
     )
     .unwrap();
 
@@ -406,6 +416,7 @@ fn a_workspace_specifier_naming_no_member_is_an_error() {
         &store,
         &two_versions_of_lodash(),
         &spec("lodash", VersionSpec::Exact("4.17.21".into())),
+        None,
     )
     .unwrap_err();
 
@@ -431,6 +442,7 @@ fn a_single_importer_workspace_installs_exactly_as_before() {
         &store,
         &FixtureRegistry::new().with_package("lodash", "4.17.21", lodash_tarball()),
         &spec("lodash", VersionSpec::Latest),
+        None,
     )
     .unwrap();
 
@@ -484,6 +496,7 @@ fn installing_a_member_by_the_workspace_protocol_links_it() {
         &store,
         &registry,
         &spec("ui", VersionSpec::Exact("workspace:*".into())),
+        None,
     )
     .unwrap();
 
@@ -511,6 +524,7 @@ fn install_writes_one_lockfile_at_the_workspace_root() {
         &store,
         &two_versions_of_lodash(),
         &spec("lodash", VersionSpec::Exact("4.17.21".into())),
+        None,
     )
     .unwrap();
 
@@ -548,6 +562,7 @@ fn a_lockfile_target_is_one_climb_short_of_the_symlink() {
         &store,
         &two_versions_of_lodash(),
         &spec("lodash", VersionSpec::Exact("4.17.21".into())),
+        None,
     )
     .unwrap();
 
@@ -581,6 +596,7 @@ fn the_manifest_records_an_exact_pin() {
         &store,
         &FixtureRegistry::new().with_package("lodash", "4.17.21", lodash_tarball()),
         &spec("lodash", VersionSpec::Latest),
+        None,
     )
     .unwrap();
 
@@ -609,6 +625,7 @@ fn an_exact_request_still_installs_that_exact_version() {
         &store,
         &registry,
         &spec("lodash", VersionSpec::Exact("4.17.21".into())),
+        None,
     )
     .unwrap();
 
@@ -643,6 +660,7 @@ fn a_range_the_user_typed_is_recorded_as_they_typed_it() {
         &store,
         &registry,
         &spec("lodash", VersionSpec::Exact("^4.0.0".into())),
+        None,
     )
     .unwrap();
 
@@ -666,6 +684,7 @@ fn a_range_the_user_typed_is_recorded_as_they_typed_it() {
         &store,
         &registry,
         &spec("lodash", VersionSpec::Exact("^4.0.0".into())),
+        None,
     )
     .unwrap();
     assert_eq!(
@@ -709,6 +728,7 @@ fn every_range_form_is_recorded_as_written() {
             &store,
             &registry,
             &spec("lodash", VersionSpec::Exact(requested.into())),
+            None,
         )
         .unwrap();
 
@@ -748,6 +768,7 @@ fn a_range_that_rules_nothing_out_is_refused() {
             &Store::new(home.path().join("store")),
             &registry,
             &spec("lodash", VersionSpec::Exact(requested.into())),
+            None,
         )
         .unwrap_err();
 
@@ -797,6 +818,7 @@ fn a_bounded_range_is_not_mistaken_for_a_wildcard() {
             &Store::new(home.path().join("store")),
             &registry,
             &spec("lodash", VersionSpec::Exact(requested.into())),
+            None,
         )
         .unwrap_or_else(|err| panic!("`{requested}` was refused: {err}"));
 
@@ -829,6 +851,7 @@ fn a_dist_tag_other_than_latest_resolves_and_pins() {
         &Store::new(home.path().join("store")),
         &registry,
         &spec("lodash", VersionSpec::Exact("next".into())),
+        None,
     )
     .unwrap();
 
@@ -860,6 +883,7 @@ fn a_dist_tag_is_pinned_rather_than_recorded_as_a_tag() {
         &store,
         &registry,
         &spec("lodash", VersionSpec::Exact("latest".into())),
+        None,
     )
     .unwrap();
 
@@ -891,6 +915,7 @@ fn a_pinned_dependency_does_not_drift_when_its_importer_is_re_resolved() {
         &store,
         &registry,
         &spec("lodash", VersionSpec::Exact("4.17.21".into())),
+        None,
     )
     .unwrap();
 
@@ -900,6 +925,7 @@ fn a_pinned_dependency_does_not_drift_when_its_importer_is_re_resolved() {
         &store,
         &registry,
         &spec("alpha", VersionSpec::Exact("1.0.0".into())),
+        None,
     )
     .unwrap();
 
@@ -927,13 +953,13 @@ fn an_unchanged_workspace_does_not_re_resolve() {
     let request = spec("lodash", VersionSpec::Exact("4.17.21".into()));
     let web = ImporterPath::new("apps/web").unwrap();
 
-    install(&workspace, &web, &store, &registry, &request).unwrap();
+    install(&workspace, &web, &store, &registry, &request, None).unwrap();
     let after_first = registry.packument_calls();
     assert!(after_first > 0, "the first install resolved nothing");
 
     // Same workspace, same request, and now a lockfile recording both.
     let workspace = Workspace::discover(root).unwrap();
-    install(&workspace, &web, &store, &registry, &request).unwrap();
+    install(&workspace, &web, &store, &registry, &request, None).unwrap();
 
     assert_eq!(
         registry.packument_calls(),
@@ -976,6 +1002,7 @@ fn editing_one_importer_re_resolves_only_what_it_must() {
         &store,
         &registry,
         &spec("alpha", VersionSpec::Exact("1.0.0".into())),
+        None,
     )
     .unwrap();
     assert_eq!(registry.packument_calls_for("lodash"), 1);
@@ -992,6 +1019,7 @@ fn editing_one_importer_re_resolves_only_what_it_must() {
         &store,
         &registry,
         &spec("beta", VersionSpec::Exact("1.0.0".into())),
+        None,
     )
     .unwrap();
 
@@ -1042,6 +1070,7 @@ fn a_dependency_deleted_by_hand_loses_its_subtree() {
         &store,
         &registry,
         &spec("alpha", VersionSpec::Exact("1.0.0".into())),
+        None,
     )
     .unwrap();
 
@@ -1062,6 +1091,7 @@ fn a_dependency_deleted_by_hand_loses_its_subtree() {
         &store,
         &registry,
         &spec("beta", VersionSpec::Exact("1.0.0".into())),
+        None,
     )
     .unwrap();
 
@@ -1102,6 +1132,7 @@ fn a_lockfile_integrity_mismatch_stops_the_install() {
         &Store::new(first_home.path().join("store")),
         &registry,
         &spec("lodash", VersionSpec::Exact("4.17.21".into())),
+        None,
     )
     .unwrap();
 
@@ -1134,6 +1165,7 @@ fn a_lockfile_integrity_mismatch_stops_the_install() {
         &Store::new(second_home.path().join("store")),
         &registry,
         &spec("lodash", VersionSpec::Exact("4.17.21".into())),
+        None,
     )
     .unwrap_err();
 
@@ -1170,6 +1202,7 @@ fn a_warm_store_does_not_excuse_a_lockfile_mismatch() {
         &store,
         &registry,
         &spec("lodash", VersionSpec::Exact("4.17.21".into())),
+        None,
     )
     .unwrap();
 
@@ -1192,6 +1225,7 @@ fn a_warm_store_does_not_excuse_a_lockfile_mismatch() {
         &store,
         &registry,
         &spec("lodash", VersionSpec::Exact("4.17.21".into())),
+        None,
     )
     .unwrap_err();
 
@@ -1227,6 +1261,7 @@ fn a_request_naming_the_locked_version_does_not_re_resolve() {
         &store,
         &registry,
         &spec("lodash", VersionSpec::Exact("^4.0.0".into())),
+        None,
     )
     .unwrap();
     assert_eq!(registry.packument_calls_for("lodash"), 1);
@@ -1237,6 +1272,7 @@ fn a_request_naming_the_locked_version_does_not_re_resolve() {
         &store,
         &registry,
         &spec("lodash", VersionSpec::Exact("4.18.0".into())),
+        None,
     )
     .unwrap();
 
@@ -1280,6 +1316,7 @@ fn a_bare_request_asks_even_when_the_manifest_declares_a_dist_tag() {
         &store,
         &registry,
         &spec("alpha", VersionSpec::Latest),
+        None,
     )
     .unwrap();
     let before = registry.packument_calls_for("lodash");
@@ -1290,6 +1327,7 @@ fn a_bare_request_asks_even_when_the_manifest_declares_a_dist_tag() {
         &store,
         &registry,
         &spec("lodash", VersionSpec::Latest),
+        None,
     )
     .unwrap();
 
@@ -1566,6 +1604,7 @@ fn installing_a_dev_dependency_at_its_locked_version_does_not_duplicate_it() {
         &store,
         &registry,
         &spec("lodash", VersionSpec::Exact("4.17.21".into())),
+        None,
     )
     .unwrap();
 
@@ -1584,6 +1623,47 @@ fn installing_a_dev_dependency_at_its_locked_version_does_not_duplicate_it() {
         "4.17.21"
     );
     assert!(lock["importers"]["."]["dependencies"].is_null());
+}
+
+#[test]
+fn a_plain_install_does_not_settle_a_duplicate_it_was_not_asked_about() {
+    // A manifest declaring lodash in *both* sections is a contradiction jerky
+    // masks with the prod-wins rule rather than resolving in the file, because
+    // the manifest may belong to someone else's monorepo or be generated by a
+    // tool. `jerky install lodash@4.18.0` asks for a version and nothing else,
+    // so the `devDependencies` line has to survive it — deleting that entry
+    // would lose a declaration the user never mentioned.
+    //
+    // Driven through `install` rather than `Manifest` directly: what decides
+    // this is the branch in `install` choosing `add_dependency` over
+    // `move_dependency`, and a unit test on the manifest cannot see it.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let store = Store::new(home.path().join("store"));
+    let registry =
+        FixtureRegistry::new().with_packument("lodash", &[("4.17.21", &[]), ("4.18.0", &[])]);
+    write_manifest(
+        root,
+        r#"{"name":"demo","dependencies":{"lodash":"4.17.21"},"devDependencies":{"lodash":"3.0.0"}}"#,
+    );
+
+    install(
+        &solo(root),
+        &ImporterPath::root(),
+        &store,
+        &registry,
+        &spec("lodash", VersionSpec::Exact("4.18.0".into())),
+        None,
+    )
+    .unwrap();
+
+    let manifest = read_json(&root.join("package.json"));
+    assert_eq!(manifest["dependencies"]["lodash"], "4.18.0");
+    assert_eq!(
+        manifest["devDependencies"]["lodash"], "3.0.0",
+        "a version change must not delete the other declaration: {manifest}"
+    );
 }
 
 #[test]
@@ -1617,6 +1697,7 @@ fn installing_a_new_version_of_a_dev_dependency_keeps_it_a_dev_dependency() {
         &store,
         &registry,
         &spec("lodash", VersionSpec::Exact("4.18.0".into())),
+        None,
     )
     .unwrap();
 
@@ -1633,6 +1714,171 @@ fn installing_a_new_version_of_a_dev_dependency_keeps_it_a_dev_dependency() {
         "4.18.0"
     );
     assert!(lock["importers"]["."]["dependencies"].is_null());
+}
+
+// The `--save-dev` tests. What the flag does is one line of manifest writing;
+// what it has to not do is leave the name in the section it came from, which
+// is the half that needs a workspace and a lockfile to pin down.
+
+#[test]
+fn save_dev_records_under_dev_dependencies() {
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let project_dir = project(work.path());
+    let store = Store::new(home.path().join("store"));
+    let registry = FixtureRegistry::new().with_package("lodash", "4.17.21", lodash_tarball());
+
+    install(
+        &solo(project_dir),
+        &ImporterPath::root(),
+        &store,
+        &registry,
+        &spec("lodash", VersionSpec::Latest),
+        Some(Kind::Dev),
+    )
+    .unwrap();
+
+    let manifest = read_json(&project_dir.join("package.json"));
+    assert_eq!(manifest["devDependencies"]["lodash"], "4.17.21");
+    assert!(
+        manifest["dependencies"].is_null(),
+        "the package was declared twice: {manifest}"
+    );
+
+    // And the lockfile agrees, so the next install has nothing to re-resolve.
+    let lock = read_json(&project_dir.join("jerky-lock.json"));
+    assert_eq!(
+        lock["importers"]["."]["devDependencies"]["lodash"]["version"],
+        "4.17.21"
+    );
+    assert!(lock["importers"]["."]["dependencies"].is_null());
+}
+
+#[test]
+fn save_dev_records_in_the_importer_you_are_standing_in() {
+    // The same rule as any other install — the flag chooses a section, not an
+    // importer. Two members, so there is a wrong manifest for it to land in.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let root_manifest = r#"{"name":"ws","workspaces":["packages/*"]}"#;
+    write_manifest(root, root_manifest);
+    write_manifest(&root.join("packages/ui"), r#"{"name":"ui"}"#);
+
+    let store = Store::new(home.path().join("store"));
+    let registry = FixtureRegistry::new().with_packument("lodash", &[("4.17.21", &[])]);
+
+    install(
+        &Workspace::discover(root).unwrap(),
+        &ImporterPath::new("packages/ui").unwrap(),
+        &store,
+        &registry,
+        &spec("lodash", VersionSpec::Exact("4.17.21".into())),
+        Some(Kind::Dev),
+    )
+    .unwrap();
+
+    let ui = read_json(&root.join("packages/ui/package.json"));
+    assert_eq!(ui["devDependencies"]["lodash"], "4.17.21");
+
+    // Byte-identical rather than field-by-field: a `"devDependencies": {}`
+    // added to a manifest nobody asked about is exactly as wrong as an entry
+    // in it, and only the bytes catch that.
+    let untouched = std::fs::read_to_string(root.join("package.json")).unwrap();
+    assert_eq!(
+        untouched, root_manifest,
+        "installing into packages/ui rewrote the root manifest"
+    );
+
+    let lock = read_json(&root.join("jerky-lock.json"));
+    assert_eq!(
+        lock["importers"]["packages/ui"]["devDependencies"]["lodash"]["specifier"],
+        "4.17.21"
+    );
+}
+
+#[test]
+fn installing_over_an_existing_entry_does_not_duplicate_it_across_sections() {
+    // `jerky install lodash` then `jerky install --save-dev lodash` must move
+    // it. A name in both sections is the contradiction the resolver has to
+    // paper over with its prod-wins rule, and the paper never comes off: the
+    // lockfile settles and the manifest goes on declaring both.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let project_dir = project(work.path());
+    let store = Store::new(home.path().join("store"));
+    let registry = FixtureRegistry::new().with_packument("lodash", &[("4.17.21", &[])]);
+
+    for kind in [None, Some(Kind::Dev)] {
+        install(
+            &solo(project_dir),
+            &ImporterPath::root(),
+            &store,
+            &registry,
+            &spec("lodash", VersionSpec::Latest),
+            kind,
+        )
+        .unwrap();
+    }
+
+    let manifest = read_json(&project_dir.join("package.json"));
+    assert_eq!(manifest["devDependencies"]["lodash"], "4.17.21");
+    assert!(
+        manifest["dependencies"].is_null(),
+        "lodash is declared in both sections: {manifest}"
+    );
+}
+
+#[test]
+fn save_dev_moves_an_entry_the_lockfile_already_satisfies() {
+    // The reuse path, which is where a section change is easiest to lose: the
+    // manifest matches the lockfile and the requested version is the one
+    // already resolved, so nothing about *this package* needs looking up. The
+    // section is still a change, and one the lockfile records, so it has to
+    // make the importer stale — otherwise the manifest moves, the lockfile
+    // does not, and the file goes on describing a section the manifest has
+    // abandoned until some later install notices.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let store = Store::new(home.path().join("store"));
+    let registry = FixtureRegistry::new().with_packument("lodash", &[("4.17.21", &[])]);
+    write_manifest(
+        root,
+        r#"{"name":"demo","dependencies":{"lodash":"4.17.21"}}"#,
+    );
+
+    sync(
+        &Workspace::discover(root).unwrap(),
+        &store,
+        &registry,
+        None::<&Request>,
+    )
+    .unwrap();
+
+    install(
+        &solo(root),
+        &ImporterPath::root(),
+        &store,
+        &registry,
+        &spec("lodash", VersionSpec::Exact("4.17.21".into())),
+        Some(Kind::Dev),
+    )
+    .unwrap();
+
+    let manifest = read_json(&root.join("package.json"));
+    assert_eq!(manifest["devDependencies"]["lodash"], "4.17.21");
+    assert!(manifest["dependencies"].is_null(), "{manifest}");
+
+    let lock = read_json(&root.join("jerky-lock.json"));
+    assert_eq!(
+        lock["importers"]["."]["devDependencies"]["lodash"]["version"],
+        "4.17.21"
+    );
+    assert!(
+        lock["importers"]["."]["dependencies"].is_null(),
+        "the lockfile still records the section the manifest left"
+    );
 }
 
 #[test]

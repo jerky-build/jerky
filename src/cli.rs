@@ -21,6 +21,14 @@ pub enum Command {
         /// Package to add, e.g. `lodash` or `lodash@4.17.21`. Omit it to
         /// install what every importer's package.json already declares.
         spec: Option<String>,
+        // `requires` rather than a flag that is quietly ignored on its own:
+        // `jerky install --save-dev` names no package to record anywhere, and
+        // performing a bare install instead would answer a question nobody
+        // asked. Rationale stays out of the doc comment because clap prints
+        // that one to the user.
+        /// Record the package under devDependencies rather than dependencies
+        #[arg(long, short = 'D', requires = "spec")]
+        save_dev: bool,
     },
 }
 
@@ -117,15 +125,51 @@ mod tests {
         // The post-clone command. `spec` being required is what has meant
         // there was no way to say *install what this repo declares*.
         let cli = Cli::parse_from(["jerky", "install"]);
-        assert!(matches!(cli.command, Command::Install { spec: None }));
+        assert!(matches!(cli.command, Command::Install { spec: None, .. }));
     }
 
     #[test]
     fn install_still_accepts_a_spec() {
         let cli = Cli::parse_from(["jerky", "install", "lodash@4.17.21"]);
         assert!(
-            matches!(cli.command, Command::Install { spec: Some(ref s) } if s == "lodash@4.17.21")
+            matches!(cli.command, Command::Install { spec: Some(ref s), .. } if s == "lodash@4.17.21")
         );
+    }
+
+    #[test]
+    fn the_short_flag_does_the_same_thing() {
+        // `-D` is universal muscle memory, and the only difference between it
+        // working and it being a parse error is one `short` attribute. Asked
+        // of clap rather than of an install, because what could go wrong here
+        // is the spelling and nothing below it.
+        let long = Cli::parse_from(["jerky", "install", "--save-dev", "lodash"]);
+        let short = Cli::parse_from(["jerky", "install", "-D", "lodash"]);
+
+        for cli in [long, short] {
+            let Command::Install { spec, save_dev } = cli.command else {
+                panic!("expected an install");
+            };
+            assert_eq!(spec.as_deref(), Some("lodash"));
+            assert!(save_dev);
+        }
+    }
+
+    #[test]
+    fn a_plain_install_asks_for_no_section() {
+        let cli = Cli::parse_from(["jerky", "install", "lodash"]);
+        assert!(matches!(
+            cli.command,
+            Command::Install {
+                save_dev: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn save_dev_with_nothing_to_save_is_refused() {
+        // The alternative is a bare install that silently ignores the flag.
+        assert!(Cli::try_parse_from(["jerky", "install", "--save-dev"]).is_err());
     }
 
     #[test]

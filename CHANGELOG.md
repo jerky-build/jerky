@@ -35,9 +35,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   with no devDependencies gets no new block. `lockfileVersion` stays `1`; the
   format is unreleased ([#21](https://github.com/jerky-build/jerky/issues/21)).
   Recording a package *into* `devDependencies` from the command line is
-  `--save-dev`, which is still to come; a name appearing in both sections is
-  resolved as a production dependency, which is npm's answer, rather than
-  refused — the manifest may not be the user's to edit.
+  `--save-dev`, below; a name appearing in both sections is resolved as a
+  production dependency, which is npm's answer, rather than refused — the
+  manifest may not be the user's to edit.
+- `jerky install --save-dev <pkg>`, or `-D <pkg>`, records the package under
+  `devDependencies` rather than `dependencies`, in the workspace member you
+  are standing in. It *moves* a package already declared in the other section
+  rather than declaring it twice, and a section it empties by doing so is
+  removed rather than left behind as `"dependencies": {}`. Without the flag the
+  section is still whatever the manifest already says, so `jerky install
+  lodash@4.18.0` remains a version change and never a promotion — and a
+  manifest that declares the name in *both* sections keeps both, because
+  settling that contradiction is not something a version change was asked to
+  do. The lockfile
+  is rewritten to agree, so the move is one diff rather than a manifest change
+  the next install notices and repeats. `--save-dev` with no package is an
+  error rather than a bare install that ignores the flag
+  ([#57](https://github.com/jerky-build/jerky/issues/57)).
 - The lockfile is now read back, not only written. An importer whose recorded
   specifiers still match its `package.json` is reused verbatim; one that does
   not is re-resolved. Staleness is per importer, so editing `apps/web` does not
