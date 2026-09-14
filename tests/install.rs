@@ -11,6 +11,12 @@ use jerky::workspace::{Workspace, WorkspaceError};
 use std::os::unix::fs::MetadataExt as _;
 use tempfile::TempDir;
 
+/// The mode a file carries on disk, as the low twelve bits.
+fn mode_of(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
+}
+
 fn lodash_tarball() -> Vec<u8> {
     build_tarball(&[
         TarEntry::file(
@@ -144,6 +150,56 @@ fn files_are_hard_linked_from_the_store_not_copied() {
         (a.dev(), a.ino()),
         (b.dev(), b.ino()),
         "package was copied, not hard-linked — the store's whole purpose is lost"
+    );
+}
+
+#[test]
+fn a_hostile_mode_never_reaches_the_project() {
+    // The propagation the mode normalisation exists to stop. A store entry is
+    // hard-linked into every project that installs the package, so one set of
+    // permissions is shared machine-wide: a file left group- or
+    // world-writable in the store is writable in every project at once, and
+    // rewriting it there changes what all of them import.
+    //
+    // Asserting at the extraction seam alone would not show this. The claim
+    // is about what a developer's `node_modules` ends up holding.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let project_dir = project(work.path());
+    let store = Store::new(home.path().join("store"));
+    let tarball = build_tarball(&[
+        TarEntry::file(
+            "package/package.json",
+            r#"{"name":"hostile","version":"1.0.0"}"#,
+        ),
+        TarEntry::file_with_mode("package/index.js", "module.exports = {};", 0o666),
+        TarEntry::file_with_mode("package/bin/cli.js", "#!/usr/bin/env node\n", 0o4777),
+    ]);
+    let registry = FixtureRegistry::new().with_package("hostile", "1.0.0", tarball);
+
+    install(
+        &solo(project_dir),
+        &ImporterPath::root(),
+        &store,
+        &registry,
+        &spec("hostile", VersionSpec::Latest),
+        None,
+    )
+    .unwrap();
+
+    let installed = project_dir.join("node_modules/hostile");
+    assert_eq!(
+        mode_of(&installed.join("index.js")),
+        0o644,
+        "a world-writable file reached the project"
+    );
+    // The setuid bit is gone, and the one bit worth keeping survived: #20
+    // links this into `node_modules/.bin`, where a non-executable target is a
+    // runtime failure rather than an install one.
+    assert_eq!(
+        mode_of(&installed.join("bin/cli.js")),
+        0o755,
+        "a setuid binary reached the project"
     );
 }
 

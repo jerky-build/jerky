@@ -112,6 +112,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- File permissions from a package tarball are no longer applied as recorded.
+  Every extracted file becomes `0o644`, or `0o755` when the archive marked it
+  owner-executable, and every directory becomes `0o755`; nothing else from the
+  header survives. A package can no longer put a group- or world-writable file
+  into the content store, which matters more there than elsewhere because the
+  store is machine-global and hard-linked into every project, so one set of
+  permissions is shared by all of them at once and anyone who can rewrite that
+  file changes what all of them import. The setuid and setgid bits were
+  already dropped before this change, by the tar reader rather than by jerky;
+  they are now jerky's own guarantee and a test fails if that stops being true
+  ([#29](https://github.com/jerky-build/jerky/issues/29))
 - `jerky install` is now convergent rather than additive: after it runs, each
   importer's `node_modules` holds what its manifest declares and nothing else.
   A dependency you delete from a `package.json` loses its link on the next

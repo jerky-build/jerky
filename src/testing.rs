@@ -17,8 +17,15 @@ pub const ABC_SHA512_SSRI: &str = "sha512-3a81oZNherrMQXNJriBBMRLm+k6JqX6iCp7u5k
 
 /// One entry in a generated tarball.
 pub enum TarEntry<'a> {
-    /// A regular file at `path` with `contents`.
-    File { path: &'a str, contents: &'a [u8] },
+    /// A regular file at `path` with `contents`, recorded with `mode`.
+    File {
+        path: &'a str,
+        contents: &'a [u8],
+        mode: u32,
+    },
+    /// A directory at `path`, recorded with `mode`. Real npm tarballs carry
+    /// directory entries, and their mode is as untrusted as a file's.
+    Dir { path: &'a str, mode: u32 },
     /// A symlink at `path` pointing at `target`. Used to build hostile
     /// fixtures that a committed binary tarball could not safely carry.
     Symlink { path: &'a str, target: &'a str },
@@ -29,6 +36,21 @@ impl<'a> TarEntry<'a> {
         TarEntry::File {
             path,
             contents: contents.as_bytes(),
+            mode: 0o644,
+        }
+    }
+
+    /// A file carrying a mode of the fixture's choosing.
+    ///
+    /// A package tarball is untrusted input and the mode field is part of it,
+    /// so the hostile modes — setuid, setgid, world-writable — have to be
+    /// expressible here or the normalisation in `archive::extract` cannot be
+    /// tested at all.
+    pub fn file_with_mode(path: &'a str, contents: &'a str, mode: u32) -> Self {
+        TarEntry::File {
+            path,
+            contents: contents.as_bytes(),
+            mode,
         }
     }
 }
@@ -61,13 +83,27 @@ pub fn build_tarball(entries: &[TarEntry<'_>]) -> Vec<u8> {
     for entry in entries {
         let mut header = tar::Header::new_gnu();
         match entry {
-            TarEntry::File { path, contents } => {
+            TarEntry::File {
+                path,
+                contents,
+                mode,
+            } => {
                 set_raw_path(&mut header, path);
                 header.set_size(contents.len() as u64);
-                header.set_mode(0o644);
+                header.set_mode(*mode);
                 header.set_cksum();
                 builder
                     .append(&header, *contents)
+                    .expect("in-memory tar append cannot fail");
+            }
+            TarEntry::Dir { path, mode } => {
+                set_raw_path(&mut header, path);
+                header.set_size(0);
+                header.set_mode(*mode);
+                header.set_entry_type(tar::EntryType::Directory);
+                header.set_cksum();
+                builder
+                    .append(&header, std::io::empty())
                     .expect("in-memory tar append cannot fail");
             }
             TarEntry::Symlink { path, target } => {
