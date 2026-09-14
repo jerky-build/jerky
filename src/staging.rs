@@ -30,6 +30,31 @@ fn unique_suffix() -> String {
     format!("{}-{}-{}", std::process::id(), nanos, n)
 }
 
+/// Put a freshly created staging directory at 0o755.
+///
+/// `create_dir` derives its mode from the process umask, and the store renames
+/// this directory into place as the entry root — so under a permissive umask
+/// the store would hold a group- or world-writable directory, and another user
+/// could add or replace files inside a package every project on the machine
+/// imports. `archive::extract` normalises what it writes *into* the directory
+/// but never the directory itself, which the caller owns; this is that caller.
+#[cfg(unix)]
+fn set_traversable(path: &Path) -> Result<(), StagingError> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).map_err(|source| {
+        StagingError {
+            path: path.to_path_buf(),
+            source,
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn set_traversable(_path: &Path) -> Result<(), StagingError> {
+    Ok(())
+}
+
 /// A staging directory that deletes itself on drop unless kept.
 ///
 /// Hand-rolled rather than using `tempfile::TempDir` because the directory has
@@ -58,6 +83,7 @@ impl StagingDir {
             path: path.clone(),
             source,
         })?;
+        set_traversable(&path)?;
 
         Ok(Self { path, keep: false })
     }

@@ -74,6 +74,7 @@ pub fn extract(tarball: &[u8], dest: &Path) -> Result<(), ArchiveError> {
                 path: parent.to_path_buf(),
                 source,
             })?;
+            normalise_created_dirs(dest, parent)?;
         }
 
         entry
@@ -83,7 +84,7 @@ pub fn extract(tarball: &[u8], dest: &Path) -> Result<(), ArchiveError> {
                 source,
             })?;
 
-        normalise_mode(&target, entry.header())?;
+        normalise_mode(&target, entry.header().mode().unwrap_or(0))?;
     }
 
     Ok(())
@@ -103,10 +104,18 @@ fn is_metadata(entry_type: tar::EntryType) -> bool {
 
 /// Replace what the tarball recorded with a mode jerky chose.
 ///
-/// Exactly one bit of the header is consulted — owner-execute on a regular
-/// file, which marks a CLI entry point — and everything else is discarded. A
-/// directory is always 0o755, since its execute bit is the right to descend
-/// into it rather than to run it.
+/// Exactly one bit of `recorded` is consulted — owner-execute, which marks a
+/// CLI entry point — and only for a file. A directory is always 0o755, since
+/// its execute bit is the right to descend into it rather than to run it.
+///
+/// Whether `target` *is* a directory is read from the filesystem rather than
+/// from the header's type flag, because the two disagree. `unpack` applies an
+/// old-BSD compatibility rule that makes a non-ustar entry whose name ends in
+/// `/` a directory while its flag still says `Regular`; trusting the flag put
+/// such a directory at 0o644, which cannot be entered or written into. The
+/// same read covers the reverse case, an unrecognised flag that POSIX requires
+/// be treated as a regular file. What is on disk is the thing being chmodded,
+/// so it is the thing to ask.
 ///
 /// A mode that cannot be read at all is treated as non-executable. That is the
 /// conservative direction: the cost is a binary that needs `chmod +x`, against
@@ -115,11 +124,20 @@ fn is_metadata(entry_type: tar::EntryType) -> bool {
 /// Unix only; `PermissionsExt` has no Windows counterpart and NTFS does not
 /// carry these bits in the first place.
 #[cfg(unix)]
-fn normalise_mode(target: &Path, header: &tar::Header) -> Result<(), ArchiveError> {
+fn normalise_mode(target: &Path, recorded: u32) -> Result<(), ArchiveError> {
     use std::os::unix::fs::PermissionsExt as _;
 
-    let executable = header.entry_type().is_file() && header.mode().unwrap_or(0) & 0o100 != 0;
-    let mode = if header.entry_type().is_dir() || executable {
+    // Links are rejected before this point, so `symlink_metadata` and
+    // `metadata` agree here; the former is used anyway so that a future
+    // decision to accept links cannot quietly make this follow one.
+    let is_dir = std::fs::symlink_metadata(target)
+        .map_err(|source| ArchiveError::Write {
+            path: target.to_path_buf(),
+            source,
+        })?
+        .is_dir();
+
+    let mode = if is_dir || recorded & 0o100 != 0 {
         0o755
     } else {
         0o644
@@ -133,8 +151,50 @@ fn normalise_mode(target: &Path, header: &tar::Header) -> Result<(), ArchiveErro
     })
 }
 
+/// A no-op off unix, where there are no mode bits to normalise. The rule and
+/// the reasoning for it live on the unix twin above; this exists so `extract`
+/// has one shape on every platform rather than a `cfg` in its body.
 #[cfg(not(unix))]
-fn normalise_mode(_target: &Path, _header: &tar::Header) -> Result<(), ArchiveError> {
+fn normalise_mode(_target: &Path, _recorded: u32) -> Result<(), ArchiveError> {
+    Ok(())
+}
+
+/// Put every directory between `dest` and `deepest` at 0o755.
+///
+/// A tarball need not carry directory entries, and `extract` tolerates that
+/// deliberately rather than refusing to install — which means `create_dir_all`
+/// creates them, taking its mode from the process umask instead of from any
+/// rule of jerky's. Under a permissive umask that is 0o777. Normalising only
+/// the entries the tarball named would leave the file rule intact and this
+/// hole open, and a world-writable directory in the machine-global store lets
+/// another user add or replace files inside a package every project on the
+/// machine imports.
+#[cfg(unix)]
+fn normalise_created_dirs(dest: &Path, deepest: &Path) -> Result<(), ArchiveError> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    // `dest` belongs to the caller, which chose its mode; only what extraction
+    // created below it is ours to set.
+    let Ok(relative) = deepest.strip_prefix(dest) else {
+        return Ok(());
+    };
+
+    let mut path = dest.to_path_buf();
+    for component in relative.components() {
+        path.push(component);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).map_err(
+            |source| ArchiveError::Write {
+                path: path.clone(),
+                source,
+            },
+        )?;
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn normalise_created_dirs(_dest: &Path, _deepest: &Path) -> Result<(), ArchiveError> {
     Ok(())
 }
 
@@ -181,6 +241,8 @@ fn strip_prefix_component(raw: &Path, display: &str) -> Result<PathBuf, ArchiveE
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use crate::testing::mode_of;
     use crate::testing::{TarEntry, build_tarball};
     use tempfile::TempDir;
 
@@ -281,12 +343,8 @@ mod tests {
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
-    /// The mode a file carries on disk, as the low twelve bits.
     #[cfg(unix)]
-    fn mode_of(path: &Path) -> u32 {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
-    }
+    use std::os::unix::fs::PermissionsExt as _;
 
     #[test]
     #[cfg(unix)]
@@ -353,14 +411,14 @@ mod tests {
     fn a_directory_is_always_traversable() {
         // A directory's execute bit is the right to descend into it, not the
         // right to run it, so the rule that reads owner-execute off a file
-        // must not be applied to one. A tarball recording 0o666 on a
-        // directory would otherwise produce a directory jerky itself cannot
-        // write the rest of the package into.
+        // must not be applied to one.
+        //
+        // Not a bug that existed before this module normalised anything —
+        // `unpack` did not apply a recorded directory mode either — but the
+        // rule introduced here could reintroduce it, and this is what fails
+        // if it does.
         let tarball = build_tarball(&[
-            TarEntry::Dir {
-                path: "package/lib",
-                mode: 0o666,
-            },
+            TarEntry::dir_with_mode("package/lib", 0o666),
             TarEntry::file("package/lib/index.js", "module.exports = 1;"),
         ]);
         let dir = TempDir::new().unwrap();
@@ -379,10 +437,7 @@ mod tests {
         // something on disk fails here, on a tarball that is not hostile at
         // all, and takes the whole install with it.
         let tarball = build_tarball(&[
-            TarEntry::Metadata {
-                path: "package/pax_global_header",
-                entry_type: tar::EntryType::XGlobalHeader,
-            },
+            TarEntry::metadata("package/pax_global_header", tar::EntryType::XGlobalHeader),
             TarEntry::file("package/index.js", "module.exports = 1;"),
         ]);
         let dir = TempDir::new().unwrap();
@@ -394,6 +449,59 @@ mod tests {
             !dir.path().join("pax_global_header").exists(),
             "a metadata entry must not become a file"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_directory_the_tarball_omitted_is_still_normalised() {
+        // A tarball need not carry directory entries — `extract` tolerates
+        // that deliberately — in which case `create_dir_all` makes them and
+        // takes its mode from the process umask, not from any rule of ours.
+        // Under a permissive umask that is 0o777, and a world-writable
+        // directory in the machine-global store lets another user add or
+        // replace files inside a package every project on the machine
+        // imports. The file rule would be intact and the hole open anyway.
+        //
+        // Pre-creating the parent wide open is that state, reached without
+        // depending on the umask the test happens to run under.
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("lib")).unwrap();
+        std::fs::set_permissions(
+            dir.path().join("lib"),
+            std::fs::Permissions::from_mode(0o777),
+        )
+        .unwrap();
+
+        let tarball = build_tarball(&[TarEntry::file(
+            "package/lib/deep/index.js",
+            "module.exports = 1;",
+        )]);
+
+        extract(&tarball, dir.path()).unwrap();
+
+        assert_eq!(mode_of(&dir.path().join("lib")), 0o755);
+        assert_eq!(mode_of(&dir.path().join("lib/deep")), 0o755);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_directory_is_recognised_by_the_filesystem_not_the_type_flag() {
+        // `tar` honours an old BSD rule: a non-ustar entry whose name ends in
+        // `/` becomes a directory even though its type flag says regular
+        // file. A rule that asked the flag would put that directory at 0o644,
+        // which cannot be entered or written into — and nothing about the
+        // tarball is hostile, it is merely old.
+        let tarball = build_tarball(&[TarEntry::OldStyleDir {
+            path: "package/lib/",
+            mode: 0o644,
+        }]);
+        let dir = TempDir::new().unwrap();
+
+        extract(&tarball, dir.path()).unwrap();
+
+        let lib = dir.path().join("lib");
+        assert!(lib.is_dir(), "the trailing slash makes this a directory");
+        assert_eq!(mode_of(&lib), 0o755);
     }
 
     #[test]

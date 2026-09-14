@@ -5,17 +5,11 @@ use jerky::commands::install::{InstallError, Mode, Outcome, Recorded, Request, i
 use jerky::linker::{Unowned, UnownedReason};
 use jerky::resolver::{ImporterPath, Kind, ResolveError};
 use jerky::store::Store;
-use jerky::testing::{FixtureRegistry, TarEntry, build_tarball};
+use jerky::testing::{FixtureRegistry, TarEntry, build_tarball, mode_of};
 use jerky::workspace::{Workspace, WorkspaceError};
 
 use std::os::unix::fs::MetadataExt as _;
 use tempfile::TempDir;
-
-/// The mode a file carries on disk, as the low twelve bits.
-fn mode_of(path: &Path) -> u32 {
-    use std::os::unix::fs::PermissionsExt as _;
-    std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
-}
 
 fn lodash_tarball() -> Vec<u8> {
     build_tarball(&[
@@ -201,6 +195,31 @@ fn a_hostile_mode_never_reaches_the_project() {
         0o755,
         "a setuid binary reached the project"
     );
+    // The directory the tarball never named, created on the way to the file
+    // inside it. Its mode comes from the process umask rather than from any
+    // rule of jerky's unless extraction sets it.
+    assert_eq!(
+        mode_of(&installed.join("bin")),
+        0o755,
+        "an implicitly created directory kept the umask's mode"
+    );
+
+    // The entry root in the store, which is the staging directory renamed
+    // into place rather than anything extraction wrote. A world-writable
+    // directory here would let another user add files inside a package every
+    // project on the machine imports, which is the propagation this whole
+    // rule exists to stop.
+    //
+    // Under a strict umask this assertion also holds without the fix, so it
+    // bites only where the hole is real — a developer or CI runner on 0o002
+    // or 0o000. That is the case worth guarding.
+    let entry = std::fs::read_dir(store.entry_path_root())
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .find(|p| p.is_dir() && p.join("package.json").is_file())
+        .expect("a store entry exists");
+    assert_eq!(mode_of(&entry), 0o755, "the store entry root is too open");
 }
 
 #[test]
