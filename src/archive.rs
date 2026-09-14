@@ -121,8 +121,9 @@ fn is_metadata(entry_type: tar::EntryType) -> bool {
 /// conservative direction: the cost is a binary that needs `chmod +x`, against
 /// a corrupt header being allowed to choose.
 ///
-/// Unix only; `PermissionsExt` has no Windows counterpart and NTFS does not
-/// carry these bits in the first place.
+/// Unix only, because `PermissionsExt` is. What the equivalent should be on
+/// Windows is not settled here and has not been tested; the issue flagged it
+/// as something to verify rather than assume, and nothing above does.
 #[cfg(unix)]
 fn normalise_mode(target: &Path, recorded: u32) -> Result<(), ArchiveError> {
     use std::os::unix::fs::PermissionsExt as _;
