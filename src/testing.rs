@@ -29,6 +29,16 @@ pub enum TarEntry<'a> {
     /// A symlink at `path` pointing at `target`. Used to build hostile
     /// fixtures that a committed binary tarball could not safely carry.
     Symlink { path: &'a str, target: &'a str },
+    /// An entry carrying a type flag of the fixture's choosing.
+    ///
+    /// For the metadata entries real packers emit — a `pax_global_header`
+    /// above all — which name no file and unpack to nothing. A fixture builder
+    /// that could only express entries which become files could not catch the
+    /// code that assumes every entry does.
+    Metadata {
+        path: &'a str,
+        entry_type: tar::EntryType,
+    },
 }
 
 impl<'a> TarEntry<'a> {
@@ -101,6 +111,16 @@ pub fn build_tarball(entries: &[TarEntry<'_>]) -> Vec<u8> {
                 header.set_size(0);
                 header.set_mode(*mode);
                 header.set_entry_type(tar::EntryType::Directory);
+                header.set_cksum();
+                builder
+                    .append(&header, std::io::empty())
+                    .expect("in-memory tar append cannot fail");
+            }
+            TarEntry::Metadata { path, entry_type } => {
+                set_raw_path(&mut header, path);
+                header.set_size(0);
+                header.set_mode(0o644);
+                header.set_entry_type(*entry_type);
                 header.set_cksum();
                 builder
                     .append(&header, std::io::empty())

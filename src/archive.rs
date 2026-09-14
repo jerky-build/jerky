@@ -49,6 +49,16 @@ pub fn extract(tarball: &[u8], dest: &Path) -> Result<(), ArchiveError> {
             });
         }
 
+        // Metadata entries name no file: they carry a long path or a set of
+        // extended attributes for the entries around them, and `unpack`
+        // creates nothing for them. They have to be skipped rather than
+        // unpacked, because the code below assumes an entry left something on
+        // disk to set permissions on. `pax_global_header` is the common one —
+        // `git archive` writes it unconditionally.
+        if is_metadata(entry.header().entry_type()) {
+            continue;
+        }
+
         let relative = strip_prefix_component(&raw, &display)?;
         if relative.as_os_str().is_empty() {
             continue;
@@ -77,6 +87,18 @@ pub fn extract(tarball: &[u8], dest: &Path) -> Result<(), ArchiveError> {
     }
 
     Ok(())
+}
+
+/// Whether an entry describes other entries rather than a file of its own.
+///
+/// This mirrors the set `tar::Entry::unpack` returns early for. Keeping the
+/// two in agreement is the price of doing our own work afterwards; the test
+/// above fails if they diverge.
+fn is_metadata(entry_type: tar::EntryType) -> bool {
+    entry_type.is_pax_global_extensions()
+        || entry_type.is_pax_local_extensions()
+        || entry_type.is_gnu_longname()
+        || entry_type.is_gnu_longlink()
 }
 
 /// Replace what the tarball recorded with a mode jerky chose.
@@ -347,6 +369,31 @@ mod tests {
 
         assert_eq!(mode_of(&dir.path().join("lib")), 0o755);
         assert!(dir.path().join("lib/index.js").is_file());
+    }
+
+    #[test]
+    fn a_global_pax_header_is_not_a_file() {
+        // `pax_global_header` is ordinary output — `git archive` emits one on
+        // every archive — and it names no file: `unpack` deliberately creates
+        // nothing for it. Anything downstream that assumes each entry left
+        // something on disk fails here, on a tarball that is not hostile at
+        // all, and takes the whole install with it.
+        let tarball = build_tarball(&[
+            TarEntry::Metadata {
+                path: "package/pax_global_header",
+                entry_type: tar::EntryType::XGlobalHeader,
+            },
+            TarEntry::file("package/index.js", "module.exports = 1;"),
+        ]);
+        let dir = TempDir::new().unwrap();
+
+        extract(&tarball, dir.path()).unwrap();
+
+        assert!(dir.path().join("index.js").is_file());
+        assert!(
+            !dir.path().join("pax_global_header").exists(),
+            "a metadata entry must not become a file"
+        );
     }
 
     #[test]
