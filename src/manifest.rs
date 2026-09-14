@@ -126,12 +126,28 @@ impl Manifest {
     /// `workspace:*` is a protocol the resolver keys on, and normalizing here
     /// would also make staleness undetectable once the lockfile compares what
     /// was recorded against what is declared.
-    ///
-    /// `devDependencies` are deliberately absent: only the root project's are
-    /// ever followed, and that is spec 3.
     pub fn dependencies(&self) -> BTreeMap<String, String> {
+        self.section("dependencies")
+    }
+
+    /// The `devDependencies` this manifest declares, specifier verbatim.
+    ///
+    /// Read only from a *workspace member's* manifest, which is what this type
+    /// always describes. A registry package's dev dependencies must never be
+    /// followed — doing so pulls in most of the registry — and that is
+    /// enforced by `VersionMetadata` having no field to read them from, not by
+    /// anything here. The two sections are separate reads rather than one
+    /// merged map because the caller is the one that knows what it wants: the
+    /// resolver wants both, and a production install wants only the first.
+    pub fn dev_dependencies(&self) -> BTreeMap<String, String> {
+        self.section("devDependencies")
+    }
+
+    /// One `name -> specifier` section of the manifest, or nothing when the
+    /// field is absent or is not an object.
+    fn section(&self, field: &str) -> BTreeMap<String, String> {
         self.value
-            .get("dependencies")
+            .get(field)
             .and_then(Value::as_object)
             .map(|deps| {
                 deps.iter()
@@ -143,10 +159,28 @@ impl Manifest {
             .unwrap_or_default()
     }
 
+    /// Record `name` at `version`, in whichever section already declares it.
+    ///
+    /// Writing unconditionally to `dependencies` would leave a name that lives
+    /// in `devDependencies` declared in *both*, and nothing ever takes it out
+    /// again: the resolver's prod-wins rule masks the duplicate rather than
+    /// resolving it, so the manifest never settles even though the lockfile
+    /// does. `jerky install lodash` against a lodash already in
+    /// `devDependencies` is a version change, not a request to promote it to a
+    /// runtime dependency — the section is the user's statement, not jerky's.
+    ///
+    /// Moving a dependency between sections *deliberately* is `--save-dev`,
+    /// which is #57 and will pass the section in rather than infer it.
     pub fn add_dependency(&mut self, name: &str, version: &str) {
+        let section = if self.declares_in("devDependencies", name) {
+            "devDependencies"
+        } else {
+            "dependencies"
+        };
+
         let deps = self
             .value
-            .entry("dependencies")
+            .entry(section)
             .or_insert_with(|| Value::Object(Map::new()));
 
         if !deps.is_object() {
@@ -154,8 +188,15 @@ impl Manifest {
         }
 
         deps.as_object_mut()
-            .expect("dependencies was just forced to an object")
+            .expect("the section was just forced to an object")
             .insert(name.to_string(), Value::String(version.to_string()));
+    }
+
+    fn declares_in(&self, section: &str, name: &str) -> bool {
+        self.value
+            .get(section)
+            .and_then(Value::as_object)
+            .is_some_and(|deps| deps.contains_key(name))
     }
 
     pub fn save(&self) -> Result<(), ManifestError> {
@@ -321,15 +362,34 @@ mod tests {
     }
 
     #[test]
+    fn the_two_sections_are_read_separately() {
+        // A name in both is not this type's problem to settle: it reports each
+        // section as written, and the caller building the resolver's input is
+        // where the two are reconciled.
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":"web",
+                "dependencies":{"lodash":"^4.17.21"},
+                "devDependencies":{"vitest":"^1.0.0","lodash":"^3.0.0"}}"#,
+        )
+        .unwrap();
+
+        let manifest = Manifest::load(dir.path()).unwrap();
+
+        assert_eq!(manifest.dependencies().len(), 1);
+        assert_eq!(manifest.dependencies()["lodash"], "^4.17.21");
+        assert_eq!(manifest.dev_dependencies()["vitest"], "^1.0.0");
+        assert_eq!(manifest.dev_dependencies()["lodash"], "^3.0.0");
+    }
+
+    #[test]
     fn a_manifest_without_dependencies_declares_none() {
         let dir = TempDir::new().unwrap();
         std::fs::write(dir.path().join("package.json"), r#"{"name":"web"}"#).unwrap();
 
-        assert!(
-            Manifest::load(dir.path())
-                .unwrap()
-                .dependencies()
-                .is_empty()
-        );
+        let manifest = Manifest::load(dir.path()).unwrap();
+        assert!(manifest.dependencies().is_empty());
+        assert!(manifest.dev_dependencies().is_empty());
     }
 }

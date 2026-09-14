@@ -7,19 +7,29 @@
 use std::collections::BTreeMap;
 
 use jerky::lockfile::{self, LOCKFILE_NAME, LockfileError};
-use jerky::resolver::{ImporterPath, resolve};
+use jerky::resolver::{Declared, ImporterPath, Kind, resolve};
 use jerky::testing::FixtureRegistry;
 use tempfile::TempDir;
 
 /// A workspace of one, keyed `.`. These tests predate multiple importers and
 /// read unchanged: one importer is the degenerate case of the general input.
-fn roots(list: &[(&str, &str)]) -> BTreeMap<ImporterPath, BTreeMap<String, String>> {
-    BTreeMap::from([(
-        ImporterPath::root(),
-        list.iter()
-            .map(|(n, r)| (n.to_string(), r.to_string()))
-            .collect(),
-    )])
+fn roots(list: &[(&str, &str)]) -> BTreeMap<ImporterPath, BTreeMap<String, Declared>> {
+    BTreeMap::from([(ImporterPath::root(), section(list, Kind::Prod))])
+}
+
+/// One manifest section as the resolver takes it.
+fn section(list: &[(&str, &str)], kind: Kind) -> BTreeMap<String, Declared> {
+    list.iter()
+        .map(|(name, specifier)| {
+            (
+                name.to_string(),
+                Declared {
+                    specifier: specifier.to_string(),
+                    kind,
+                },
+            )
+        })
+        .collect()
 }
 
 /// No `workspace:` dependencies, which is every test here.
@@ -426,6 +436,7 @@ fn two_importer_graph() -> jerky::resolver::ResolvedGraph {
         "a".to_string(),
         Dependency {
             specifier: "^1.0.0".to_string(),
+            kind: Kind::Prod,
             resolution: Resolution::Registry(a_id),
         },
     );
@@ -434,6 +445,7 @@ fn two_importer_graph() -> jerky::resolver::ResolvedGraph {
         "ui".to_string(),
         Dependency {
             specifier: "workspace:*".to_string(),
+            kind: Kind::Prod,
             resolution: Resolution::Local(std::path::PathBuf::from("../../packages/ui")),
         },
     );
@@ -468,6 +480,56 @@ fn a_dependency_records_both_what_was_asked_and_what_was_chosen() {
     let entry = &parsed["importers"]["."]["dependencies"]["a"];
     assert_eq!(entry["specifier"], "^1.0.0");
     assert_eq!(entry["version"], "1.0.0");
+}
+
+#[test]
+fn the_lockfile_records_dev_dependencies_in_their_own_block() {
+    // Asserted on the parsed JSON rather than on a struct: the on-disk shape
+    // is the decision being pinned, and it is pnpm's. Two importers, one of
+    // each kind, because the empty-block half of the claim needs an importer
+    // that has no devDependencies at all.
+    let registry = FixtureRegistry::new().with_tree(&[("a", "1.0.0", &[]), ("b", "1.0.0", &[])]);
+    let dir = TempDir::new().unwrap();
+
+    let graph = resolve(
+        &registry,
+        &BTreeMap::from([
+            (
+                ImporterPath::root(),
+                section(&[("a", "^1.0.0")], Kind::Prod),
+            ),
+            (
+                ImporterPath::new("packages/ui").unwrap(),
+                section(&[("b", "^1.0.0")], Kind::Dev),
+            ),
+        ]),
+        &no_members(),
+    )
+    .unwrap();
+    lockfile::save(&graph, dir.path()).unwrap();
+
+    let parsed: serde_json::Value = serde_json::from_str(&read(&dir)).unwrap();
+    let ui = &parsed["importers"]["packages/ui"];
+    assert_eq!(ui["devDependencies"]["b"]["specifier"], "^1.0.0");
+    assert_eq!(ui["devDependencies"]["b"]["version"], "1.0.0");
+    assert!(
+        ui["dependencies"].is_null(),
+        "a devDependency was written into the production block as well"
+    );
+    assert!(
+        parsed["importers"]["."]["devDependencies"].is_null(),
+        "an importer with no devDependencies grew an empty block"
+    );
+
+    // And the kind survives the round trip, which is what makes staleness
+    // detectable after a restart rather than only within one process.
+    let back = lockfile::load(dir.path()).unwrap().unwrap();
+    let ui = &back.importers[&ImporterPath::new("packages/ui").unwrap()];
+    assert_eq!(ui.dependencies["b"].kind, Kind::Dev);
+    assert_eq!(
+        back.importers[&ImporterPath::root()].dependencies["a"].kind,
+        Kind::Prod
+    );
 }
 
 #[test]
@@ -628,6 +690,7 @@ fn an_alias_survives_a_save_and_load_cycle() {
         "execa".to_string(),
         Dependency {
             specifier: "npm:safe-execa@0.3.0".to_string(),
+            kind: Kind::Prod,
             resolution: Resolution::Registry(real.clone()),
         },
     );

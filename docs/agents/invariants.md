@@ -43,9 +43,16 @@ nested importer.
 
 ## Resolution
 
-**Never follow a dependency's `devDependencies`.** Only the root project's, and
-that is spec 3. This is a correctness requirement rather than an optimisation:
-following them pulls in most of the registry.
+**Every importer's `devDependencies` are followed; no registry package's ever
+are.** The rule as usually phrased — "only the root project's" — does not
+survive workspaces: in a monorepo every member is a first-party project, not
+just the one keyed `.`. The second half is a correctness requirement rather
+than an optimisation, because following a dependency's dev dependencies pulls
+in most of the registry, and it is enforced by `VersionMetadata` having no
+field to read them from rather than by the resolver remembering. So the
+resolver stays kind-blind: a devDependency resolves exactly as a dependency
+does, and `Kind` is carried only so the lockfile can record which section
+asked.
 
 **The resolver performs no I/O beyond the `RegistryClient`.** No filesystem, no
 `$HOME`, no cwd. This is what makes it testable with no filesystem at all.
@@ -77,7 +84,16 @@ Then, against the diff:
 - No `HashMap` on any path that reaches the lockfile.
 - No module below `main.rs` reads the cwd or `$HOME`.
 - No literal `../` outside the linker's depth calculation.
-- `devDependencies` is read nowhere, and `VersionMetadata` has no field for it.
+- `grep -rn 'devDependencies' src/` finds the name *read* in exactly two
+  modules: `manifest.rs`, which reads a member's sections, and
+  `lockfile.rs`, where the on-disk block is named by a `serde(rename)` beside
+  the existing `lockfileVersion`. Every other hit must be **prose or a test
+  fixture** — a comment saying why a dependency's are never followed, or a
+  fixture manifest that happens to declare some. The check is on what the
+  *code* reads, so count the reads and ignore the rest; do not try to keep a
+  list of permitted files, which goes stale the first time someone writes a
+  comment. A third place that reads the name, and a `VersionMetadata` field
+  for it above all, is the bug this rule exists to prevent.
 - At least one test exercises more than one importer. A suite that only ever
   sees `.` is not testing workspaces.
 - Any user-visible behaviour change is noted in `CHANGELOG.md`, under

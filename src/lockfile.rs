@@ -13,7 +13,7 @@ use thiserror::Error;
 
 use crate::integrity::Integrity;
 use crate::resolver::{
-    Dependency, Importer, ImporterPath, PackageId, Resolution, ResolvedGraph, ResolvedPackage,
+    Dependency, Importer, ImporterPath, Kind, PackageId, Resolution, ResolvedGraph, ResolvedPackage,
 };
 
 pub const LOCKFILE_NAME: &str = "jerky-lock.json";
@@ -113,10 +113,25 @@ struct OnDisk {
     packages: BTreeMap<String, Entry>,
 }
 
+/// One importer's two sections, which is pnpm's shape.
+///
+/// The graph keeps one flat map with the kind as a field; the split happens
+/// here and nowhere else. Recording it at all is what makes a dependency
+/// moving between sections a real diff rather than nothing, and what lets a
+/// production install be planned from this file alone.
+///
+/// Both blocks are skipped when empty, so a project with no devDependencies
+/// grows no empty object and the common case reads exactly as it did before.
 #[derive(Serialize, Deserialize, Default)]
 struct OnDiskImporter {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     dependencies: BTreeMap<String, OnDiskDependency>,
+    #[serde(
+        rename = "devDependencies",
+        default,
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    dev_dependencies: BTreeMap<String, OnDiskDependency>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -223,36 +238,32 @@ pub fn save(graph: &ResolvedGraph, project_dir: &Path) -> Result<(), LockfileErr
         .importers
         .iter()
         .map(|(path, importer)| {
-            (
-                path.as_str().to_string(),
-                OnDiskImporter {
-                    dependencies: importer
-                        .dependencies
-                        .iter()
-                        .map(|(name, dependency)| {
-                            (
-                                name.clone(),
-                                OnDiskDependency {
-                                    specifier: dependency.specifier.clone(),
-                                    version: match &dependency.resolution {
-                                        // The name is written only when it
-                                        // differs from the key, so an ordinary
-                                        // dependency stays terse and an alias
-                                        // stays identifiable.
-                                        Resolution::Registry(id) if &id.name == name => {
-                                            id.version.clone()
-                                        }
-                                        Resolution::Registry(id) => id.to_string(),
-                                        Resolution::Local(target) => {
-                                            format!("{LINK_PREFIX}{}", target.display())
-                                        }
-                                    },
-                                },
-                            )
-                        })
-                        .collect(),
-                },
-            )
+            // Partitioned on the way out, which is the only place the two
+            // sections exist as separate things.
+            let mut on_disk = OnDiskImporter::default();
+            for (name, dependency) in &importer.dependencies {
+                let block = match dependency.kind {
+                    Kind::Prod => &mut on_disk.dependencies,
+                    Kind::Dev => &mut on_disk.dev_dependencies,
+                };
+                block.insert(
+                    name.clone(),
+                    OnDiskDependency {
+                        specifier: dependency.specifier.clone(),
+                        version: match &dependency.resolution {
+                            // The name is written only when it differs from
+                            // the key, so an ordinary dependency stays terse
+                            // and an alias stays identifiable.
+                            Resolution::Registry(id) if &id.name == name => id.version.clone(),
+                            Resolution::Registry(id) => id.to_string(),
+                            Resolution::Local(target) => {
+                                format!("{LINK_PREFIX}{}", target.display())
+                            }
+                        },
+                    },
+                );
+            }
+            (path.as_str().to_string(), on_disk)
         })
         .collect();
 
@@ -392,8 +403,19 @@ pub fn load(project_dir: &Path) -> Result<Option<ResolvedGraph>, LockfileError> 
                 source,
             })?;
 
+        // Read back into one flat map, because that is what the graph is.
+        // `dependencies` is read second so that a hand-edited file naming one
+        // package in both blocks collapses the way a manifest declaring it
+        // twice does — to the production entry — rather than a different way.
         let mut dependencies = BTreeMap::new();
-        for (name, dependency) in on_disk_importer.dependencies {
+        let blocks = [
+            (Kind::Dev, on_disk_importer.dev_dependencies),
+            (Kind::Prod, on_disk_importer.dependencies),
+        ];
+        for (name, dependency, kind) in blocks
+            .into_iter()
+            .flat_map(|(kind, block)| block.into_iter().map(move |(n, d)| (n, d, kind)))
+        {
             let resolution = match dependency.version.strip_prefix(LINK_PREFIX) {
                 Some(target) => {
                     // A link legitimately climbs out of the importer — that is
@@ -447,6 +469,7 @@ pub fn load(project_dir: &Path) -> Result<Option<ResolvedGraph>, LockfileError> 
                 name,
                 Dependency {
                     specifier: dependency.specifier,
+                    kind,
                     resolution,
                 },
             );
