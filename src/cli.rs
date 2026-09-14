@@ -27,8 +27,16 @@ pub enum Command {
         // asked. Rationale stays out of the doc comment because clap prints
         // that one to the user.
         /// Record the package under devDependencies rather than dependencies
-        #[arg(long, short = 'D', requires = "spec")]
+        #[arg(long, short = 'D', requires = "spec", conflicts_with = "production")]
         save_dev: bool,
+        // `conflicts_with_all` rather than a check inside the install: the two
+        // halves contradict each other — one reproduces a lockfile exactly,
+        // the other changes it — and the worst place to discover that is after
+        // half a tree is linked. No `--omit=dev` alias; one spelling per
+        // concept until someone asks.
+        /// Install dependencies only, from a lockfile that must already match
+        #[arg(long, conflicts_with_all = ["spec", "save_dev"])]
+        production: bool,
     },
 }
 
@@ -146,7 +154,7 @@ mod tests {
         let short = Cli::parse_from(["jerky", "install", "-D", "lodash"]);
 
         for cli in [long, short] {
-            let Command::Install { spec, save_dev } = cli.command else {
+            let Command::Install { spec, save_dev, .. } = cli.command else {
                 panic!("expected an install");
             };
             assert_eq!(spec.as_deref(), Some("lodash"));
@@ -161,6 +169,36 @@ mod tests {
             cli.command,
             Command::Install {
                 save_dev: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn production_conflicts_with_a_package_argument() {
+        // Rejected by clap at parse time rather than partway through an
+        // install. `jerky install --production lodash` is a contradiction —
+        // one half reproduces a lockfile exactly, the other changes it — and
+        // the worst place to discover that is after half a tree is linked.
+        assert!(Cli::try_parse_from(["jerky", "install", "--production", "lodash"]).is_err());
+    }
+
+    #[test]
+    fn production_conflicts_with_save_dev() {
+        assert!(
+            Cli::try_parse_from(["jerky", "install", "--production", "--save-dev", "lodash"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn production_on_its_own_parses() {
+        let cli = Cli::parse_from(["jerky", "install", "--production"]);
+        assert!(matches!(
+            cli.command,
+            Command::Install {
+                spec: None,
+                production: true,
                 ..
             }
         ));

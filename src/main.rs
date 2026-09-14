@@ -3,6 +3,7 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use jerky::cli::{Cli, Command};
+use jerky::commands::install::Mode;
 use jerky::error::JerkyError;
 use jerky::linker::{Unowned, UnownedReason};
 use jerky::resolver::{ImporterPath, Kind};
@@ -37,7 +38,11 @@ fn run(cli: Cli) -> Result<(), JerkyError> {
             println!("wrote {}", path.display());
             Ok(())
         }
-        Command::Install { spec, save_dev } => {
+        Command::Install {
+            spec,
+            save_dev,
+            production,
+        } => {
             let spec = spec
                 .as_deref()
                 .map(jerky::cli::parse_package_spec)
@@ -78,9 +83,17 @@ fn run(cli: Cli) -> Result<(), JerkyError> {
                         .expect("an install always reports what it recorded");
                     println!("added {}@{} to {importer}", added.name, added.version);
                 }
+                // `--production` takes this arm too: clap has already refused
+                // it alongside a package, so a mode that acts on every importer
+                // never has to ask which one the user meant.
                 None => {
+                    let mode = if production {
+                        Mode::Production
+                    } else {
+                        Mode::Develop
+                    };
                     let outcome =
-                        jerky::commands::install::sync(&workspace, &store, &registry, None)?;
+                        jerky::commands::install::sync(&workspace, &store, &registry, None, mode)?;
                     report_unowned(&outcome.left_alone);
                     // The packages, not the links: two importers on one version
                     // share a store entry, and reporting the link count would

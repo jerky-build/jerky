@@ -38,6 +38,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `--save-dev`, below; a name appearing in both sections is resolved as a
   production dependency, which is npm's answer, rather than refused — the
   manifest may not be the user's to edit.
+- `jerky install --production` installs `dependencies` only, across every
+  importer, and **requires a lockfile that already matches every manifest**.
+  This is the CI form — jerky's `npm ci` — and it gives the frozen-lockfile
+  story without a third flag to design. Requiring the match is what earns the
+  read-only property rather than enforcing it: with every importer reusable
+  there is nothing to resolve, so there is nothing to write, and the lockfile
+  is left byte-identical. It performs no metadata requests at all; the only
+  traffic is tarballs the store does not already hold. The match is over
+  **both** sections, so editing a `devDependencies` entry without reinstalling
+  fails even though no devDependency would have been linked — a mode that
+  overlooked that would let CI pass on a lockfile that is genuinely out of
+  date. A missing lockfile, or one that disagrees, is an error naming the
+  dependency and both values, raised before anything is linked. Convergence is
+  not selectively applied: a `node_modules` from an earlier ordinary install
+  has its devDependency links *removed*. `--production` conflicts with a
+  package argument and with `--save-dev`, rejected by clap at parse time
+  ([#58](https://github.com/jerky-build/jerky/issues/58)).
 - `jerky install --save-dev <pkg>`, or `-D <pkg>`, records the package under
   `devDependencies` rather than `dependencies`, in the workspace member you
   are standing in. It *moves* a package already declared in the other section

@@ -8,9 +8,12 @@ use crate::resolver::Kind;
 
 /// The manifest section a `Kind` names.
 ///
-/// One place that spells these, so a third `Kind` cannot be added and write
-/// to a section this module never heard of.
-fn section_for(kind: Kind) -> &'static str {
+/// One place that spells these, so a third `Kind` cannot be added and write to
+/// a section this module never heard of — and so the names stay readable from
+/// exactly the two modules `docs/agents/invariants.md` permits. An error
+/// elsewhere that wants to *say* `devDependencies` asks here rather than
+/// spelling it again, which is why this is visible past the module.
+pub(crate) fn section_for(kind: Kind) -> &'static str {
     match kind {
         Kind::Prod => "dependencies",
         Kind::Dev => "devDependencies",
