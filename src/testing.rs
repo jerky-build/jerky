@@ -17,11 +17,34 @@ pub const ABC_SHA512_SSRI: &str = "sha512-3a81oZNherrMQXNJriBBMRLm+k6JqX6iCp7u5k
 
 /// One entry in a generated tarball.
 pub enum TarEntry<'a> {
-    /// A regular file at `path` with `contents`.
-    File { path: &'a str, contents: &'a [u8] },
+    /// A regular file at `path` with `contents`, recorded with `mode`.
+    File {
+        path: &'a str,
+        contents: &'a [u8],
+        mode: u32,
+    },
+    /// A directory at `path`, recorded with `mode`. Real npm tarballs carry
+    /// directory entries, and their mode is as untrusted as a file's.
+    Dir { path: &'a str, mode: u32 },
     /// A symlink at `path` pointing at `target`. Used to build hostile
     /// fixtures that a committed binary tarball could not safely carry.
     Symlink { path: &'a str, target: &'a str },
+    /// A directory as a pre-ustar packer wrote one: the type flag says
+    /// regular file and the trailing `/` in the name is what marks it a
+    /// directory. `tar` honours that old BSD rule, so an entry of this shape
+    /// becomes a directory on disk while its flag still says otherwise — and
+    /// anything that reads the flag rather than the filesystem gets it wrong.
+    OldStyleDir { path: &'a str, mode: u32 },
+    /// An entry carrying a type flag of the fixture's choosing.
+    ///
+    /// For the metadata entries real packers emit — a `pax_global_header`
+    /// above all — which name no file and unpack to nothing. A fixture builder
+    /// that could only express entries which become files could not catch the
+    /// code that assumes every entry does.
+    Metadata {
+        path: &'a str,
+        entry_type: tar::EntryType,
+    },
 }
 
 impl<'a> TarEntry<'a> {
@@ -29,8 +52,44 @@ impl<'a> TarEntry<'a> {
         TarEntry::File {
             path,
             contents: contents.as_bytes(),
+            mode: 0o644,
         }
     }
+
+    /// A directory carrying a mode of the fixture's choosing.
+    pub fn dir_with_mode(path: &'a str, mode: u32) -> Self {
+        TarEntry::Dir { path, mode }
+    }
+
+    /// An entry that names no file of its own — a `pax_global_header`, a GNU
+    /// longname — which unpacks to nothing.
+    pub fn metadata(path: &'a str, entry_type: tar::EntryType) -> Self {
+        TarEntry::Metadata { path, entry_type }
+    }
+
+    /// A file carrying a mode of the fixture's choosing.
+    ///
+    /// A package tarball is untrusted input and the mode field is part of it,
+    /// so the hostile modes — setuid, setgid, world-writable — have to be
+    /// expressible here or the normalisation in `archive::extract` cannot be
+    /// tested at all.
+    pub fn file_with_mode(path: &'a str, contents: &'a str, mode: u32) -> Self {
+        TarEntry::File {
+            path,
+            contents: contents.as_bytes(),
+            mode,
+        }
+    }
+}
+
+/// The mode a path carries on disk, as the low twelve bits.
+///
+/// Shared rather than written twice: the extraction unit tests and the
+/// install tests both assert on modes, and two copies of the masking would be
+/// two chances to mask differently.
+pub fn mode_of(path: &std::path::Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
 }
 
 /// Write a path into a header's name field directly, bypassing the `tar`
@@ -61,13 +120,50 @@ pub fn build_tarball(entries: &[TarEntry<'_>]) -> Vec<u8> {
     for entry in entries {
         let mut header = tar::Header::new_gnu();
         match entry {
-            TarEntry::File { path, contents } => {
+            TarEntry::File {
+                path,
+                contents,
+                mode,
+            } => {
                 set_raw_path(&mut header, path);
                 header.set_size(contents.len() as u64);
-                header.set_mode(0o644);
+                header.set_mode(*mode);
                 header.set_cksum();
                 builder
                     .append(&header, *contents)
+                    .expect("in-memory tar append cannot fail");
+            }
+            TarEntry::Dir { path, mode } => {
+                set_raw_path(&mut header, path);
+                header.set_size(0);
+                header.set_mode(*mode);
+                header.set_entry_type(tar::EntryType::Directory);
+                header.set_cksum();
+                builder
+                    .append(&header, std::io::empty())
+                    .expect("in-memory tar append cannot fail");
+            }
+            TarEntry::OldStyleDir { path, mode } => {
+                // `Header::new_old()` rather than `new_gnu()`: tar applies the
+                // trailing-slash rule only when the header is not ustar.
+                let mut old = tar::Header::new_old();
+                set_raw_path(&mut old, path);
+                old.set_size(0);
+                old.set_mode(*mode);
+                old.set_entry_type(tar::EntryType::Regular);
+                old.set_cksum();
+                builder
+                    .append(&old, std::io::empty())
+                    .expect("in-memory tar append cannot fail");
+            }
+            TarEntry::Metadata { path, entry_type } => {
+                set_raw_path(&mut header, path);
+                header.set_size(0);
+                header.set_mode(0o644);
+                header.set_entry_type(*entry_type);
+                header.set_cksum();
+                builder
+                    .append(&header, std::io::empty())
                     .expect("in-memory tar append cannot fail");
             }
             TarEntry::Symlink { path, target } => {

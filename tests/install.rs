@@ -5,7 +5,7 @@ use jerky::commands::install::{InstallError, Mode, Outcome, Recorded, Request, i
 use jerky::linker::{Unowned, UnownedReason};
 use jerky::resolver::{ImporterPath, Kind, ResolveError};
 use jerky::store::Store;
-use jerky::testing::{FixtureRegistry, TarEntry, build_tarball};
+use jerky::testing::{FixtureRegistry, TarEntry, build_tarball, mode_of};
 use jerky::workspace::{Workspace, WorkspaceError};
 
 use std::os::unix::fs::MetadataExt as _;
@@ -145,6 +145,81 @@ fn files_are_hard_linked_from_the_store_not_copied() {
         (b.dev(), b.ino()),
         "package was copied, not hard-linked — the store's whole purpose is lost"
     );
+}
+
+#[test]
+fn a_hostile_mode_never_reaches_the_project() {
+    // The propagation the mode normalisation exists to stop. A store entry is
+    // hard-linked into every project that installs the package, so one set of
+    // permissions is shared machine-wide: a file left group- or
+    // world-writable in the store is writable in every project at once, and
+    // rewriting it there changes what all of them import.
+    //
+    // Asserting at the extraction seam alone would not show this. The claim
+    // is about what a developer's `node_modules` ends up holding.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let project_dir = project(work.path());
+    let store = Store::new(home.path().join("store"));
+    let tarball = build_tarball(&[
+        TarEntry::file(
+            "package/package.json",
+            r#"{"name":"hostile","version":"1.0.0"}"#,
+        ),
+        TarEntry::file_with_mode("package/index.js", "module.exports = {};", 0o666),
+        TarEntry::file_with_mode("package/bin/cli.js", "#!/usr/bin/env node\n", 0o4777),
+    ]);
+    let registry = FixtureRegistry::new().with_package("hostile", "1.0.0", tarball);
+
+    install(
+        &solo(project_dir),
+        &ImporterPath::root(),
+        &store,
+        &registry,
+        &spec("hostile", VersionSpec::Latest),
+        None,
+    )
+    .unwrap();
+
+    let installed = project_dir.join("node_modules/hostile");
+    assert_eq!(
+        mode_of(&installed.join("index.js")),
+        0o644,
+        "a world-writable file reached the project"
+    );
+    // The setuid bit is gone, and the one bit worth keeping survived: #20
+    // links this into `node_modules/.bin`, where a non-executable target is a
+    // runtime failure rather than an install one.
+    assert_eq!(
+        mode_of(&installed.join("bin/cli.js")),
+        0o755,
+        "a setuid binary reached the project"
+    );
+    // The directory the tarball never named, created on the way to the file
+    // inside it. Its mode comes from the process umask rather than from any
+    // rule of jerky's unless extraction sets it.
+    assert_eq!(
+        mode_of(&installed.join("bin")),
+        0o755,
+        "an implicitly created directory kept the umask's mode"
+    );
+
+    // The entry root in the store, which is the staging directory renamed
+    // into place rather than anything extraction wrote. A world-writable
+    // directory here would let another user add files inside a package every
+    // project on the machine imports, which is the propagation this whole
+    // rule exists to stop.
+    //
+    // Under a strict umask this assertion also holds without the fix, so it
+    // bites only where the hole is real — a developer or CI runner on 0o002
+    // or 0o000. That is the case worth guarding.
+    let entry = std::fs::read_dir(store.entry_path_root())
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .find(|p| p.is_dir() && p.join("package.json").is_file())
+        .expect("a store entry exists");
+    assert_eq!(mode_of(&entry), 0o755, "the store entry root is too open");
 }
 
 #[test]

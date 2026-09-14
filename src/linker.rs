@@ -53,6 +53,35 @@ pub fn link_file(src: &Path, dst: &Path) -> Result<(), LinkError> {
     }
 }
 
+/// Give `dst` the mode `src` carries.
+///
+/// `create_dir_all` takes its mode from the process umask, so a tree recreated
+/// in a project would otherwise discard the source's — and the source here is
+/// a store entry, whose modes `archive::extract` normalised deliberately. The
+/// project would get the umask's answer instead, which under a permissive one
+/// is a world-writable directory inside `node_modules`.
+///
+/// Files need no equivalent: a hard link shares the inode and therefore the
+/// mode, and the `EXDEV` copy fallback carries permissions itself.
+fn reproduce_dir_mode(src: &Path, dst: &Path) -> Result<(), LinkError> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mode = std::fs::metadata(src)
+        .map_err(|source| LinkError::Access {
+            path: src.to_path_buf(),
+            source,
+        })?
+        .permissions()
+        .mode();
+
+    std::fs::set_permissions(dst, std::fs::Permissions::from_mode(mode)).map_err(|source| {
+        LinkError::Access {
+            path: dst.to_path_buf(),
+            source,
+        }
+    })
+}
+
 fn walk_tree(
     src: &Path,
     dst: &Path,
@@ -62,6 +91,7 @@ fn walk_tree(
         path: dst.to_path_buf(),
         source,
     })?;
+    reproduce_dir_mode(src, dst)?;
 
     let entries = std::fs::read_dir(src).map_err(|source| LinkError::Access {
         path: src.to_path_buf(),
@@ -707,6 +737,7 @@ fn remove_entry(path: &Path) -> Result<(), LinkError> {
 mod tests {
     use super::*;
     use std::os::unix::fs::MetadataExt as _;
+    use std::os::unix::fs::PermissionsExt as _;
     use tempfile::TempDir;
 
     fn store_entry(root: &Path) -> PathBuf {
@@ -751,6 +782,28 @@ mod tests {
             std::fs::read_to_string(dst.join("lib/core.js")).unwrap(),
             "core"
         );
+    }
+
+    #[test]
+    fn hard_link_tree_reproduces_directory_modes() {
+        // `create_dir_all` takes its mode from the process umask, so a tree
+        // recreated in a project would otherwise discard whatever the store
+        // holds — and the store's modes are the normalised ones extraction
+        // chose. The project would get the umask's answer instead, which under
+        // a permissive one is a world-writable directory inside `node_modules`.
+        //
+        // 0o700 rather than 0o755 on purpose: no ordinary umask produces it,
+        // so this fails if the mode is merely defaulted rather than carried.
+        use crate::testing::mode_of;
+
+        let root = TempDir::new().unwrap();
+        let src = store_entry(root.path());
+        std::fs::set_permissions(src.join("lib"), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let dst = root.path().join("dst");
+
+        hard_link_tree(&src, &dst).unwrap();
+
+        assert_eq!(mode_of(&dst.join("lib")), 0o700);
     }
 
     #[test]
