@@ -77,6 +77,12 @@ if [[ -z ${JERKY_BIN:-} ]]; then
 fi
 [[ -x $JERKY ]] || { printf 'not executable: %s\n' "$JERKY" >&2; exit 1; }
 
+if [[ $JERKY_BENCH_TIMER == none ]]; then
+    printf 'no millisecond clock: this wants bash 5 (for EPOCHREALTIME), GNU date,\n' >&2
+    printf 'or gdate from coreutils. On macOS: brew install bash, or brew install coreutils.\n' >&2
+    exit 1
+fi
+
 if ((WITH_NPM)) && ! command -v npm >/dev/null; then
     printf -- '--npm was asked for and npm is not on PATH\n' >&2
     exit 1
@@ -92,31 +98,37 @@ trap 'cleanup; exit 130' INT
 trap 'cleanup; exit 143' TERM
 export HOME=$WORK/home
 
-# Lay out a project to install into: the fixture's manifest, and its lockfile
+# Lay out a project to install into: the fixture's manifest, and a lockfile
 # only when the scenario is one that has one.
+#
+# `dir` because jerky's project and npm's are kept apart. `npm install` writes a
+# package-lock.json into whatever directory it runs in, and a stray one in
+# jerky's project would silently change what the no-lockfile rows measure.
+# `lockfile` is a path to copy in, or empty for the rows that start from the
+# manifest alone.
 prepare_project() {
-    local fixture=$1 with_lockfile=$2
-    rm -rf "$WORK/proj"
-    mkdir -p "$WORK/proj"
-    cp "$REPO/benches/fixtures/$fixture/package.json" "$WORK/proj/package.json"
-    if ((with_lockfile)); then
-        cp "$REPO/benches/fixtures/$fixture/jerky-lock.json" "$WORK/proj/jerky-lock.json"
+    local dir=$1 fixture=$2 lockfile=${3:-}
+    rm -rf "$dir"
+    mkdir -p "$dir"
+    cp "$REPO/benches/fixtures/$fixture/package.json" "$dir/package.json"
+    if [[ -n $lockfile ]]; then
+        cp "$lockfile" "$dir/$(basename "$lockfile")"
     fi
 }
 
-# Milliseconds spent running the command, which must succeed. `date +%s%N`
-# rather than `time`, so the number arrives as an integer this can do
-# arithmetic on instead of a string to be parsed back.
+# Milliseconds spent running the command, which must succeed. `now_ms` rather
+# than `time`, so the number arrives as an integer this can do arithmetic on
+# instead of a string to be parsed back.
 time_ms() {
     local start finish
-    start=$(date +%s%N)
+    start=$(now_ms)
     if ! "$@" >"$WORK/last-run.log" 2>&1; then
         printf '\ncommand failed: %s\n' "$*" >&2
         cat "$WORK/last-run.log" >&2
         exit 1
     fi
-    finish=$(date +%s%N)
-    printf '%s\n' $(((finish - start) / 1000000))
+    finish=$(now_ms)
+    printf '%s\n' $((finish - start))
 }
 
 # One trial of one jerky scenario. Returns milliseconds; the untimed setup each
@@ -126,38 +138,22 @@ time_ms() {
 # fixture so the three warm scenarios inherit the store it filled.
 jerky_trial() {
     local fixture=$1 scenario=$2
+    local pin=$REPO/benches/fixtures/$fixture/jerky-lock.json
     case $scenario in
         cold)
             rm -rf "$HOME"
             mkdir -p "$HOME"
-            prepare_project "$fixture" 0
+            prepare_project "$WORK/proj" "$fixture"
             ;;
-        warm) prepare_project "$fixture" 0 ;;
-        lockfile) prepare_project "$fixture" 1 ;;
+        warm) prepare_project "$WORK/proj" "$fixture" ;;
+        lockfile) prepare_project "$WORK/proj" "$fixture" "$pin" ;;
         noop)
-            prepare_project "$fixture" 1
+            prepare_project "$WORK/proj" "$fixture" "$pin"
             (cd "$WORK/proj" && time_ms "$JERKY" install >/dev/null)
             ;;
     esac
 
     (cd "$WORK/proj" && time_ms "$JERKY" install)
-}
-
-# npm's project, kept beside jerky's rather than sharing one: npm writes a
-# package-lock.json into whatever directory it installs in, and a stray one in
-# jerky's project would silently change what the "no lockfile" rows measure.
-prepare_npm_project() {
-    local fixture=$1 keep_lock=$2
-    local saved=""
-    if ((keep_lock)) && [[ -f $WORK/npm-proj/package-lock.json ]]; then
-        saved=$WORK/npm-lock.json
-        cp "$WORK/npm-proj/package-lock.json" "$saved"
-    fi
-    rm -rf "$WORK/npm-proj"
-    mkdir -p "$WORK/npm-proj"
-    cp "$REPO/benches/fixtures/$fixture/package.json" "$WORK/npm-proj/package.json"
-    [[ -n $saved ]] && cp "$saved" "$WORK/npm-proj/package-lock.json"
-    return 0
 }
 
 # npm's equivalents of the same four scenarios.
@@ -170,15 +166,28 @@ npm_trial() {
     local fixture=$1 scenario=$2
     export npm_config_cache=$WORK/npm-cache
     local -a npm_args=(install --legacy-peer-deps --no-audit --no-fund)
+    local pin=$WORK/npm-pin-$fixture/package-lock.json
+
+    # The lockfile rows produce their own lockfile in untimed setup rather than
+    # inheriting whatever the previous scenario left behind. Depending on the
+    # order would make "warm store + lockfile" quietly measure a no-lockfile
+    # install the first time it ran, which is a wrong number and not an error.
+    if [[ $scenario == lockfile || $scenario == noop ]] && [[ ! -f $pin ]]; then
+        prepare_project "$WORK/npm-proj" "$fixture"
+        (cd "$WORK/npm-proj" && time_ms npm "${npm_args[@]}" >/dev/null)
+        mkdir -p "$(dirname "$pin")"
+        cp "$WORK/npm-proj/package-lock.json" "$pin"
+    fi
+
     case $scenario in
         cold)
             rm -rf "$WORK/npm-cache"
-            prepare_npm_project "$fixture" 0
+            prepare_project "$WORK/npm-proj" "$fixture"
             ;;
-        warm) prepare_npm_project "$fixture" 0 ;;
-        lockfile) prepare_npm_project "$fixture" 1 ;;
+        warm) prepare_project "$WORK/npm-proj" "$fixture" ;;
+        lockfile) prepare_project "$WORK/npm-proj" "$fixture" "$pin" ;;
         noop)
-            prepare_npm_project "$fixture" 1
+            prepare_project "$WORK/npm-proj" "$fixture" "$pin"
             (cd "$WORK/npm-proj" && time_ms npm "${npm_args[@]}" >/dev/null)
             ;;
     esac
@@ -198,11 +207,11 @@ pin_fixtures() {
         printf 'pinning %s\n' "$fixture" >&2
         rm -rf "$HOME"
         mkdir -p "$HOME"
-        prepare_project "$fixture" 0
+        prepare_project "$WORK/proj" "$fixture"
         (cd "$WORK/proj" && time_ms "$JERKY" install >/dev/null)
         cp "$WORK/proj/jerky-lock.json" "$REPO/benches/fixtures/$fixture/jerky-lock.json"
         printf '  wrote benches/fixtures/%s/jerky-lock.json (%s packages)\n' \
-            "$fixture" "$(sed -n 's/^installed \([0-9]*\) package.*/\1/p' "$WORK/last-run.log")" >&2
+            "$fixture" "$(packages_installed "$WORK/last-run.log")" >&2
     done
 }
 
@@ -217,6 +226,23 @@ for fixture in "${FIXTURES[@]}"; do
         exit 1
     }
 done
+
+# Printed under every table that has an npm column, rather than once at the end
+# of the run. A reader pastes one fixture's table into an issue, and a
+# cross-tool table that arrives without this is misleading about what it
+# compares.
+npm_caveat() {
+    cat <<'CAVEAT'
+
+The two columns do not count the same tree. jerky does not resolve peer
+dependencies yet (#34), so it installs fewer packages than npm does from the
+same manifest, and npm refuses both fixtures outright without
+`--legacy-peer-deps`, which this passes. npm also writes more files than jerky
+for the same fixture, because a hoisted tree duplicates what an isolated store
+shares. These are different trees, measured for shape rather than as a
+scoreboard.
+CAVEAT
+}
 
 SCENARIOS=(cold warm lockfile noop)
 label_for() {
@@ -249,10 +275,12 @@ for fixture in "${FIXTURES[@]}"; do
         # rather than out of `jerky_trial` — a trial runs in a command
         # substitution, so nothing it assigns survives it.
         #
-        # Taken from the cold row, whose tree is the one every later scenario
-        # reproduces, and taken before any npm trial overwrites the log.
-        if [[ -z $packages ]]; then
-            packages=$(sed -n 's/^installed \([0-9]*\) package.*/\1/p' "$WORK/last-run.log")
+        # Keyed on the scenario rather than on `packages` still being empty.
+        # The empty test would re-fire on the next scenario if the summary line
+        # ever stopped matching, quietly attributing the no-op row's tree to the
+        # cold row; `packages_installed` fails loudly instead.
+        if [[ $scenario == cold ]]; then
+            packages=$(packages_installed "$WORK/last-run.log")
             links=$(count_links "$WORK/proj")
             dangling=$(count_dangling "$WORK/proj")
         fi
@@ -272,21 +300,9 @@ for fixture in "${FIXTURES[@]}"; do
 
     printf '\njerky installed %s packages; %s dangling links out of %s.\n' \
         "$packages" "$dangling" "$links"
-    if ((dangling != 0)); then
+    if [[ $dangling != 0 ]]; then
         printf 'A tree with a dangling link in it is one `require` cannot walk, so treat\n'
         printf 'the timings above as measuring something other than a working install.\n'
     fi
+    if ((WITH_NPM)); then npm_caveat; fi
 done
-
-if ((WITH_NPM)); then
-    cat <<'CAVEAT'
-
-The two columns do not count the same tree. jerky does not resolve peer
-dependencies yet (#34), so it installs fewer packages than npm does from the
-same manifest, and npm refuses both fixtures outright without
-`--legacy-peer-deps`, which this passes. npm also writes more files than jerky
-for the same fixture, because a hoisted tree duplicates what an isolated store
-shares. These are different trees, measured for shape rather than as a
-scoreboard.
-CAVEAT
-fi

@@ -43,6 +43,12 @@ toolchains — `@angular/cli`, `@nestjs/cli`, `@vue/cli-service`, `eslint`,
 | levels in the walk | 7 | 7 | **10** |
 | files on disk | ~600 | ~40k | **93k** |
 
+These shape figures are **quoted from issue #72**, not produced by this
+harness — it measures time, not graph shape, and only the package counts and
+the link totals in its footer are regenerated on every run. The package counts
+are the ones to check a change against: `--pin` reproduced 1291 and 2910 here,
+which is what says the pinned graphs still match what the issue recorded.
+
 Nine times the scoped names and three times the duplicate-version names, on
 2.2x the packages: `alotta-packages` is the only fixture here that exercises
 the virtual store's whole reason for existing at any scale. It is also three
@@ -81,6 +87,14 @@ regularly.
 - **A release binary**, because a debug `jerky` measures the optimiser rather
   than the install. Set `JERKY_BIN` to measure a binary built somewhere else —
   a previous commit, which is most of what a benchmark is for.
+- **A millisecond clock**, checked before the first measurement rather than
+  found missing halfway through one. bash 5's `EPOCHREALTIME` is preferred
+  because it costs no subprocess, which matters when the thing being timed is a
+  30ms no-op; GNU `date +%s%N` and coreutils' `gdate` are the fallbacks. macOS
+  ships neither bash 5 nor GNU date, so on a stock macOS this wants
+  `brew install bash` or `brew install coreutils` — the harness says so and
+  stops. The helpers themselves are written for bash 3.2 and are exercised on
+  both runners in premerge.
 
 Every run reports the packages installed and the dangling links out of the
 total, because a timing taken against a tree `require` cannot walk is measuring
@@ -110,8 +124,9 @@ converge on.
 
 ## Comparing against npm
 
-`--npm` adds an npm column. Three things about it have to be said with any
-table that carries one:
+`--npm` adds an npm column, and prints the following caveat **under every table
+that has one** rather than once at the end of a run — a reader pastes one
+fixture's table into an issue, and it has to travel with it. Three things:
 
 - **The two columns do not count the same tree.** jerky does not resolve peer
   dependencies yet, so it installs fewer packages than npm does from the same
