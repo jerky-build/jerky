@@ -10,6 +10,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Scoped packages install. `@types/node` and every `@babel/*`, `@eslint/*` and
+  `@nodelib/*` a real tree pulls in now resolve, download and link, where
+  before the install died on the first one with an `ENOENT` from the rename
+  that puts a store entry in place. The virtual store nests them —
+  `.jerky/@types/node@20.0.0` — which is the layout convergence and pruning
+  were already written to expect, so both halves of the decision agree.
+  Together with `npm:` aliases this is what a large real-world tree needed:
+  `alotta-files`, the fixture the pnpm benchmarks use, installs its 1291
+  packages in **11s** into a cold store, with every one of its 2502 symlinks
+  resolving and `require` working through them. The scope directories jerky
+  creates are `0o755` rather than whatever the umask allows, in an importer's
+  tree and in the machine-global store alike
+  ([#22](https://github.com/jerky-build/jerky/issues/22)).
 - `jerky install` with no package installs what the workspace declares. This is
   the command you run after cloning a repo, and until now there was no way to
   say it: `spec` was a required argument, so jerky could add a dependency but

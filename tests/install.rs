@@ -3369,3 +3369,261 @@ fn an_alias_without_a_range_is_pinned_inside_the_scheme() {
 
     assert_eq!(linked_version(root, "width-cjs"), "4.2.3");
 }
+
+/// A scoped package, a second one in the same scope, and an unscoped package
+/// that depends on one of them.
+fn scoped_registry() -> FixtureRegistry {
+    FixtureRegistry::new()
+        .with_packument("@types/node", &[("20.0.0", &[])])
+        .with_packument("@types/react", &[("18.0.0", &[])])
+        .with_packument("uses-types", &[("1.0.0", &[("@types/node", "^20.0.0")])])
+        // A scoped package that depends on things, so the *owner* of a link
+        // inside the store is itself nested one level deeper.
+        .with_packument(
+            "@nodelib/fs.walk",
+            &[("1.2.8", &[("fastq", "^1.0.0"), ("@types/node", "^20.0.0")])],
+        )
+        .with_packument("fastq", &[("1.17.1", &[])])
+}
+
+/// Every symlink under `dir` that resolves to nothing.
+///
+/// Symlinked directories are deliberately not followed: the virtual store's
+/// links point back into the store, so following them does not terminate. An
+/// unreadable directory is a panic rather than a skip, because a helper that
+/// passes by not looking is worse than no helper.
+fn dangling_links(dir: &Path) -> Vec<PathBuf> {
+    let mut dangling = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(next) = stack.pop() {
+        let entries = std::fs::read_dir(&next)
+            .unwrap_or_else(|err| panic!("cannot read {}: {err}", next.display()));
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let meta = std::fs::symlink_metadata(&path).unwrap();
+            if meta.file_type().is_symlink() {
+                if !path.exists() {
+                    dangling.push(path);
+                }
+            } else if meta.is_dir() {
+                stack.push(path);
+            }
+        }
+    }
+    dangling
+}
+
+#[test]
+fn a_scoped_packages_own_dependencies_are_linked_from_where_it_sits() {
+    // A scoped owner sits one level deeper in the virtual store, so the climb
+    // out of it to reach a sibling entry is one longer. Getting this wrong
+    // produces links that *exist* — so anything checking for presence passes —
+    // and resolve to nothing.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let store = Store::new(home.path().join("store"));
+
+    write_manifest(
+        root,
+        r#"{"name":"demo","dependencies":{"@nodelib/fs.walk":"1.2.8"}}"#,
+    );
+    sync(&solo(root), &store, &scoped_registry(), None, Mode::Develop).unwrap();
+
+    let owner = root.join("node_modules/.jerky/@nodelib/fs.walk@1.2.8/node_modules");
+
+    // An unscoped dependency of a scoped package, and a scoped one: the climb
+    // differs again for the second, because the target is nested too.
+    let fastq = std::fs::read_to_string(owner.join("fastq/package.json")).unwrap();
+    assert!(fastq.contains("\"fastq\""), "got {fastq}");
+    let types = std::fs::read_to_string(owner.join("@types/node/package.json")).unwrap();
+    assert!(types.contains("@types/node"), "got {types}");
+
+    assert_eq!(
+        dangling_links(&root.join("node_modules")),
+        Vec::<PathBuf>::new(),
+        "the install left links that resolve to nothing"
+    );
+}
+
+#[test]
+fn a_scoped_package_installs_and_its_link_resolves() {
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let store = Store::new(home.path().join("store"));
+
+    write_manifest(
+        root,
+        r#"{"name":"demo","dependencies":{"@types/node":"20.0.0"}}"#,
+    );
+    sync(&solo(root), &store, &scoped_registry(), None, Mode::Develop).unwrap();
+
+    // Read through the link: proves the extra `../` the scope adds was
+    // computed rather than assumed, since a target one level short resolves
+    // nowhere.
+    assert_eq!(linked_version(root, "@types/node"), "20.0.0");
+
+    // The store nests, which is what `converge` and `prune_virtual_store` were
+    // already written to expect.
+    assert!(
+        root.join("node_modules/.jerky/@types/node@20.0.0/node_modules/@types/node")
+            .is_dir(),
+        "the entry is not where the pruner looks for it"
+    );
+}
+
+#[test]
+fn a_scoped_dependency_of_a_package_is_linked_inside_the_store() {
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let store = Store::new(home.path().join("store"));
+
+    write_manifest(
+        root,
+        r#"{"name":"demo","dependencies":{"uses-types":"1.0.0"}}"#,
+    );
+    sync(&solo(root), &store, &scoped_registry(), None, Mode::Develop).unwrap();
+
+    let raw = std::fs::read_to_string(
+        root.join("node_modules/.jerky/uses-types@1.0.0/node_modules/@types/node/package.json"),
+    )
+    .unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(parsed["name"], "@types/node");
+}
+
+#[test]
+fn a_nested_importer_reaches_a_scoped_package() {
+    // Two climbs compound here: the importer's depth and the scope's extra
+    // level. Both are derived from where the paths diverge rather than from a
+    // count, which is the only reason this works at all.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let store = Store::new(home.path().join("store"));
+
+    write_manifest(
+        root,
+        r#"{"name":"mono","private":true,"workspaces":["apps/*"]}"#,
+    );
+    write_manifest(
+        &root.join("apps/web"),
+        r#"{"name":"web","dependencies":{"@types/node":"20.0.0"}}"#,
+    );
+    sync(&solo(root), &store, &scoped_registry(), None, Mode::Develop).unwrap();
+
+    assert_eq!(
+        linked_version(&root.join("apps/web"), "@types/node"),
+        "20.0.0"
+    );
+}
+
+#[test]
+fn dropping_a_scoped_package_removes_its_link_and_its_entry() {
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let store = Store::new(home.path().join("store"));
+    let registry = scoped_registry();
+
+    write_manifest(
+        root,
+        r#"{"name":"demo","dependencies":{"@types/node":"20.0.0","@types/react":"18.0.0"}}"#,
+    );
+    sync(&solo(root), &store, &registry, None, Mode::Develop).unwrap();
+
+    // Drop one of the two. The scope survives because its sibling does.
+    write_manifest(
+        root,
+        r#"{"name":"demo","dependencies":{"@types/react":"18.0.0"}}"#,
+    );
+    sync(&solo(root), &store, &registry, None, Mode::Develop).unwrap();
+
+    assert!(!still_there(&root.join("node_modules/@types/node")));
+    assert!(still_there(&root.join("node_modules/@types/react")));
+    assert!(!still_there(
+        &root.join("node_modules/.jerky/@types/node@20.0.0")
+    ));
+    assert!(still_there(
+        &root.join("node_modules/.jerky/@types/react@18.0.0")
+    ));
+
+    // Drop the last one. Now the scope directory itself has nothing left to
+    // hold, in the importer's `node_modules` and in the store.
+    write_manifest(root, r#"{"name":"demo"}"#);
+    sync(&solo(root), &store, &registry, None, Mode::Develop).unwrap();
+
+    assert!(
+        !still_there(&root.join("node_modules/@types")),
+        "an empty scope directory outlived every package it was created for"
+    );
+    assert!(!still_there(&root.join("node_modules/.jerky/@types")));
+}
+
+#[test]
+fn a_scoped_workspace_member_is_linked_in_place() {
+    // The one link shape the registry-side tests cannot reach: a member is
+    // linked straight at its own directory rather than into the store, and a
+    // scoped member puts that link one level down like any other scoped name.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let store = Store::new(home.path().join("store"));
+
+    write_manifest(
+        root,
+        r#"{"name":"mono","private":true,"workspaces":["packages/*"]}"#,
+    );
+    write_manifest(
+        &root.join("packages/ui"),
+        r#"{"name":"@myorg/ui","version":"1.0.0"}"#,
+    );
+    write_manifest(
+        &root.join("packages/app"),
+        r#"{"name":"app","dependencies":{"@myorg/ui":"workspace:*"}}"#,
+    );
+    sync(&solo(root), &store, &scoped_registry(), None, Mode::Develop).unwrap();
+
+    // Read through: a target one level short resolves nowhere, and the member
+    // is a real directory rather than a store entry, so the climb differs
+    // again from the registry case.
+    assert_eq!(
+        linked_version(&root.join("packages/app"), "@myorg/ui"),
+        "1.0.0"
+    );
+    assert_eq!(
+        dangling_links(&root.join("packages")),
+        Vec::<PathBuf>::new()
+    );
+}
+
+#[test]
+fn scope_directories_jerky_creates_are_not_world_writable() {
+    // `create_dir_all` takes its mode from the umask, so under a permissive
+    // one every scope level jerky creates would be writable by anyone — and a
+    // scope directory another user can write into is one they can add a
+    // package to, in the importer's tree and in the store that every project
+    // on the machine hard-links from.
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let store = Store::new(home.path().join("store"));
+
+    write_manifest(
+        root,
+        r#"{"name":"demo","dependencies":{"@types/node":"20.0.0"}}"#,
+    );
+    sync(&solo(root), &store, &scoped_registry(), None, Mode::Develop).unwrap();
+
+    for scope in [
+        root.join("node_modules/@types"),
+        root.join("node_modules/.jerky/@types"),
+    ] {
+        let mode = std::fs::metadata(&scope).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "{} is {mode:o}, not 0o755", scope.display());
+    }
+}

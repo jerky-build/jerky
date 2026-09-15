@@ -166,6 +166,21 @@ pub fn populate_virtual_store(
         return Ok(target);
     }
 
+    // A scoped package's `dir_name` carries a `/` — `@types/node@20.0.0` — so
+    // the `join` above is two levels, and the rename below has a parent that
+    // nothing has created. Unscoped names take this branch too and find the
+    // virtual root already there, which `create_dir_all` treats as success.
+    //
+    // Nesting rather than flattening is the decision #22 left open, and it is
+    // settled by what is already written: `converge` and `prune_virtual_store`
+    // both descend into an `@`-prefixed directory here on purpose, and
+    // flattening would make the second of those dead code branching on a
+    // directory that could no longer exist. The cost is this line.
+    let scope = target
+        .parent()
+        .expect("the target is a directory inside the virtual store, so it has a parent");
+    create_dirs_at_0o755(scope)?;
+
     // The guard deletes the staging tree on any exit that is not an explicit
     // keep — including a panic partway through linking, which the previous
     // hand-rolled unwind here could not cover.
@@ -230,13 +245,52 @@ fn relative_path(from: &Path, to: &Path) -> PathBuf {
     relative
 }
 
+/// Create `dir` and every level of it that did not exist, at `0o755`.
+///
+/// `create_dir_all` takes its mode from the process umask, so under a
+/// permissive one every level it creates is world-writable. That is the rule
+/// `archive::normalise_created_dirs` exists for on the store side, and it
+/// applies here for the same reason: the directories this creates are scope
+/// levels — `node_modules/@types` and `.jerky/@types` — which hold every
+/// package in that scope, and one another user can write into is one they can
+/// add a package to.
+///
+/// Only what was actually missing is touched. A level that already existed
+/// belongs to whoever made it, and rewriting its mode would be this function
+/// deciding something about a directory it did not create.
+fn create_dirs_at_0o755(dir: &Path) -> Result<(), LinkError> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let missing: Vec<PathBuf> = dir
+        .ancestors()
+        .take_while(|level| !level.exists())
+        .map(Path::to_path_buf)
+        .collect();
+
+    std::fs::create_dir_all(dir).map_err(|source| LinkError::Access {
+        path: dir.to_path_buf(),
+        source,
+    })?;
+
+    for level in missing {
+        std::fs::set_permissions(&level, std::fs::Permissions::from_mode(0o755)).map_err(
+            |source| LinkError::Access {
+                path: level.clone(),
+                source,
+            },
+        )?;
+    }
+
+    Ok(())
+}
+
 /// Create `link` pointing at `target`, replacing a link jerky already wrote.
 fn place_symlink(link: PathBuf, target: PathBuf) -> Result<(), LinkError> {
+    // Reachable only for a scoped name, which puts the link one level down and
+    // so needs an `@scope` directory that may not exist. An unscoped name finds
+    // the parent already there.
     if let Some(parent) = link.parent() {
-        std::fs::create_dir_all(parent).map_err(|source| LinkError::Access {
-            path: parent.to_path_buf(),
-            source,
-        })?;
+        create_dirs_at_0o755(parent)?;
     }
 
     // symlink_metadata does not follow the link, so a dangling link is still
@@ -266,9 +320,23 @@ fn place_symlink(link: PathBuf, target: PathBuf) -> Result<(), LinkError> {
 /// name as `entry`. Everything after that — deriving the climb, creating the
 /// directory, replacing a link jerky already wrote — is the same work, so it
 /// lives here rather than being repeated with one line changed.
+///
+/// The climb is measured from the directory the link ends up *in*, which is
+/// not `link_dir` when `pkg_name` is scoped: `@types/node` puts the link one
+/// level further down, at `link_dir/@types/node`, and a relative target is
+/// resolved against the link's own parent. Measuring from `link_dir` instead
+/// costs exactly one `../` and produces a link that silently resolves to
+/// nothing — `node_modules/@types/.jerky/...` rather than
+/// `node_modules/.jerky/...`.
 fn link_at(link_dir: &Path, pkg_name: &str, entry: &Path) -> Result<(), LinkError> {
-    let target = relative_path(link_dir, entry);
-    place_symlink(link_dir.join(pkg_name), target)
+    let link = link_dir.join(pkg_name);
+    let containing = link
+        .parent()
+        .expect("a link is a named entry inside a directory, so it has a parent")
+        .to_path_buf();
+    let target = relative_path(&containing, entry);
+
+    place_symlink(link, target)
 }
 
 /// Link `<importer_dir>/node_modules/<pkg_name>` straight at a workspace
@@ -296,6 +364,18 @@ pub fn symlink_local(
 /// reaching into an importer's `node_modules`, so a package sees exactly the
 /// dependencies it declared and nothing a sibling happens to have installed.
 ///
+/// The store is *found* rather than assumed to be one level up, because how far
+/// up it is depends on the owner: a scoped package's entry is
+/// `@nodelib/fs.walk@1.2.8`, two levels down, so a single `parent()` lands on
+/// the scope directory and every link written from there points at a sibling of
+/// the scope rather than of the entry. Those links exist, so anything checking
+/// for presence is satisfied; they resolve to nothing.
+///
+/// Searching for the named component rather than taking the store as a second
+/// parameter is what keeps the two from being able to disagree: a caller handed
+/// both could pass a mismatched pair and get exactly that silent miscount
+/// back, with nothing to catch it.
+///
 /// The two names are separate because an alias makes them differ: a dependent
 /// declaring `npm:string-width@^4.0.0` under `width-cjs` calls it by the local
 /// name in its own source, while the directory it must land on is the real
@@ -309,11 +389,24 @@ pub fn symlink_into_store(
     target: &StoreEntry<'_>,
 ) -> Result<(), LinkError> {
     let link_dir = owner_entry.join("node_modules");
-    let virtual_store = owner_entry
-        .parent()
-        .expect("a store entry is a directory inside the virtual store, so it has a parent");
+    let virtual_store = virtual_store_of(owner_entry)
+        .expect("a store entry is a directory inside the virtual store");
 
     link_at(&link_dir, link_name, &target.path_under(virtual_store))
+}
+
+/// The virtual store `entry` sits in, however deep in it the entry is.
+///
+/// The nearest ancestor named `.jerky`, so an unscoped entry one level down and
+/// a scoped entry two levels down both find the same directory. A package
+/// cannot be named `.jerky` — npm forbids a leading dot — so the first match
+/// climbing out is the store itself.
+fn virtual_store_of(entry: &Path) -> Option<&Path> {
+    entry.ancestors().find(|level| {
+        level
+            .file_name()
+            .is_some_and(|name| name == VIRTUAL_STORE_DIR)
+    })
 }
 
 /// Where a package sits in a virtual store: the entry directory, and the name
@@ -870,6 +963,45 @@ mod tests {
     }
 
     #[test]
+    fn populate_virtual_store_creates_the_scope_level() {
+        // A scoped entry's directory name carries a `/`, so the rename that
+        // puts it in place needs a level that nothing has created yet. Without
+        // it the rename fails `ENOENT` and no scoped package can be installed
+        // at all — which is what #22 was.
+        let root = TempDir::new().unwrap();
+        let src = store_entry(root.path());
+        let node_modules = root.path().join("node_modules");
+
+        let dir = populate_virtual_store(&src, &node_modules, "@types/node@20.0.0", "@types/node")
+            .unwrap();
+
+        assert_eq!(
+            dir,
+            node_modules
+                .join(".jerky")
+                .join("@types")
+                .join("node@20.0.0")
+        );
+        assert!(dir.join("node_modules/@types/node/package.json").is_file());
+    }
+
+    #[test]
+    fn a_second_package_in_one_scope_joins_the_first() {
+        // The scope level is shared, so creating it must not be a one-shot:
+        // the second package in a scope finds it already there.
+        let root = TempDir::new().unwrap();
+        let src = store_entry(root.path());
+        let node_modules = root.path().join("node_modules");
+
+        populate_virtual_store(&src, &node_modules, "@types/node@20.0.0", "@types/node").unwrap();
+        populate_virtual_store(&src, &node_modules, "@types/react@18.0.0", "@types/react").unwrap();
+
+        let scope = node_modules.join(".jerky").join("@types");
+        assert!(scope.join("node@20.0.0").is_dir());
+        assert!(scope.join("react@18.0.0").is_dir());
+    }
+
+    #[test]
     fn populate_virtual_store_leaves_no_staging_debris() {
         let root = TempDir::new().unwrap();
         let src = store_entry(root.path());
@@ -1077,6 +1209,67 @@ mod tests {
         assert!(
             link.join("package.json").is_file(),
             "the link does not resolve"
+        );
+    }
+
+    #[test]
+    fn a_scoped_owner_climbs_one_level_further_to_reach_a_sibling() {
+        // The owner is two levels into the store, so reaching a sibling entry
+        // takes three climbs rather than two. Inferring the store's location
+        // with a single `parent()` on the owner lands on the scope directory
+        // and writes `../../fastq@1.0.0/...`, which exists as a link and
+        // resolves to nothing.
+        let root = TempDir::new().unwrap();
+        let src = store_entry(root.path());
+        let node_modules = root.path().join("ws").join("node_modules");
+        let owner = populate_virtual_store(
+            &src,
+            &node_modules,
+            "@nodelib/fs.walk@1.2.8",
+            "@nodelib/fs.walk",
+        )
+        .unwrap();
+        populate_virtual_store(&src, &node_modules, "fastq@1.0.0", "fastq").unwrap();
+
+        symlink_into_store(&owner, "fastq", &entry("fastq@1.0.0", "fastq")).unwrap();
+
+        let link = owner.join("node_modules").join("fastq");
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            Path::new("../../../fastq@1.0.0/node_modules/fastq")
+        );
+        assert!(
+            link.join("package.json").is_file(),
+            "the link does not resolve"
+        );
+    }
+
+    #[test]
+    fn a_scoped_owner_reaching_a_scoped_sibling_climbs_from_both() {
+        let root = TempDir::new().unwrap();
+        let src = store_entry(root.path());
+        let node_modules = root.path().join("ws").join("node_modules");
+        let owner = populate_virtual_store(
+            &src,
+            &node_modules,
+            "@nodelib/fs.walk@1.2.8",
+            "@nodelib/fs.walk",
+        )
+        .unwrap();
+        populate_virtual_store(&src, &node_modules, "@types/node@20.0.0", "@types/node").unwrap();
+
+        symlink_into_store(
+            &owner,
+            "@types/node",
+            &entry("@types/node@20.0.0", "@types/node"),
+        )
+        .unwrap();
+
+        let link = owner.join("node_modules").join("@types").join("node");
+        assert!(
+            link.join("package.json").is_file(),
+            "the link does not resolve: {:?}",
+            std::fs::read_link(&link).unwrap()
         );
     }
 
