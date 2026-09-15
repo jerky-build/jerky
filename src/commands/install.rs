@@ -370,12 +370,6 @@ pub fn sync(
         graph = graph.reachable();
     }
 
-    // The virtual store sits at the workspace root, which is the whole reason
-    // two importers on one version share an entry rather than each unpacking
-    // their own.
-    let node_modules = workspace.root().join("node_modules");
-    let mut entries: BTreeMap<PackageId, PathBuf> = BTreeMap::new();
-
     // The locked-integrity gate, over every package, before a single byte is
     // fetched. It was previously folded into the materialisation loop, which
     // meant a mismatch on a late package was raised only after every earlier
@@ -425,102 +419,13 @@ pub fn sync(
     // already holds cost nothing here and are never downloaded.
     fetch_missing(&graph, store, registry)?;
 
-    // Laying out the virtual store stays serial and stays in `graph.packages`
-    // order. It is local filesystem work — hard links out of the store — so
-    // there is no latency to hide, and keeping one writer means the tree is
-    // built the same way every run.
-    for (id, package) in &graph.packages {
-        let entry = store.entry_path(&package.integrity);
-        let virtual_dir =
-            linker::populate_virtual_store(&entry, &node_modules, &id.to_string(), &id.name)?;
-        entries.insert(id.clone(), virtual_dir);
-    }
-
-    // Each package's own edges, linked inside the store. This is what makes a
-    // package see exactly what it declared: its siblings in its private
-    // `node_modules` are its dependencies and nothing else.
-    for (id, package) in &graph.packages {
-        let owner = &entries[id];
-        for (dep_name, dep_id) in &package.dependencies {
-            let dir_name = dep_id.to_string();
-            linker::symlink_into_store(owner, dep_name, &store_entry(&dir_name, dep_id))?;
-        }
-    }
-
-    // Then one `node_modules` per importer, with targets shaped by how deep
-    // that importer sits.
-    for (path, resolved) in &graph.importers {
-        let member = workspace
-            .members()
-            .get(path)
-            .expect("every importer in the graph was seeded from a member");
-
-        for (name, dependency) in &resolved.dependencies {
-            match &dependency.resolution {
-                Resolution::Registry(id) => {
-                    let dir_name = id.to_string();
-                    linker::symlink_dependency_from(
-                        &member.path,
-                        workspace.root(),
-                        name,
-                        &store_entry(&dir_name, id),
-                    )?
-                }
-                // The graph records a path relative to the declaring importer,
-                // which is what the lockfile wants. Linking uses the member's
-                // own absolute directory instead: joining a relative target
-                // back on would produce a path full of `..` components, and
-                // the linker compares paths lexically.
-                Resolution::Local(_) => {
-                    let local = workspace
-                        .member_by_name(name)
-                        .expect("a local resolution named a member the resolver found");
-                    linker::symlink_local(&member.path, name, &local.path)?
-                }
-            }
-        }
-    }
-
-    // Then, per importer, the other half of the same job: remove the links
-    // nothing declares any more. An install that only ever added would leave a
-    // symlink that still resolves behind every deleted dependency, so `require`
-    // would go on finding a package the manifest has dropped. The lockfile is
-    // already pruned on every write; this is that property applied to disk.
-    //
-    // It runs after linking rather than before, so that what convergence sees
-    // is the finished tree: an entry that is about to be rewritten has already
-    // been rewritten, and the only entries left to judge are the ones no
-    // importer asked for.
-    //
-    // Every member's directory, so that a link at one is recognised as jerky's.
-    // A local link points straight at the member rather than into the virtual
-    // store, and an ownership test that knew only about the store would delete
-    // every local link on the install after it was created.
-    let member_dirs: BTreeSet<PathBuf> = workspace
-        .members()
-        .values()
-        .map(|member| member.path.clone())
-        .collect();
-    let mut left_alone = Vec::new();
-    for (path, resolved) in &graph.importers {
-        let member = workspace
-            .members()
-            .get(path)
-            .expect("every importer in the graph was seeded from a member");
-        let expected: BTreeSet<String> = resolved.dependencies.keys().cloned().collect();
-
-        left_alone.extend(linker::converge(
-            &member.path,
-            workspace.root(),
-            &member_dirs,
-            &expected,
-        )?);
-    }
-
-    // The links go first and the entries they named go second, so that nothing
-    // is ever pointed at by a link jerky still considers live.
-    let reachable: BTreeSet<String> = graph.packages.keys().map(PackageId::to_string).collect();
-    linker::prune_virtual_store(&node_modules, &reachable)?;
+    // Say what the tree should be, then make it so. Two statements, because
+    // the ordering the second half obeys — entries before the links into them,
+    // convergence after linking, the prune last — is a property of `apply`
+    // rather than of the order these lines happen to be written in. It used to
+    // be five loops here and a comment above each one saying what must not be
+    // moved.
+    let left_alone = plan_for(&graph, workspace, store).apply()?;
 
     // The lockfile records what the manifest declares, so the specifier it
     // carries for this request is the one about to be written rather than the
@@ -774,27 +679,100 @@ fn fetch_one(
     Ok(())
 }
 
-/// What the manifest should record for a request, and what it resolved to.
+/// The tree this graph means, as a plan the linker can apply.
 ///
-/// The two differ more often than they look like they should, which is why
-/// this is one named function rather than an expression at the call site.
+/// Three descriptions and nothing performed: the virtual store the workspace
+/// root should hold, the edges that leave each entry in it, and one
+/// `node_modules` per importer. What order those get written in, and what gets
+/// removed afterwards, is [`linker::Plan::apply`]'s business — this says only
+/// what the answer is.
+///
+/// Every importer in the graph is named, including one that declares nothing.
+/// That is not a formality: convergence is what unlinks a dropped dependency,
+/// and the importer that just lost its last one has no links to write and
+/// everything to remove.
+fn plan_for(graph: &ResolvedGraph, workspace: &Workspace, store: &Store) -> linker::Plan {
+    // Every member's directory, so that a link at one is recognised as jerky's.
+    // A local link points straight at the member rather than into the virtual
+    // store, and an ownership test that knew only about the store would delete
+    // every local link on the install after it was created.
+    let members: BTreeSet<PathBuf> = workspace
+        .members()
+        .values()
+        .map(|member| member.path.clone())
+        .collect();
+
+    // The virtual store sits at the workspace root, which is the whole reason
+    // two importers on one version share an entry rather than each unpacking
+    // their own. The plan carries the root and derives the rest.
+    let mut plan = linker::Plan::new(workspace.root(), members);
+
+    for (id, package) in &graph.packages {
+        plan.add_entry(
+            &id.to_string(),
+            linker::VirtualStoreEntry {
+                store_path: store.entry_path(&package.integrity),
+                pkg_name: id.name.clone(),
+                edges: package
+                    .dependencies
+                    .iter()
+                    .map(|(name, dep_id)| (name.clone(), store_entry(dep_id)))
+                    .collect(),
+            },
+        );
+    }
+
+    for (path, resolved) in &graph.importers {
+        let member = workspace
+            .members()
+            .get(path)
+            .expect("every importer in the graph was seeded from a member");
+
+        let links = resolved
+            .dependencies
+            .iter()
+            .map(|(name, dependency)| {
+                let target = match &dependency.resolution {
+                    Resolution::Registry(id) => linker::ImporterTarget::Entry(store_entry(id)),
+                    // The graph records a path relative to the declaring
+                    // importer, which is what the lockfile wants. Linking uses
+                    // the member's own absolute directory instead: joining a
+                    // relative target back on would produce a path full of
+                    // `..` components, and the linker compares paths lexically.
+                    Resolution::Local(_) => {
+                        let local = workspace
+                            .member_by_name(name)
+                            .expect("a local resolution named a member the resolver found");
+                        linker::ImporterTarget::Member(local.path.clone())
+                    }
+                };
+                (name.clone(), target)
+            })
+            .collect();
+
+        plan.add_importer(&member.path, links);
+    }
+
+    plan
+}
+
 /// Where a resolved package sits in the virtual store.
 ///
 /// The one place that pairs the two, so a caller cannot get the order wrong:
 /// the entry's directory is the package's `name@version`, and the package
 /// nested inside it is named for the package itself — which for an alias is
 /// not the name the link takes.
-///
-/// `dir_name` is passed in rather than returned because it is a fresh
-/// `String` and [`linker::StoreEntry`] borrows; the caller owns it for as long
-/// as the link takes to write.
-fn store_entry<'a>(dir_name: &'a str, id: &'a PackageId) -> linker::StoreEntry<'a> {
+fn store_entry(id: &PackageId) -> linker::StoreEntry {
     linker::StoreEntry {
-        dir_name,
-        pkg_name: &id.name,
+        dir_name: id.to_string(),
+        pkg_name: id.name.clone(),
     }
 }
 
+/// What the manifest should record for a request, and what it resolved to.
+///
+/// The two differ more often than they look like they should, which is why
+/// this is one named function rather than an expression at the call site.
 fn record_for(request: &Request, graph: &ResolvedGraph, workspace: &Workspace) -> Recorded {
     let resolved = &graph.importers[&request.importer].dependencies[&request.name];
 
@@ -1014,4 +992,220 @@ fn unconstrained_range(seed: &str) -> Option<&str> {
 /// thing that was installed.
 fn declared_range(seed: &str) -> Option<&str> {
     (Range::parse(seed).is_ok() && Version::parse(seed).is_err()).then_some(seed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::integrity::Algo;
+    use crate::linker::{ImporterTarget, Plan, StoreEntry, VirtualStoreEntry};
+    use crate::resolver::Dependency;
+    use std::path::Path;
+    use tempfile::TempDir;
+
+    fn write_manifest(dir: &Path, json: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("package.json"), json).unwrap();
+    }
+
+    fn id(name: &str, version: &str) -> PackageId {
+        PackageId {
+            name: name.to_string(),
+            version: version.to_string(),
+        }
+    }
+
+    /// Distinct per package, because the store path a plan carries is derived
+    /// from the integrity and two entries must not share one.
+    fn integrity(seed: &str) -> Integrity {
+        Integrity {
+            algo: Algo::Sha512,
+            digest: <sha2::Sha512 as sha2::Digest>::digest(seed.as_bytes()).to_vec(),
+        }
+    }
+
+    fn package(name: &str, version: &str, dependencies: &[(&str, PackageId)]) -> ResolvedPackage {
+        ResolvedPackage {
+            id: id(name, version),
+            resolved: format!("https://fixture.test/{name}-{version}.tgz"),
+            integrity: integrity(&format!("{name}@{version}")),
+            dependencies: dependencies
+                .iter()
+                .map(|(link, target)| (link.to_string(), target.clone()))
+                .collect(),
+        }
+    }
+
+    fn dependency(specifier: &str, resolution: Resolution) -> Dependency {
+        Dependency {
+            specifier: specifier.to_string(),
+            kind: Kind::Prod,
+            resolution,
+        }
+    }
+
+    fn importer(dependencies: &[(&str, Dependency)]) -> Importer {
+        Importer {
+            dependencies: dependencies
+                .iter()
+                .map(|(name, dep)| (name.to_string(), dep.clone()))
+                .collect(),
+        }
+    }
+
+    fn at(path: &str) -> ImporterPath {
+        ImporterPath::new(path).unwrap()
+    }
+
+    fn store_dir(dir_name: &str, pkg_name: &str) -> StoreEntry {
+        StoreEntry {
+            dir_name: dir_name.to_string(),
+            pkg_name: pkg_name.to_string(),
+        }
+    }
+
+    /// A workspace of three: the root, a member with dependencies, and a
+    /// member that declares nothing.
+    fn workspace(root: &Path) -> Workspace {
+        write_manifest(root, r#"{"name":"ws","workspaces":["packages/*"]}"#);
+        write_manifest(&root.join("packages/ui"), r#"{"name":"ui"}"#);
+        write_manifest(&root.join("packages/empty"), r#"{"name":"empty"}"#);
+        Workspace::discover(root).unwrap()
+    }
+
+    #[test]
+    fn the_plan_names_exactly_the_entries_edges_and_links_the_graph_implies() {
+        // The seam the orchestrator now speaks across. Written as an equality
+        // against a plan built by hand through the same public interface,
+        // because what is under test is that nothing is named twice, nothing
+        // is missed, and no name is swapped for another — an assertion made
+        // one `contains` at a time can pass while missing all three.
+        let home = TempDir::new().unwrap();
+        let work = TempDir::new().unwrap();
+        let workspace = workspace(work.path());
+        let store = Store::new(home.path().join("store"));
+        // `discover` canonicalizes, so every path below is taken from the
+        // workspace rather than from the temp directory it was built in.
+        let root = workspace.root().to_path_buf();
+
+        let graph = ResolvedGraph {
+            importers: BTreeMap::from([
+                (
+                    at("."),
+                    importer(&[(
+                        "alpha",
+                        dependency("1.0.0", Resolution::Registry(id("alpha", "1.0.0"))),
+                    )]),
+                ),
+                (
+                    at("packages/ui"),
+                    importer(&[
+                        (
+                            // An alias: the link takes the local name, the
+                            // entry is the real package's.
+                            "width-cjs",
+                            dependency(
+                                "npm:string-width@^4.0.0",
+                                Resolution::Registry(id("string-width", "4.2.3")),
+                            ),
+                        ),
+                        (
+                            "empty",
+                            dependency("workspace:*", Resolution::Local("../empty".into())),
+                        ),
+                    ]),
+                ),
+                // Declares nothing, and is named all the same: convergence is
+                // what unlinks a dropped dependency, and the importer that
+                // just lost its last one has nothing to write and everything
+                // to remove.
+                (at("packages/empty"), importer(&[])),
+            ]),
+            packages: BTreeMap::from([
+                (
+                    id("alpha", "1.0.0"),
+                    package(
+                        "alpha",
+                        "1.0.0",
+                        &[
+                            ("beta", id("beta", "2.0.0")),
+                            ("width-cjs", id("string-width", "4.2.3")),
+                        ],
+                    ),
+                ),
+                (id("beta", "2.0.0"), package("beta", "2.0.0", &[])),
+                (
+                    id("string-width", "4.2.3"),
+                    package("string-width", "4.2.3", &[]),
+                ),
+            ]),
+        };
+
+        let mut expected = Plan::new(
+            &root,
+            BTreeSet::from([
+                root.clone(),
+                root.join("packages/ui"),
+                root.join("packages/empty"),
+            ]),
+        );
+        expected.add_entry(
+            "alpha@1.0.0",
+            VirtualStoreEntry {
+                store_path: store.entry_path(&integrity("alpha@1.0.0")),
+                pkg_name: "alpha".to_string(),
+                edges: BTreeMap::from([
+                    ("beta".to_string(), store_dir("beta@2.0.0", "beta")),
+                    (
+                        "width-cjs".to_string(),
+                        store_dir("string-width@4.2.3", "string-width"),
+                    ),
+                ]),
+            },
+        );
+        expected.add_entry(
+            "beta@2.0.0",
+            VirtualStoreEntry {
+                store_path: store.entry_path(&integrity("beta@2.0.0")),
+                pkg_name: "beta".to_string(),
+                edges: BTreeMap::new(),
+            },
+        );
+        expected.add_entry(
+            "string-width@4.2.3",
+            VirtualStoreEntry {
+                store_path: store.entry_path(&integrity("string-width@4.2.3")),
+                pkg_name: "string-width".to_string(),
+                edges: BTreeMap::new(),
+            },
+        );
+        expected.add_importer(
+            &root,
+            BTreeMap::from([(
+                "alpha".to_string(),
+                ImporterTarget::Entry(store_dir("alpha@1.0.0", "alpha")),
+            )]),
+        );
+        expected.add_importer(
+            &root.join("packages/ui"),
+            BTreeMap::from([
+                (
+                    "width-cjs".to_string(),
+                    ImporterTarget::Entry(store_dir("string-width@4.2.3", "string-width")),
+                ),
+                // Absolute, and the member's own directory rather than the
+                // `../empty` the graph records: the lockfile wants a path
+                // relative to the declaring importer, and the linker compares
+                // paths lexically.
+                (
+                    "empty".to_string(),
+                    ImporterTarget::Member(root.join("packages/empty")),
+                ),
+            ]),
+        );
+        expected.add_importer(&root.join("packages/empty"), BTreeMap::new());
+
+        assert_eq!(plan_for(&graph, &workspace, &store), expected);
+    }
 }
