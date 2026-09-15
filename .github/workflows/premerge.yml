@@ -67,3 +67,22 @@ jobs:
           components: clippy
 
       - run: cargo clippy --all-targets -- -D warnings
+
+  # The benchmark itself is not run here — it measures a live registry, which
+  # is neither reproducible nor kind on a CI runner. Its helpers are pure, and
+  # they are where a silently wrong number would come from.
+  #
+  # Both runners, matching `test`: the helpers exist to be portable, and macOS
+  # is where they break — BSD `date` has no `%N`, BSD `wc` pads its output, and
+  # the bash macOS ships has no `mapfile`.
+  benches:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, macos-latest]
+
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - run: ./benches/lib-test.sh
