@@ -51,7 +51,7 @@ usage: ./benches/bench.sh [options]
                    jerky-lock.json, then exit without measuring
   --record         install both fixtures against the live registry, writing
                    down every packument and tarball they ask for, then exit
-                   without measuring. Roughly 470MB, and the one thing here
+                   without measuring. Roughly 770MB, and the one thing here
                    that touches the network.
   -h, --help       this
 
@@ -308,7 +308,7 @@ record_mirror() {
     mkdir -p "$MIRROR"
     printf 'recording from %s into %s\n' "$UPSTREAM" "$MIRROR" >&2
     printf 'This is the one thing here that touches the network, and it is\n' >&2
-    printf 'roughly 470MB for both fixtures. It resumes, so an interrupted\n' >&2
+    printf 'roughly 770MB for both fixtures. It resumes, so an interrupted\n' >&2
     printf 'recording can be finished by running this again.\n\n' >&2
 
     mirror_start "$MIRROR" "$MIRROR_LOG" --record --upstream "$UPSTREAM"
@@ -370,7 +370,7 @@ weather rather than a cost of the install. Seed the mirror once with
     ./benches/bench.sh --record
 
 which installs both fixtures live and writes down everything they ask for,
-roughly 470MB. It is gitignored; set JERKY_BENCH_MIRROR_DIR to keep it
+roughly 770MB. It is gitignored; set JERKY_BENCH_MIRROR_DIR to keep it
 somewhere else.
 MSG
     exit 1
