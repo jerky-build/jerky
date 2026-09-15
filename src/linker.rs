@@ -50,8 +50,12 @@ pub enum LinkError {
 ///
 /// A workspace of one is not a special case: it is a plan with one importer at
 /// the root, applied by the same function as a plan with twenty.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Plan {
+///
+/// `pub(crate)` rather than `pub`: this is the seam between the orchestrator
+/// and the linker, not part of what jerky offers a dependent. Widening it is a
+/// decision to make when something outside the crate needs one.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Plan {
     /// The workspace root. The one virtual store hangs below it, and every
     /// importer link's climb is measured against it.
     workspace_root: PathBuf,
@@ -76,28 +80,45 @@ pub struct Plan {
 }
 
 /// One package the virtual store must hold, and what it sees from inside it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VirtualStoreEntry {
-    /// The unpacked bytes in the machine-global content store, which the entry
-    /// is hard-linked from.
-    pub store_path: PathBuf,
+///
+/// Carries its own `dir_name` rather than being handed over beside one, for
+/// the same reason [`VirtualStoreRef`] is a pair: a name and the thing it
+/// names are never useful apart, and a `(&str, value)` argument list is
+/// exactly the shape that lets a caller pass the wrong string and get a
+/// silently misplaced entry rather than a compile error.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct VirtualStoreEntry {
+    /// The entry's directory name, which is the package's `name@version`. Its
+    /// identity in the plan and on disk both.
+    pub dir_name: String,
     /// The package's own name, which is the directory nested inside the entry.
     pub pkg_name: String,
+    /// Where the unpacked bytes are in the machine-global *content* store,
+    /// which the entry is hard-linked from. Every other path in a plan is in
+    /// the project's virtual store; this is the one that is not, and it is
+    /// spelled out because the two are easy to read past.
+    pub content_store_path: PathBuf,
     /// This package's own dependencies: the name it calls each one by, and
     /// where that one sits in the same virtual store. The two differ for an
     /// alias — a package declaring `npm:string-width@^4.0.0` under `width-cjs`
     /// calls it `width-cjs` and must land on `string-width`'s entry.
-    pub edges: BTreeMap<String, StoreEntry>,
+    pub edges: BTreeMap<String, VirtualStoreRef>,
 }
 
-/// Where a package sits in a virtual store: the entry directory, and the name
-/// of the package nested inside it.
+/// Which virtual store entry a link points at: the entry directory, and the
+/// name of the package nested inside it.
 ///
 /// A pair rather than two parameters because they are never useful apart and
 /// are easy to hand over in the wrong order — both are strings, and swapping
 /// them produces a link that resolves to nothing rather than a compile error.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StoreEntry {
+///
+/// Named for the *virtual* store on purpose. jerky has two stores — the
+/// machine-global content store under `~/.jerky/store` that holds unpacked
+/// bytes, and the per-workspace virtual store under `node_modules/.jerky` that
+/// holds hard links into it — and a reader should not have to open the docs to
+/// tell which of them a type or a field means.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct VirtualStoreRef {
     /// The entry's directory name, which is the package's `name@version`.
     pub dir_name: String,
     /// The package's own name, which is the directory nested inside it.
@@ -105,10 +126,10 @@ pub struct StoreEntry {
 }
 
 /// What one link in an importer's `node_modules` points at.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ImporterTarget {
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ImporterTarget {
     /// A registry package, in the workspace root's virtual store.
-    Entry(StoreEntry),
+    Entry(VirtualStoreRef),
     /// A workspace member, at its own directory.
     ///
     /// A local dependency has no store entry, because there is no tarball: the
@@ -119,7 +140,7 @@ pub enum ImporterTarget {
 
 impl Plan {
     /// An empty plan for `workspace_root`, whose members are at `members`.
-    pub fn new(workspace_root: &Path, members: BTreeSet<PathBuf>) -> Self {
+    pub(crate) fn new(workspace_root: &Path, members: BTreeSet<PathBuf>) -> Self {
         Plan {
             workspace_root: workspace_root.to_path_buf(),
             members,
@@ -128,10 +149,28 @@ impl Plan {
         }
     }
 
-    /// Name a package the virtual store must hold, by its `name@version`
-    /// directory.
-    pub fn add_entry(&mut self, dir_name: &str, entry: VirtualStoreEntry) {
-        self.entries.insert(dir_name.to_string(), entry);
+    /// Name a package the virtual store must hold.
+    ///
+    /// Panics on a second entry claiming a `dir_name` that is already taken.
+    /// Keying by that name is what makes the prune safe by construction, and it
+    /// is also a way to lose an entry that the `BTreeMap<PackageId, _>` this
+    /// replaced did not have: two `PackageId`s rendering the same
+    /// `name@version` would leave one silently absent from the plan, unpacked
+    /// by nothing and pointed at by links that resolve nowhere.
+    ///
+    /// Unreachable through the resolver, because a package name carries no `@`
+    /// past its scope prefix and a version carries none at all. It is worth a
+    /// panic rather than a silent overwrite anyway: `dir_name` *is* the
+    /// directory, so a collision here is a collision on disk, and this is the
+    /// one point that can still say so.
+    pub(crate) fn add_entry(&mut self, entry: VirtualStoreEntry) {
+        assert!(
+            !self.entries.contains_key(&entry.dir_name),
+            "two packages both claim the virtual store entry `{}`, which is one \
+             directory and cannot hold both",
+            entry.dir_name
+        );
+        self.entries.insert(entry.dir_name.clone(), entry);
     }
 
     /// Name an importer and everything its `node_modules` should contain.
@@ -139,7 +178,7 @@ impl Plan {
     /// `dir` is the importer's own absolute directory, not its `node_modules`.
     /// Naming an importer with no links at all is meaningful and not a no-op:
     /// it is what converges a member that has just dropped its last dependency.
-    pub fn add_importer(&mut self, dir: &Path, links: BTreeMap<String, ImporterTarget>) {
+    pub(crate) fn add_importer(&mut self, dir: &Path, links: BTreeMap<String, ImporterTarget>) {
         self.importers.insert(dir.to_path_buf(), links);
     }
 
@@ -163,13 +202,28 @@ impl Plan {
     ///    second, so nothing is ever pointed at by a link jerky still considers
     ///    live.
     ///
-    /// Laying the tree out is serial, and in the order the plan's own maps
-    /// give: it is local filesystem work — hard links out of the store — so
-    /// there is no latency to hide, and one writer means the tree is built the
-    /// same way every run. Whether that is still the right trade is #86's
-    /// question, and it is now one function's to answer rather than the
-    /// caller's.
-    pub fn apply(&self) -> Result<Vec<Unowned>, LinkError> {
+    /// Laying the tree out is serial: it is local filesystem work — hard links
+    /// out of the content store — so there is no latency to hide, and one
+    /// writer means the tree is built the same way every run. Whether that is
+    /// still the right trade is #86's question, and it is now one function's to
+    /// answer rather than the caller's.
+    ///
+    /// **The order entries are laid out in did change**, and saying so is
+    /// better than letting the next reader discover it. The orchestrator used
+    /// to walk `BTreeMap<PackageId, _>`, sorted by `(name, version)`; this
+    /// walks `entries`, sorted by the `name@version` string. The two disagree
+    /// wherever a name contains a character below `@`, so `a-b@1.0.0` now comes
+    /// before `a@1.0.0` and used to come after. Nothing depends on it: each
+    /// entry is hard-linked out of the content store independently of every
+    /// other, no entry's contents mention another, and the links between them
+    /// are written in the pass below, after all of them exist. The resulting
+    /// tree is byte for byte the one the old order produced, and
+    /// `tests/tree_shape.rs` is where that is checked rather than asserted —
+    /// its fixture was rendered by the linker that walked `PackageId`s. It is
+    /// written down because "the same way every run" is a property worth
+    /// keeping, and the next person to compare a trace against an old one
+    /// deserves to know which sort they are looking at.
+    pub(crate) fn apply(&self) -> Result<Vec<Unowned>, LinkError> {
         let node_modules = self.workspace_root.join("node_modules");
 
         // Paired with the entry rather than looked up again, so there is no
@@ -177,11 +231,11 @@ impl Plan {
         // landed, and `symlink_into_store` finds the store by climbing out of
         // it — the two halves of one fact, kept next to each other.
         let mut materialised = Vec::with_capacity(self.entries.len());
-        for (dir_name, entry) in &self.entries {
+        for entry in self.entries.values() {
             let owner = populate_virtual_store(
-                &entry.store_path,
+                &entry.content_store_path,
                 &node_modules,
-                dir_name,
+                &entry.dir_name,
                 &entry.pkg_name,
             )?;
             materialised.push((entry, owner));
@@ -539,7 +593,7 @@ fn symlink_local(importer_dir: &Path, pkg_name: &str, target_dir: &Path) -> Resu
 fn symlink_into_store(
     owner_entry: &Path,
     link_name: &str,
-    target: &StoreEntry,
+    target: &VirtualStoreRef,
 ) -> Result<(), LinkError> {
     let link_dir = owner_entry.join("node_modules");
     let virtual_store = virtual_store_of(owner_entry)
@@ -562,7 +616,7 @@ fn virtual_store_of(entry: &Path) -> Option<&Path> {
     })
 }
 
-impl StoreEntry {
+impl VirtualStoreRef {
     fn path_under(&self, virtual_store: &Path) -> PathBuf {
         virtual_store
             .join(&self.dir_name)
@@ -584,7 +638,7 @@ fn symlink_dependency_from(
     importer_dir: &Path,
     workspace_root: &Path,
     link_name: &str,
-    target: &StoreEntry,
+    target: &VirtualStoreRef,
 ) -> Result<(), LinkError> {
     debug_assert!(
         importer_dir.starts_with(workspace_root),
@@ -1000,8 +1054,8 @@ mod tests {
     /// Deliberately not derived from `dir_name`: deriving it would mean these
     /// tests agree with themselves about how the two relate rather than with
     /// the caller, and that pairing is exactly what an alias breaks.
-    fn entry(dir_name: &str, pkg_name: &str) -> StoreEntry {
-        StoreEntry {
+    fn entry(dir_name: &str, pkg_name: &str) -> VirtualStoreRef {
+        VirtualStoreRef {
             dir_name: dir_name.to_string(),
             pkg_name: pkg_name.to_string(),
         }
@@ -1739,8 +1793,9 @@ mod tests {
 
     fn leaf(root: &Path, dir_name: &str, pkg_name: &str) -> VirtualStoreEntry {
         VirtualStoreEntry {
-            store_path: store_tree(root, dir_name, pkg_name),
+            dir_name: dir_name.to_string(),
             pkg_name: pkg_name.to_string(),
+            content_store_path: store_tree(root, dir_name, pkg_name),
             edges: BTreeMap::new(),
         }
     }
@@ -1756,18 +1811,37 @@ mod tests {
         let ui = ws.join("packages/ui");
 
         let mut forwards = Plan::new(&ws, BTreeSet::from([ws.clone(), ui.clone()]));
-        forwards.add_entry("alpha@1.0.0", leaf(root.path(), "alpha@1.0.0", "alpha"));
-        forwards.add_entry("beta@2.0.0", leaf(root.path(), "beta@2.0.0", "beta"));
+        forwards.add_entry(leaf(root.path(), "alpha@1.0.0", "alpha"));
+        forwards.add_entry(leaf(root.path(), "beta@2.0.0", "beta"));
         forwards.add_importer(&ws, BTreeMap::new());
         forwards.add_importer(&ui, BTreeMap::new());
 
         let mut backwards = Plan::new(&ws, BTreeSet::from([ws.clone(), ui.clone()]));
         backwards.add_importer(&ui, BTreeMap::new());
         backwards.add_importer(&ws, BTreeMap::new());
-        backwards.add_entry("beta@2.0.0", leaf(root.path(), "beta@2.0.0", "beta"));
-        backwards.add_entry("alpha@1.0.0", leaf(root.path(), "alpha@1.0.0", "alpha"));
+        backwards.add_entry(leaf(root.path(), "beta@2.0.0", "beta"));
+        backwards.add_entry(leaf(root.path(), "alpha@1.0.0", "alpha"));
 
         assert_eq!(forwards, backwards);
+    }
+
+    #[test]
+    #[should_panic(expected = "two packages both claim the virtual store entry")]
+    fn two_packages_claiming_one_entry_is_loud_rather_than_lossy() {
+        // Keying the entries by their directory name is what makes the prune
+        // safe by construction, and it costs this: a `BTreeMap` insert would
+        // drop one of a colliding pair without a word, leaving an entry the
+        // plan believes in, nothing to unpack it, and links into it that
+        // resolve nowhere. Unreachable through the resolver — a name carries
+        // no `@` past its scope prefix and a version carries none at all — and
+        // pinned anyway, because the point of choosing a panic over a silent
+        // overwrite is that someone later can see the choice was made.
+        let root = TempDir::new().unwrap();
+        let ws = root.path().join("ws");
+
+        let mut plan = Plan::new(&ws, BTreeSet::new());
+        plan.add_entry(leaf(root.path(), "alpha@1.0.0", "alpha"));
+        plan.add_entry(leaf(root.path(), "alpha@1.0.0", "alpha"));
     }
 
     #[test]
@@ -1818,15 +1892,13 @@ mod tests {
             ]),
         );
 
-        plan.add_entry(
-            "alpha@1.0.0",
-            VirtualStoreEntry {
-                store_path: store_tree(root.path(), "alpha@1.0.0", "alpha"),
-                pkg_name: "alpha".to_string(),
-                edges: BTreeMap::from([("beta".to_string(), entry("beta@2.0.0", "beta"))]),
-            },
-        );
-        plan.add_entry("beta@2.0.0", leaf(root.path(), "beta@2.0.0", "beta"));
+        plan.add_entry(VirtualStoreEntry {
+            dir_name: "alpha@1.0.0".to_string(),
+            pkg_name: "alpha".to_string(),
+            content_store_path: store_tree(root.path(), "alpha@1.0.0", "alpha"),
+            edges: BTreeMap::from([("beta".to_string(), entry("beta@2.0.0", "beta"))]),
+        });
+        plan.add_entry(leaf(root.path(), "beta@2.0.0", "beta"));
 
         let left_alone = plan.apply().unwrap();
         assert!(left_alone.is_empty(), "{left_alone:?}");
@@ -1889,7 +1961,7 @@ mod tests {
         symlink_dependency_from(&ws, &ws, "alpha", &entry("alpha@0.9.0", "alpha")).unwrap();
 
         let mut plan = Plan::new(&ws, BTreeSet::from([ws.clone()]));
-        plan.add_entry("alpha@1.0.0", leaf(root.path(), "alpha@1.0.0", "alpha"));
+        plan.add_entry(leaf(root.path(), "alpha@1.0.0", "alpha"));
         plan.add_importer(
             &ws,
             BTreeMap::from([(

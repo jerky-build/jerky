@@ -419,12 +419,11 @@ pub fn sync(
     // already holds cost nothing here and are never downloaded.
     fetch_missing(&graph, store, registry)?;
 
-    // Say what the tree should be, then make it so. Two statements, because
-    // the ordering the second half obeys — entries before the links into them,
-    // convergence after linking, the prune last — is a property of `apply`
-    // rather than of the order these lines happen to be written in. It used to
-    // be five loops here and a comment above each one saying what must not be
-    // moved.
+    // Say what the tree should be, then make it so. The ordering the second
+    // half obeys — entries before the links into them, convergence after
+    // linking, the prune last — is a property of `apply` rather than of
+    // anything written here. This used to be five loops with a comment above
+    // each one saying what must not be moved.
     let left_alone = plan_for(&graph, workspace, store).apply()?;
 
     // The lockfile records what the manifest declares, so the specifier it
@@ -708,18 +707,16 @@ fn plan_for(graph: &ResolvedGraph, workspace: &Workspace, store: &Store) -> link
     let mut plan = linker::Plan::new(workspace.root(), members);
 
     for (id, package) in &graph.packages {
-        plan.add_entry(
-            &id.to_string(),
-            linker::VirtualStoreEntry {
-                store_path: store.entry_path(&package.integrity),
-                pkg_name: id.name.clone(),
-                edges: package
-                    .dependencies
-                    .iter()
-                    .map(|(name, dep_id)| (name.clone(), store_entry(dep_id)))
-                    .collect(),
-            },
-        );
+        plan.add_entry(linker::VirtualStoreEntry {
+            dir_name: id.to_string(),
+            pkg_name: id.name.clone(),
+            content_store_path: store.entry_path(&package.integrity),
+            edges: package
+                .dependencies
+                .iter()
+                .map(|(name, dep_id)| (name.clone(), virtual_store_ref(dep_id)))
+                .collect(),
+        });
     }
 
     for (path, resolved) in &graph.importers {
@@ -733,7 +730,9 @@ fn plan_for(graph: &ResolvedGraph, workspace: &Workspace, store: &Store) -> link
             .iter()
             .map(|(name, dependency)| {
                 let target = match &dependency.resolution {
-                    Resolution::Registry(id) => linker::ImporterTarget::Entry(store_entry(id)),
+                    Resolution::Registry(id) => {
+                        linker::ImporterTarget::Entry(virtual_store_ref(id))
+                    }
                     // The graph records a path relative to the declaring
                     // importer, which is what the lockfile wants. Linking uses
                     // the member's own absolute directory instead: joining a
@@ -762,8 +761,8 @@ fn plan_for(graph: &ResolvedGraph, workspace: &Workspace, store: &Store) -> link
 /// the entry's directory is the package's `name@version`, and the package
 /// nested inside it is named for the package itself — which for an alias is
 /// not the name the link takes.
-fn store_entry(id: &PackageId) -> linker::StoreEntry {
-    linker::StoreEntry {
+fn virtual_store_ref(id: &PackageId) -> linker::VirtualStoreRef {
+    linker::VirtualStoreRef {
         dir_name: id.to_string(),
         pkg_name: id.name.clone(),
     }
@@ -999,7 +998,7 @@ mod tests {
     use super::*;
 
     use crate::integrity::Algo;
-    use crate::linker::{ImporterTarget, Plan, StoreEntry, VirtualStoreEntry};
+    use crate::linker::{ImporterTarget, Plan, VirtualStoreEntry, VirtualStoreRef};
     use crate::resolver::Dependency;
     use std::path::Path;
     use tempfile::TempDir;
@@ -1058,8 +1057,8 @@ mod tests {
         ImporterPath::new(path).unwrap()
     }
 
-    fn store_dir(dir_name: &str, pkg_name: &str) -> StoreEntry {
-        StoreEntry {
+    fn at_entry(dir_name: &str, pkg_name: &str) -> VirtualStoreRef {
+        VirtualStoreRef {
             dir_name: dir_name.to_string(),
             pkg_name: pkg_name.to_string(),
         }
@@ -1150,41 +1149,35 @@ mod tests {
                 root.join("packages/empty"),
             ]),
         );
-        expected.add_entry(
-            "alpha@1.0.0",
-            VirtualStoreEntry {
-                store_path: store.entry_path(&integrity("alpha@1.0.0")),
-                pkg_name: "alpha".to_string(),
-                edges: BTreeMap::from([
-                    ("beta".to_string(), store_dir("beta@2.0.0", "beta")),
-                    (
-                        "width-cjs".to_string(),
-                        store_dir("string-width@4.2.3", "string-width"),
-                    ),
-                ]),
-            },
-        );
-        expected.add_entry(
-            "beta@2.0.0",
-            VirtualStoreEntry {
-                store_path: store.entry_path(&integrity("beta@2.0.0")),
-                pkg_name: "beta".to_string(),
-                edges: BTreeMap::new(),
-            },
-        );
-        expected.add_entry(
-            "string-width@4.2.3",
-            VirtualStoreEntry {
-                store_path: store.entry_path(&integrity("string-width@4.2.3")),
-                pkg_name: "string-width".to_string(),
-                edges: BTreeMap::new(),
-            },
-        );
+        expected.add_entry(VirtualStoreEntry {
+            dir_name: "alpha@1.0.0".to_string(),
+            pkg_name: "alpha".to_string(),
+            content_store_path: store.entry_path(&integrity("alpha@1.0.0")),
+            edges: BTreeMap::from([
+                ("beta".to_string(), at_entry("beta@2.0.0", "beta")),
+                (
+                    "width-cjs".to_string(),
+                    at_entry("string-width@4.2.3", "string-width"),
+                ),
+            ]),
+        });
+        expected.add_entry(VirtualStoreEntry {
+            dir_name: "beta@2.0.0".to_string(),
+            pkg_name: "beta".to_string(),
+            content_store_path: store.entry_path(&integrity("beta@2.0.0")),
+            edges: BTreeMap::new(),
+        });
+        expected.add_entry(VirtualStoreEntry {
+            dir_name: "string-width@4.2.3".to_string(),
+            pkg_name: "string-width".to_string(),
+            content_store_path: store.entry_path(&integrity("string-width@4.2.3")),
+            edges: BTreeMap::new(),
+        });
         expected.add_importer(
             &root,
             BTreeMap::from([(
                 "alpha".to_string(),
-                ImporterTarget::Entry(store_dir("alpha@1.0.0", "alpha")),
+                ImporterTarget::Entry(at_entry("alpha@1.0.0", "alpha")),
             )]),
         );
         expected.add_importer(
@@ -1192,7 +1185,7 @@ mod tests {
             BTreeMap::from([
                 (
                     "width-cjs".to_string(),
-                    ImporterTarget::Entry(store_dir("string-width@4.2.3", "string-width")),
+                    ImporterTarget::Entry(at_entry("string-width@4.2.3", "string-width")),
                 ),
                 // Absolute, and the member's own directory rather than the
                 // `../empty` the graph records: the lockfile wants a path
