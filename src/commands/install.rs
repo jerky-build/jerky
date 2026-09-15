@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use thiserror::Error;
 
@@ -13,7 +15,7 @@ use crate::range::{Range, Version};
 use crate::registry::{RegistryClient, RegistryError};
 use crate::resolver::{
     self, Declared, Importer, ImporterPath, Kind, PackageId, Resolution, ResolveError,
-    ResolvedGraph,
+    ResolvedGraph, ResolvedPackage,
 };
 use crate::store::{Store, StoreError};
 use crate::workspace::Workspace;
@@ -91,6 +93,19 @@ pub enum InstallError {
     )]
     ProductionLockfileImporterGone { importer: String },
 }
+
+/// How many tarballs are in flight at once.
+///
+/// This is latency-bound fan-out, not a CPU workload, so the cap is not tied
+/// to core count: a thread waiting on a socket is not competing for anything.
+/// Sixteen is where the measured gain on a real tree flattens: installing
+/// express's 69 packages into a cold store from a matching lockfile — the CI
+/// and fresh-clone case, where every tarball is fetched and no metadata is —
+/// went from 3.36s serially to 0.40s at this width. It stays far below the
+/// point where a registry starts treating one client as abusive. A cap exists
+/// at all because a resolved graph can hold thousands of packages, and one
+/// thread per package is how an install gets an IP rate-limited.
+pub const MAX_CONCURRENT_FETCHES: usize = 16;
 
 /// What a sync is for.
 ///
@@ -375,36 +390,39 @@ pub fn sync(
     let node_modules = workspace.root().join("node_modules");
     let mut entries: BTreeMap<PackageId, PathBuf> = BTreeMap::new();
 
+    // The locked-integrity gate, over every package, before a single byte is
+    // fetched. It was previously folded into the materialisation loop, which
+    // meant a mismatch on a late package was raised only after every earlier
+    // one had been downloaded. Fan-out makes that worse rather than merely
+    // untidy: with sixteen workers in flight there is no "earlier", so the
+    // gate has to be a pass of its own to keep meaning what it says.
+    //
+    // Before the store is consulted, not only on the download path.
+    //
+    // #47 proposed the latter, reasoning that a store hit already proves the
+    // bytes hash to the recorded key. That is true and beside the point: it
+    // compares bytes against their *own* hash, while this compares the
+    // *locked* hash against the *reported* one. The key here is derived from
+    // what the registry now says, so a republished tarball whose bytes some
+    // other project already put in the machine-global store takes the hit path
+    // and is never questioned — which is the precise attack the lockfile
+    // exists to catch.
+    //
+    // The cost #47 wanted to avoid was re-fetching metadata for an entry
+    // already present. Nothing is re-fetched: both hashes are already in
+    // memory. A package carried over from the lockfile rather than re-resolved
+    // compares equal by construction.
+    //
+    // The comparison is algorithm-sensitive, though, and that is the one way
+    // it fires without tampering: `Integrity` compares algo *and* digest, so
+    // an entry locked from a legacy `dist.shasum` (sha1) whose metadata later
+    // carries a `dist.integrity` (sha512) disagrees with itself. The bytes are
+    // fine and the error says otherwise, with no path out but editing the
+    // lockfile by hand. Narrowing that needs a decision about which side to
+    // re-hash and is deliberately not made here — but it is the reason this is
+    // not the "cannot fire spuriously" check an earlier draft of this comment
+    // claimed.
     for (id, package) in &graph.packages {
-        let key = package.integrity.store_key();
-
-        // Populating is skipped entirely when the store already holds these
-        // bytes, so a repeat install performs no download.
-        // Before the store is consulted, not only on the download path.
-        //
-        // #47 proposed the latter, reasoning that a store hit already proves
-        // the bytes hash to the recorded key. That is true and beside the
-        // point: it compares bytes against their *own* hash, while this
-        // compares the *locked* hash against the *reported* one. The key here
-        // is derived from what the registry now says, so a republished tarball
-        // whose bytes some other project already put in the machine-global
-        // store takes the hit path and is never questioned — which is the
-        // precise attack the lockfile exists to catch.
-        //
-        // The cost #47 wanted to avoid was re-fetching metadata for an entry
-        // already present. Nothing is re-fetched: both hashes are already in
-        // memory. A package carried over from the lockfile rather than
-        // re-resolved compares equal by construction.
-        //
-        // The comparison is algorithm-sensitive, though, and that is the one
-        // way it fires without tampering: `Integrity` compares algo *and*
-        // digest, so an entry locked from a legacy `dist.shasum` (sha1) whose
-        // metadata later carries a `dist.integrity` (sha512) disagrees with
-        // itself. The bytes are fine and the error says otherwise, with no
-        // path out but editing the lockfile by hand. Narrowing that needs a
-        // decision about which side to re-hash and is deliberately not made
-        // here — but it is the reason this is not the "cannot fire
-        // spuriously" check an earlier draft of this comment claimed.
         if let Some(locked) = locked_integrity.get(id)
             && *locked != package.integrity
         {
@@ -415,27 +433,18 @@ pub fn sync(
                 reported: package.integrity.to_ssri(),
             });
         }
+    }
 
-        let entry = if store.contains(&key) {
-            store.entry_path(&key)
-        } else {
-            let tarball = registry.fetch_tarball(&package.resolved)?;
+    // Every tarball the store lacks, fetched concurrently. Packages the store
+    // already holds cost nothing here and are never downloaded.
+    fetch_missing(&graph, store, registry)?;
 
-            // Verify the complete buffer before a single byte is extracted. A
-            // stream-and-hash design would only detect a mismatch after
-            // writing attacker-controlled files to disk.
-            package
-                .integrity
-                .verify(&tarball)
-                .map_err(|source| InstallError::Integrity {
-                    name: id.name.clone(),
-                    version: id.version.clone(),
-                    source,
-                })?;
-
-            store.commit(&key, |staging| archive::extract(&tarball, staging))?
-        };
-
+    // Laying out the virtual store stays serial and stays in `graph.packages`
+    // order. It is local filesystem work — hard links out of the store — so
+    // there is no latency to hide, and keeping one writer means the tree is
+    // built the same way every run.
+    for (id, package) in &graph.packages {
+        let entry = store.entry_path(&package.integrity.store_key());
         let virtual_dir =
             linker::populate_virtual_store(&entry, &node_modules, &id.to_string(), &id.name)?;
         entries.insert(id.clone(), virtual_dir);
@@ -696,6 +705,117 @@ fn declared_by(manifest: &Manifest) -> BTreeMap<String, Declared> {
 
     // `prod` second, so it overwrites a name `dev` already inserted.
     dev.chain(prod).collect()
+}
+
+/// Download, verify and commit every package the store does not already hold.
+///
+/// Split out of the materialisation loop because it is the only part of an
+/// install that waits on the network, and therefore the only part worth
+/// overlapping. Once the graph is resolved every tarball URL is known, so this
+/// is a fixed work list rather than a walk that discovers as it goes — which is
+/// what makes a plain bounded pool sufficient and keeps the resolver's harder
+/// problem (#33's second half) out of scope here.
+///
+/// Verification stays per-tarball and stays ahead of extraction: a worker holds
+/// the complete buffer, checks it against the hash the graph carries, and only
+/// then hands it to `store.commit`. Parallelism is not a reason to stream.
+fn fetch_missing(
+    graph: &ResolvedGraph,
+    store: &Store,
+    registry: &dyn RegistryClient,
+) -> Result<(), InstallError> {
+    // Decided up front, on one thread. Asking the store mid-flight would race
+    // the commits this function is itself performing, and a package listed
+    // twice would be downloaded twice.
+    let missing: Vec<(&PackageId, &ResolvedPackage)> = graph
+        .packages
+        .iter()
+        .filter(|(_, package)| !store.contains(&package.integrity.store_key()))
+        .collect();
+
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    let next = AtomicUsize::new(0);
+    let failed = AtomicBool::new(false);
+    // Keyed by position in `missing`, which is `graph.packages` order, so the
+    // error a user sees is chosen by where the package sits in the graph and
+    // not by which worker happened to lose. An install that blamed a different
+    // package on each run would be untriageable.
+    //
+    // What makes that hold: every claim below is a `fetch_add`, so the claimed
+    // indices are a contiguous prefix however the workers interleave, and
+    // `failed` decides only how far that prefix extends. The lowest index that
+    // fails is always inside it — the prefix stopped growing *because*
+    // something in it failed — so taking the first entry of this map is taking
+    // the same package every time.
+    let failures: Mutex<BTreeMap<usize, InstallError>> = Mutex::new(BTreeMap::new());
+
+    // No more threads than there is work: a two-package install should not
+    // start sixteen of them.
+    let workers = MAX_CONCURRENT_FETCHES.min(missing.len());
+
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                while !failed.load(Ordering::Relaxed) {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some((id, package)) = missing.get(index) else {
+                        break;
+                    };
+
+                    if let Err(err) = fetch_one(id, package, store, registry) {
+                        // Stops the pool taking *new* work. Fetches already in
+                        // flight still finish and may commit, which is correct:
+                        // the store is a machine-global cache of verified
+                        // bytes, and an entry landing there is not a claim that
+                        // any project depends on it. What must not happen is a
+                        // link or a manifest edit, and neither is reached.
+                        failed.store(true, Ordering::Relaxed);
+                        failures.lock().unwrap().insert(index, err);
+                    }
+                }
+            });
+        }
+    });
+
+    match failures.into_inner().unwrap().into_values().next() {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
+/// One package: fetch, verify, extract into the store.
+fn fetch_one(
+    id: &PackageId,
+    package: &ResolvedPackage,
+    store: &Store,
+    registry: &dyn RegistryClient,
+) -> Result<(), InstallError> {
+    let tarball = registry.fetch_tarball(&package.resolved)?;
+
+    // Verify the complete buffer before a single byte is extracted. A
+    // stream-and-hash design would only detect a mismatch after writing
+    // attacker-controlled files to disk.
+    package
+        .integrity
+        .verify(&tarball)
+        .map_err(|source| InstallError::Integrity {
+            name: id.name.clone(),
+            version: id.version.clone(),
+            source,
+        })?;
+
+    // `commit` stages and renames, and treats losing a race as success because
+    // the key is the content hash. Two workers asked for the same entry —
+    // which cannot happen within one install, but can across concurrent
+    // processes — both end up correct.
+    store.commit(&package.integrity.store_key(), |staging| {
+        archive::extract(&tarball, staging)
+    })?;
+
+    Ok(())
 }
 
 /// What the manifest should record for a request, and what it resolved to.

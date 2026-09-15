@@ -106,7 +106,12 @@ impl Dist {
 /// tests: offline, deterministic, and fast. Its cost is that the fixture
 /// covers everything *except* the module it replaces, so `HttpRegistry` needs
 /// its own tests.
-pub trait RegistryClient {
+///
+/// `Sync` because install fetches tarballs from a pool of threads sharing one
+/// client (#33). It is a bound on the trait rather than on that call site so
+/// the requirement is stated where implementors read it: a client caching into
+/// a bare `RefCell` would otherwise compile until the day it was shared.
+pub trait RegistryClient: Sync {
     /// Fetch one version's manifest. `version` may be a concrete version or a
     /// dist-tag such as `latest`; the registry resolves both on this endpoint.
     fn version_metadata(&self, name: &str, version: &str)

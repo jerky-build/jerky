@@ -189,8 +189,9 @@ pub fn build_tarball(entries: &[TarEntry<'_>]) -> Vec<u8> {
 }
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex};
+use std::time::Duration;
 
 use crate::integrity::Integrity;
 use crate::registry::{Dist, Packument, RegistryClient, RegistryError, VersionMetadata};
@@ -201,6 +202,93 @@ pub type FixtureVersion<'a> = (&'a str, &'a [(&'a str, &'a str)]);
 /// One entry in a fixture tree: a package name, a version, and its
 /// dependencies as `(name, range)` pairs.
 pub type FixtureEntry<'a> = (&'a str, &'a str, &'a [(&'a str, &'a str)]);
+
+/// How long a rendezvous waits before deciding the callers it is waiting for
+/// are never going to arrive.
+///
+/// Generous, because it is only ever paid by a *failing* test: a registry
+/// fetching in parallel meets the rendezvous in microseconds. A serial one
+/// pays this once — the first waiter times out, marks the rendezvous broken,
+/// and releases every later caller immediately — rather than once per package,
+/// which is what keeps a regression from turning into a suite that hangs.
+const RENDEZVOUS_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A meeting point that proves callers are genuinely concurrent.
+///
+/// Asserting on a high-water mark of in-flight calls can pass by luck: a
+/// serial implementation that happens to be preempted never overlaps, but a
+/// parallel one under a loaded CI box might only ever reach two. This instead
+/// makes each caller *wait* for its peers, so the only way through is for
+/// `width` calls to be in flight at once. A serial implementation cannot
+/// satisfy it at any speed, which is the point.
+#[derive(Debug)]
+struct Rendezvous {
+    width: usize,
+    state: Mutex<RendezvousState>,
+    arrived: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct RendezvousState {
+    in_flight: usize,
+    high_water: usize,
+    /// Set once `width` callers have been in flight together, and never
+    /// cleared.
+    ///
+    /// The predicate waiters block on has to be monotonic. Keying it on
+    /// `in_flight` instead is a lost-wakeup race: the caller that satisfies the
+    /// rendezvous goes on to decrement `in_flight` while still holding the
+    /// lock, so by the time a waiter re-checks, the count has already fallen
+    /// back below `width` and it waits again — forever, or until the timeout
+    /// calls a working implementation broken.
+    released: bool,
+    /// Set when a waiter gives up, and never cleared. It is what a test reads
+    /// to distinguish "ran in parallel" from "timed out and carried on".
+    broken: bool,
+}
+
+impl Rendezvous {
+    fn new(width: usize) -> Self {
+        Self {
+            width,
+            state: Mutex::new(RendezvousState::default()),
+            arrived: Condvar::new(),
+        }
+    }
+
+    /// Block until `width` callers are inside, then let them all through.
+    ///
+    /// Callers arriving after the rendezvous has been satisfied pass straight
+    /// through. The claim being tested is that `width` calls were in flight at
+    /// one moment, which is settled the first time it opens.
+    fn meet(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.in_flight += 1;
+        state.high_water = state.high_water.max(state.in_flight);
+
+        if state.in_flight >= self.width {
+            state.released = true;
+            self.arrived.notify_all();
+        } else if !state.released {
+            // `wait_timeout_while` rather than a bare wait: a serial caller
+            // would otherwise block forever and take the test suite with it.
+            let (guard, timed_out) = self
+                .arrived
+                .wait_timeout_while(state, RENDEZVOUS_TIMEOUT, |s| !s.released)
+                .unwrap();
+            state = guard;
+            if timed_out.timed_out() {
+                state.broken = true;
+                // Releases everyone else too, so a serial implementation pays
+                // one timeout for the whole run rather than one per package.
+                state.released = true;
+                self.arrived.notify_all();
+            }
+        }
+
+        state.in_flight -= 1;
+    }
+}
 
 /// An in-memory registry for tests.
 ///
@@ -214,6 +302,9 @@ pub struct FixtureRegistry {
     metadata_calls: AtomicUsize,
     tarball_calls: AtomicUsize,
     packument_calls: Mutex<BTreeMap<String, usize>>,
+    /// `None` until a test asks for one, so every existing fixture is
+    /// unaffected.
+    tarball_rendezvous: Option<Rendezvous>,
 }
 
 impl FixtureRegistry {
@@ -417,6 +508,37 @@ impl FixtureRegistry {
         self.tarball_calls.load(Ordering::Relaxed)
     }
 
+    /// Make every `fetch_tarball` wait until `width` of them are in flight.
+    ///
+    /// The fixture is what makes parallelism observable at all: the bytes are
+    /// already in memory, so a download costs nothing and overlap is invisible
+    /// without somewhere to stand still. A serial installer deadlocks against
+    /// this until the rendezvous gives up, and `tarballs_met_rendezvous` then
+    /// reports false.
+    pub fn with_tarball_rendezvous(mut self, width: usize) -> Self {
+        self.tarball_rendezvous = Some(Rendezvous::new(width));
+        self
+    }
+
+    /// Whether the rendezvous was satisfied rather than timed out.
+    pub fn tarballs_met_rendezvous(&self) -> bool {
+        self.tarball_rendezvous
+            .as_ref()
+            .is_some_and(|r| !r.state.lock().unwrap().broken)
+    }
+
+    /// The most callers ever inside the rendezvous at once.
+    ///
+    /// A lower bound on concurrent `fetch_tarball` calls rather than an exact
+    /// count of them: the rendezvous sits at the top of the call, so a caller
+    /// that has passed through it and is building its response is no longer
+    /// counted here while still being in flight.
+    pub fn peak_concurrent_tarballs(&self) -> usize {
+        self.tarball_rendezvous
+            .as_ref()
+            .map_or(0, |r| r.state.lock().unwrap().high_water)
+    }
+
     pub fn packument_calls(&self) -> usize {
         self.packument_calls.lock().unwrap().values().sum()
     }
@@ -470,6 +592,9 @@ impl RegistryClient for FixtureRegistry {
 
     fn fetch_tarball(&self, url: &str) -> Result<Vec<u8>, RegistryError> {
         self.tarball_calls.fetch_add(1, Ordering::Relaxed);
+        if let Some(rendezvous) = &self.tarball_rendezvous {
+            rendezvous.meet();
+        }
         self.tarballs
             .get(url)
             .cloned()

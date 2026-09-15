@@ -2934,3 +2934,231 @@ fn production_accepts_a_workspace_whose_importers_all_still_exist() {
     production_install(root, &store, &registry)
         .expect("nothing about this workspace changed between the two installs");
 }
+
+// ---------------------------------------------------------------------------
+// Parallel tarball fetching (#33, opportunity 1)
+// ---------------------------------------------------------------------------
+
+/// A registry holding `count` independent packages, `pkg00` upward.
+///
+/// Independent on purpose: what the fan-out tests exercise is work that is all
+/// known up front, which is exactly what a resolved graph is. Kept separate
+/// from the manifest so a test can stock the registry with a package the
+/// project does not yet declare.
+fn wide_registry(count: usize) -> FixtureRegistry {
+    let mut registry = FixtureRegistry::new();
+    for i in 0..count {
+        let name = format!("pkg{i:02}");
+        registry = registry.with_package(
+            &name,
+            "1.0.0",
+            build_tarball(&[TarEntry::file(
+                "package/package.json",
+                &format!(r#"{{"name":"{name}","version":"1.0.0"}}"#),
+            )]),
+        );
+    }
+    registry
+}
+
+/// A manifest declaring the first `count` of those packages at an exact pin.
+fn wide_manifest(count: usize) -> String {
+    let declared: Vec<String> = (0..count)
+        .map(|i| format!(r#""pkg{i:02}": "1.0.0""#))
+        .collect();
+    format!(
+        r#"{{"name":"demo","dependencies":{{{}}}}}"#,
+        declared.join(",")
+    )
+}
+
+#[test]
+fn tarballs_are_fetched_concurrently() {
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let store = Store::new(home.path().join("store"));
+
+    let registry = wide_registry(4).with_tarball_rendezvous(4);
+    write_manifest(root, &wide_manifest(4));
+
+    sync(&solo(root), &store, &registry, None, Mode::Develop).unwrap();
+
+    // The rendezvous, not the high-water mark: a serial installer can reach a
+    // high-water mark of one and still pass a "> 1" assertion on a loaded
+    // machine by never being observed. It cannot satisfy a rendezvous.
+    assert!(
+        registry.tarballs_met_rendezvous(),
+        "four tarball fetches never overlapped, so the install is still serial"
+    );
+}
+
+#[test]
+fn concurrency_is_bounded() {
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let store = Store::new(home.path().join("store"));
+
+    // Comfortably more packages than the cap, so an unbounded implementation —
+    // one thread per package — is visible as a peak above it. Unbounded fan-out
+    // at the registry is what gets an IP rate-limited.
+    let count = jerky::commands::install::MAX_CONCURRENT_FETCHES * 2;
+    let registry = wide_registry(count)
+        .with_tarball_rendezvous(jerky::commands::install::MAX_CONCURRENT_FETCHES);
+    write_manifest(root, &wide_manifest(count));
+
+    sync(&solo(root), &store, &registry, None, Mode::Develop).unwrap();
+
+    assert!(
+        registry.tarballs_met_rendezvous(),
+        "the pool never reached its own cap, so the cap is not the limit in force"
+    );
+    assert!(
+        registry.peak_concurrent_tarballs() <= jerky::commands::install::MAX_CONCURRENT_FETCHES,
+        "fetched {} at once, above the cap of {}",
+        registry.peak_concurrent_tarballs(),
+        jerky::commands::install::MAX_CONCURRENT_FETCHES
+    );
+    assert_eq!(
+        registry.tarball_calls(),
+        count,
+        "every package is fetched once"
+    );
+}
+
+#[test]
+fn a_corrupt_package_is_named_even_among_many() {
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let store = Store::new(home.path().join("store"));
+
+    let registry = wide_registry(6);
+    write_manifest(root, &wide_manifest(6));
+    // Replaces `pkg03`'s entry with one whose recorded hash does not match its
+    // bytes. The name has to survive the fan-out; "one of six downloads
+    // failed" is not a diagnosable error.
+    let registry = registry.with_corrupt_package("pkg03", "1.0.0", lodash_tarball());
+
+    let err = sync(&solo(root), &store, &registry, None, Mode::Develop).unwrap_err();
+
+    match err {
+        InstallError::Integrity { name, version, .. } => {
+            assert_eq!(name, "pkg03");
+            assert_eq!(version, "1.0.0");
+        }
+        other => panic!("expected an integrity failure naming the package, got {other:?}"),
+    }
+}
+
+#[test]
+fn the_reported_failure_does_not_depend_on_which_thread_lost() {
+    // Forty packages against sixteen workers, so most indices are claimed in
+    // later rounds rather than all at once in the first, and the two corrupt
+    // ones sit far apart. A fresh store *every* iteration is what makes this
+    // test mean something: sharing one across iterations warms it, `missing`
+    // shrinks to the two corrupt packages, and every run then trivially
+    // claims both in the first round — which is a test that passes without
+    // exercising the ordering it claims to check.
+    //
+    // What must hold is that the lowest-indexed failure is always the one
+    // reported. Every claim is a `fetch_add`, so the claimed indices are a
+    // contiguous prefix whatever the workers do; the failure flag decides only
+    // how far that prefix extends. The lowest index that fails is therefore
+    // always inside it — the prefix stopped growing *because* something in it
+    // failed — so a `BTreeMap` keyed by index picks the same package every
+    // time. An install that blamed a different package on each run would be
+    // untriageable.
+    let mut reported = std::collections::BTreeSet::new();
+    for _ in 0..40 {
+        let home = TempDir::new().unwrap();
+        let work = TempDir::new().unwrap();
+        let root = work.path();
+        let store = Store::new(home.path().join("store"));
+        let registry = wide_registry(40)
+            .with_corrupt_package("pkg03", "1.0.0", lodash_tarball())
+            .with_corrupt_package("pkg30", "1.0.0", lodash_tarball());
+        write_manifest(root, &wide_manifest(40));
+
+        match sync(&solo(root), &store, &registry, None, Mode::Develop).unwrap_err() {
+            InstallError::Integrity { name, .. } => {
+                reported.insert(name);
+            }
+            other => panic!("expected an integrity failure, got {other:?}"),
+        }
+    }
+
+    assert_eq!(
+        reported.len(),
+        1,
+        "the reported package varied across runs: {reported:?}"
+    );
+    assert!(
+        reported.contains("pkg03"),
+        "expected the lowest-indexed failure, got {reported:?}"
+    );
+}
+
+#[test]
+fn a_locked_integrity_mismatch_is_caught_before_anything_is_downloaded() {
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let store = Store::new(home.path().join("store"));
+
+    let registry = wide_registry(5);
+    write_manifest(root, &wide_manifest(4));
+    sync(&solo(root), &store, &registry, None, Mode::Develop).unwrap();
+
+    // Re-point one entry's recorded integrity at bytes it does not describe,
+    // which is what a republished tarball looks like from here. Parseable but
+    // wrong: an unparseable digest is a different error raised in a different
+    // place.
+    let lock_path = root.join("jerky-lock.json");
+    let mut lock: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&lock_path).unwrap()).unwrap();
+    lock["packages"]["pkg02@1.0.0"]["integrity"] = serde_json::Value::String(
+        "sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="
+            .into(),
+    );
+    std::fs::write(&lock_path, serde_json::to_string_pretty(&lock).unwrap()).unwrap();
+
+    // The importer has to be *re-resolved* for the gate to have two hashes to
+    // compare: a reused importer carries the lockfile's own integrity into the
+    // graph, where it necessarily agrees with itself. So the request names
+    // `pkg04`, which the manifest does not yet declare — asking again for a
+    // package already pinned at the version recorded would match the lockfile
+    // and be reused, which is the behaviour #47 added and not a flaw in the
+    // gate.
+    //
+    // A fresh store and a fresh registry, so every package would otherwise be
+    // downloaded and the count below starts from zero.
+    let cold_home = TempDir::new().unwrap();
+    let cold_store = Store::new(cold_home.path().join("store"));
+    let registry = wide_registry(5);
+
+    let err = install(
+        &solo(root),
+        &ImporterPath::root(),
+        &cold_store,
+        &registry,
+        &spec("pkg04", VersionSpec::Exact("1.0.0".into())),
+        None,
+    )
+    .unwrap_err();
+
+    assert!(
+        matches!(err, InstallError::LockedIntegrityMismatch { ref name, .. } if name == "pkg02"),
+        "expected a locked-integrity refusal naming pkg02, got {err:?}"
+    );
+    // The gate is worth nothing if it fires after the bytes are already pulled.
+    // Serially it only held for packages ordered after the offending one; with
+    // sixteen workers in flight there is no "after", which is why the check is
+    // now a pass of its own ahead of the pool.
+    assert_eq!(
+        registry.tarball_calls(),
+        0,
+        "tarballs were downloaded before the locked-integrity gate ran"
+    );
+}
