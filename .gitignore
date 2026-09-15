@@ -9,3 +9,8 @@
 # below dead and `settings.json` unshareable.
 /.claude/*
 !/.claude/settings.json
+
+# The benchmark's registry recording: hundreds of megabytes of tarballs, taken
+# by `./benches/bench.sh --record` and replayed by every measuring run. Far too
+# large to commit, and regenerable from the live registry by definition.
+/benches/.mirror/

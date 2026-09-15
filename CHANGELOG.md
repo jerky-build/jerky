@@ -157,6 +157,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `jerky-lock.json` is written at the workspace root, keyed by importer. There
   is one lockfile per workspace, not one per project
   ([#47](https://github.com/jerky-build/jerky/issues/47)).
+- `JERKY_REGISTRY_URL` points jerky at a registry other than
+  `https://registry.npmjs.org`. An empty value means the same as an unset one,
+  so `JERKY_REGISTRY_URL= jerky install` is how a shell says "not the one my
+  parent exported". The client could always take a base URL and the tests
+  always drove it that way; the binary was what hardcoded the default, so
+  nothing built out of `main` could be pointed anywhere else. This is not an
+  offline mode ([#80](https://github.com/jerky-build/jerky/issues/80)) — a
+  different registry is still a registry, and a missing one is still fatal.
+  The benchmark is what wanted it: `./benches/bench.sh` now replays packuments
+  and tarballs from a local recording instead of making ~22,600 anonymous
+  requests at npm per run ([#83](https://github.com/jerky-build/jerky/issues/83)).
 
 ### Changed
 
