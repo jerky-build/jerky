@@ -14,7 +14,9 @@ use thiserror::Error;
 use crate::integrity::{Integrity, IntegrityError};
 use crate::pool;
 use crate::range::{Range, RangeError};
-use crate::registry::{MAX_CONCURRENT_FETCHES, Packument, RegistryClient, RegistryError};
+use crate::registry::{
+    Freshness, MAX_CONCURRENT_FETCHES, Packument, RegistryClient, RegistryError,
+};
 
 /// The protocol marking a dependency as a workspace member rather than a
 /// registry package. `workspace:*` and `workspace:^1.0.0` both select the
@@ -543,7 +545,10 @@ struct Walk<'a> {
     /// never reaches disk, so nothing about the result depends on the order it
     /// is filled in, which is what lets [`Walk::warm`] fill it from several
     /// threads at once.
-    packuments: HashMap<String, Packument>,
+    /// Each entry carries the freshness it was fetched under, so a name first
+    /// seen as a range and later asked for by dist-tag is re-fetched rather
+    /// than answered from a copy that was never required to be current.
+    packuments: HashMap<String, (Packument, Freshness)>,
     /// Identical `(name, range)` pairs select once.
     selections: HashMap<(String, String), PackageId>,
     /// Edges discovered but not yet visited. Drained a level at a time.
@@ -693,7 +698,7 @@ impl<'a> Walk<'a> {
             return Ok(());
         }
 
-        let packument = self
+        let (packument, _) = self
             .packuments
             .get(&id.name)
             .expect("select fetched this packument");
@@ -756,39 +761,81 @@ impl<'a> Walk<'a> {
     /// Below two distinct names there is nothing to overlap and no pool is
     /// started.
     fn warm(&mut self, level: &[Pending]) {
-        let wanted: Vec<&str> = level
-            .iter()
-            .map(|pending| pending.asked.name.as_str())
-            .filter(|name| !self.packuments.contains_key(*name))
-            .collect::<BTreeSet<&str>>()
-            .into_iter()
-            .collect();
+        // The strictest requirement any edge on this level makes of each name.
+        // One packument serves every edge that asked for the name, so if any
+        // of them was a dist-tag the fetch has to satisfy that one.
+        let mut wanted: BTreeMap<&str, Freshness> = BTreeMap::new();
+        for pending in level {
+            let name = pending.asked.name.as_str();
+            let needed = Self::freshness_for(&pending.asked.range);
+            if self.already_have(name, needed) {
+                continue;
+            }
+            let entry = wanted.entry(name).or_insert(needed);
+            if needed == Freshness::MustBeCurrent {
+                *entry = Freshness::MustBeCurrent;
+            }
+        }
+        let wanted: Vec<(&str, Freshness)> = wanted.into_iter().collect();
 
         if wanted.len() < 2 {
             return;
         }
 
         let registry = self.registry;
-        let fetched: Mutex<Vec<(String, Packument)>> = Mutex::new(Vec::new());
+        let fetched: Mutex<Vec<(String, Packument, Freshness)>> = Mutex::new(Vec::new());
 
         // The error is discarded rather than propagated, and that is the whole
         // trick: see the note above on which failure a user sees. `drain`
         // stopping on the first failure is what keeps the wasted requests to
         // the names already claimed rather than the whole level.
-        let _: Result<(), RegistryError> = pool::drain(&wanted, MAX_CONCURRENT_FETCHES, |name| {
-            let packument = registry.packument(name)?;
-            fetched
-                .lock()
-                .unwrap()
-                .push(((*name).to_string(), packument));
-            Ok(())
-        });
+        let _: Result<(), RegistryError> =
+            pool::drain(&wanted, MAX_CONCURRENT_FETCHES, |(name, freshness)| {
+                let packument = registry.packument(name, *freshness)?;
+                fetched
+                    .lock()
+                    .unwrap()
+                    .push(((*name).to_string(), packument, *freshness));
+                Ok(())
+            });
 
         // Insertion order cannot matter — the keys are distinct names and the
         // memo never reaches disk — which is why it is allowed to be a
         // `HashMap` at all.
-        for (name, packument) in fetched.into_inner().unwrap() {
-            self.packuments.insert(name, packument);
+        for (name, packument, freshness) in fetched.into_inner().unwrap() {
+            self.packuments.insert(name, (packument, freshness));
+        }
+    }
+
+    /// Is the memo already good enough for this requirement?
+    ///
+    /// An entry fetched under `MustBeCurrent` satisfies a later range, but not
+    /// the other way round.
+    fn already_have(&self, name: &str, needed: Freshness) -> bool {
+        match self.packuments.get(name) {
+            None => false,
+            Some((_, Freshness::MustBeCurrent)) => true,
+            Some((_, Freshness::MayBeCached)) => needed == Freshness::MayBeCached,
+        }
+    }
+
+    /// What a spec requires of the registry.
+    ///
+    /// A range names a set, and a version that satisfied it a few hours ago
+    /// satisfies it still, so a cached packument is a real answer. A dist-tag
+    /// names whatever the registry means by it *today* — only the registry can
+    /// say what `latest` points at — so it must be asked. A conditional
+    /// request satisfies that: a `304` is the registry confirming, just now,
+    /// that the stored copy is current.
+    ///
+    /// The test is the same one `select` uses to choose between a range and a
+    /// tag, and deliberately so: anything `Range::parse` accepts is resolved
+    /// as a range there, so anything it accepts may be cached here.
+    fn freshness_for(range: &str) -> Freshness {
+        if Range::parse(range).is_ok() {
+            Freshness::MayBeCached
+        } else {
+            Freshness::MustBeCurrent
         }
     }
 
@@ -800,11 +847,13 @@ impl<'a> Walk<'a> {
             return Ok(id.clone());
         }
 
-        if !self.packuments.contains_key(name) {
+        let needed = Self::freshness_for(range);
+        if !self.already_have(name, needed) {
+            let packument = self.registry.packument(name, needed)?;
             self.packuments
-                .insert(name.to_string(), self.registry.packument(name)?);
+                .insert(name.to_string(), (packument, needed));
         }
-        let packument = &self.packuments[name];
+        let packument = &self.packuments[name].0;
 
         // Range syntax is tried first, and a dist-tag is only the fallback for a
         // spec that is not a range at all. npm resolves in this order for a

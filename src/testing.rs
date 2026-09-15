@@ -194,7 +194,7 @@ use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
 use crate::integrity::Integrity;
-use crate::registry::{Dist, Packument, RegistryClient, RegistryError, VersionMetadata};
+use crate::registry::{Dist, Fetched, Packument, RegistryClient, RegistryError, VersionMetadata};
 
 /// One version in a fixture: its number and the dependencies it declares.
 pub type FixtureVersion<'a> = (&'a str, &'a [(&'a str, &'a str)]);
@@ -623,7 +623,15 @@ impl RegistryClient for FixtureRegistry {
         }
     }
 
-    fn packument(&self, name: &str) -> Result<Packument, RegistryError> {
+    /// The fixture has no notion of a version changing, so it answers every
+    /// conditional request with a body. A cache layered over it therefore
+    /// always takes the `200` path, which is what makes the *window* the thing
+    /// under test rather than the revalidation.
+    fn packument_conditional(
+        &self,
+        name: &str,
+        _etag: Option<&str>,
+    ) -> Result<Fetched, RegistryError> {
         *self
             .packument_calls
             .lock()
@@ -639,6 +647,10 @@ impl RegistryClient for FixtureRegistry {
             .packuments
             .get(name)
             .cloned()
+            .map(|packument| Fetched::Body {
+                packument: Box::new(packument),
+                etag: None,
+            })
             .ok_or_else(|| RegistryError::PackageNotFound(name.to_string()));
         InFlight::leave(&self.packuments_in_flight);
 
@@ -665,7 +677,7 @@ impl RegistryClient for FixtureRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::RegistryClient;
+    use crate::registry::{Freshness, RegistryClient};
 
     #[test]
     fn with_packument_registers_versions_and_their_edges() {
@@ -674,7 +686,7 @@ mod tests {
             &[("1.0.0", &[("b", "^1.0.0")]), ("1.2.0", &[("b", "^2.0.0")])],
         );
 
-        let p = registry.packument("a").unwrap();
+        let p = registry.packument("a", Freshness::MayBeCached).unwrap();
         assert_eq!(p.versions.len(), 2);
         assert_eq!(
             p.resolve_tag("latest"),
@@ -695,7 +707,10 @@ mod tests {
             FixtureRegistry::new().with_packument("a", &[("4.17.21", &[]), ("5.0.0-beta.1", &[])]);
 
         assert_eq!(
-            registry.packument("a").unwrap().resolve_tag("latest"),
+            registry
+                .packument("a", Freshness::MayBeCached)
+                .unwrap()
+                .resolve_tag("latest"),
             Some("4.17.21")
         );
     }
@@ -708,7 +723,10 @@ mod tests {
             .with_packument("a", &[("1.0.0-alpha.1", &[]), ("1.0.0-alpha.2", &[])]);
 
         assert_eq!(
-            registry.packument("a").unwrap().resolve_tag("latest"),
+            registry
+                .packument("a", Freshness::MayBeCached)
+                .unwrap()
+                .resolve_tag("latest"),
             Some("1.0.0-alpha.2")
         );
     }
@@ -720,7 +738,7 @@ mod tests {
         // the failure path by accident.
         let registry = FixtureRegistry::new().with_packument("a", &[("1.0.0", &[])]);
 
-        let p = registry.packument("a").unwrap();
+        let p = registry.packument("a", Freshness::MayBeCached).unwrap();
         let metadata = &p.versions["1.0.0"];
         let bytes = registry.fetch_tarball(&metadata.dist.tarball).unwrap();
 
@@ -736,7 +754,10 @@ mod tests {
             .with_packument("a", &[("1.0.0", &[])]);
 
         assert_eq!(
-            registry.packument("a").unwrap().resolve_tag("latest"),
+            registry
+                .packument("a", Freshness::MayBeCached)
+                .unwrap()
+                .resolve_tag("latest"),
             Some("2.0.0")
         );
     }
@@ -747,9 +768,9 @@ mod tests {
             .with_packument("a", &[("1.0.0", &[])])
             .with_packument("b", &[("1.0.0", &[])]);
 
-        registry.packument("a").unwrap();
-        registry.packument("a").unwrap();
-        registry.packument("b").unwrap();
+        registry.packument("a", Freshness::MayBeCached).unwrap();
+        registry.packument("a", Freshness::MayBeCached).unwrap();
+        registry.packument("b", Freshness::MayBeCached).unwrap();
 
         assert_eq!(registry.packument_calls_for("a"), 2);
         assert_eq!(registry.packument_calls_for("b"), 1);
@@ -760,7 +781,7 @@ mod tests {
 #[cfg(test)]
 mod tree_tests {
     use super::*;
-    use crate::registry::RegistryClient;
+    use crate::registry::{Freshness, RegistryClient};
 
     #[test]
     fn with_tree_collects_repeated_names_into_one_packument() {
@@ -772,11 +793,11 @@ mod tree_tests {
             ("a", "1.0.0", &[("d", "^1.0.0")]),
         ]);
 
-        let d = registry.packument("d").unwrap();
+        let d = registry.packument("d", Freshness::MayBeCached).unwrap();
         assert_eq!(d.versions.len(), 2);
         assert_eq!(d.resolve_tag("latest"), Some("2.1.0"));
 
-        let a = registry.packument("a").unwrap();
+        let a = registry.packument("a", Freshness::MayBeCached).unwrap();
         assert_eq!(a.versions["1.0.0"].dependencies["d"], "^1.0.0");
     }
 }
