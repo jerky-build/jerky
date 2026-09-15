@@ -80,13 +80,25 @@ Two things about this are easy to get wrong, and both were got wrong once:
   type flag.** `tar` honours an old BSD rule that makes a non-ustar entry whose
   name ends in `/` a directory while its flag still says `Regular`. Trusting
   the flag puts that directory at `0o644`, which cannot be entered.
-- **Directories jerky creates itself are covered too.** `create_dir_all` takes
-  its mode from the process umask, so the parents `extract` fills in, the
-  staging directory the store renames into place, and the tree the linker
-  recreates inside a project are all `0o777` under a permissive umask unless
+- **Directories jerky creates itself are covered too, and `src/directory.rs`
+  is where that is decided.** `create_dir_all` takes its mode from the process
+  umask, so the parents `extract` fills in, the staging directory the store
+  renames into place, the tree the linker recreates inside a project and the
+  levels of `~/.jerky/cache` are all `0o777` under a permissive umask unless
   set explicitly. Normalising only what a tarball named leaves the file rule
   intact and this open, and a writable directory in the store lets another user
-  add entries to a package every project imports.
+  add entries to a package every project imports. The rule had four
+  implementations once, kept in agreement by a grep; it now has one module, and
+  `archive`, `staging`, `linker` and `metadata_cache` reach it through
+  `directory::create` and `directory::create_all`. It returns plain
+  `io::Error`s and each caller maps them into its own type, which is what the
+  three incompatible error types had previously made look impossible.
+
+  It sets the mode only on levels it actually created. A directory that was
+  already there belongs to whoever made it, and re-asserting a mode on it is
+  both a decision jerky has no business making and — in the extractor, once
+  per ancestor per entry — several hundred thousand syscalls on a large
+  package that change nothing.
 
 The setuid and setgid bits are dropped by `tar::Entry::unpack` before any of
 this runs, since `preserve_permissions` defaults to false. That is the tar
@@ -150,10 +162,15 @@ Then, against the diff:
   for it above all, is the bug this rule exists to prevent.
 - At least one test exercises more than one importer. A suite that only ever
   sees `.` is not testing workspaces.
-- No `create_dir`, `create_dir_all` or `unpack` writes a path that reaches the
-  store or a project without an explicit mode set after it. Run the suite under
-  `umask 0` as well as the default — a strict umask hides every directory-mode
-  hole, so the usual run proves nothing about them.
+- `grep -rn 'fs::create_dir' src/` finds the call *outside* a `#[cfg(test)]`
+  module in `src/directory.rs` only. Everything else must be a test building a
+  layout of its own. A second production site is the bug this rule exists to
+  prevent: it is a directory reaching the store or a project at whatever the
+  umask allowed, and the reason the rule needs one owner rather than a grep
+  over four copies. Directories aside, no `unpack` writes a path that reaches
+  the store or a project without an explicit mode set after it. Run the suite
+  under `umask 0` as well as the default — a strict umask hides every
+  directory-mode hole, so the usual run proves nothing about them.
 - No `#[cfg(windows)]` or `#[cfg(not(unix))]`. jerky targets WSL, Linux and
   macOS; a fallback for a platform nothing runs on is a second definition to
   keep in agreement with the first, for nobody.

@@ -3,6 +3,8 @@ use std::path::{Component, Path, PathBuf};
 use flate2::read::GzDecoder;
 use thiserror::Error;
 
+use crate::directory;
+
 #[derive(Debug, Error)]
 pub enum ArchiveError {
     #[error("could not read the package tarball")]
@@ -28,7 +30,9 @@ pub enum ArchiveError {
 ///    class of bug, and the one place in spec 1 where a mistake is a security
 ///    hole rather than a crash.
 /// 3. The recorded mode is discarded and replaced — see `normalise_mode`. The
-///    archive chooses the bytes, not the permissions they land with.
+///    archive chooses the bytes, not the permissions they land with. A
+///    directory the tarball omitted is created through [`crate::directory`],
+///    which owns the mode of every directory jerky makes.
 ///
 /// Link entries are rejected outright rather than resolved. Some real
 /// packages do contain symlinks, so this is a known limitation to revisit
@@ -70,11 +74,18 @@ pub fn extract(tarball: &[u8], dest: &Path) -> Result<(), ArchiveError> {
         // usually carry directory entries, but relying on that means a
         // tarball that merely omits them fails to install.
         if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent).map_err(|source| ArchiveError::Write {
+            // Through `directory` rather than `create_dir_all`, so a
+            // directory the tarball never named lands at 0o755 instead of at
+            // whatever the umask allows. Only the levels it actually creates
+            // are chmodded, which is both the rule — `dest` belongs to the
+            // caller, which chose its mode — and what keeps this cheap: from
+            // the second entry onwards the parent is already there, and a
+            // tarball of tens of thousands of files would otherwise spend a
+            // chmod per ancestor per entry.
+            directory::create_all(parent).map_err(|source| ArchiveError::Write {
                 path: parent.to_path_buf(),
                 source,
             })?;
-            normalise_created_dirs(dest, parent)?;
         }
 
         entry
@@ -146,39 +157,6 @@ fn normalise_mode(target: &Path, recorded: u32) -> Result<(), ArchiveError> {
             source,
         }
     })
-}
-
-/// Put every directory between `dest` and `deepest` at 0o755.
-///
-/// A tarball need not carry directory entries, and `extract` tolerates that
-/// deliberately rather than refusing to install — which means `create_dir_all`
-/// creates them, taking its mode from the process umask instead of from any
-/// rule of jerky's. Under a permissive umask that is 0o777. Normalising only
-/// the entries the tarball named would leave the file rule intact and this
-/// hole open, and a world-writable directory in the machine-global store lets
-/// another user add or replace files inside a package every project on the
-/// machine imports.
-fn normalise_created_dirs(dest: &Path, deepest: &Path) -> Result<(), ArchiveError> {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    // `dest` belongs to the caller, which chose its mode; only what extraction
-    // created below it is ours to set.
-    let Ok(relative) = deepest.strip_prefix(dest) else {
-        return Ok(());
-    };
-
-    let mut path = dest.to_path_buf();
-    for component in relative.components() {
-        path.push(component);
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).map_err(
-            |source| ArchiveError::Write {
-                path: path.clone(),
-                source,
-            },
-        )?;
-    }
-
-    Ok(())
 }
 
 /// Drop the first path component and reject anything that could escape.
@@ -430,22 +408,18 @@ mod tests {
     #[test]
     fn a_directory_the_tarball_omitted_is_still_normalised() {
         // A tarball need not carry directory entries — `extract` tolerates
-        // that deliberately — in which case `create_dir_all` makes them and
-        // takes its mode from the process umask, not from any rule of ours.
-        // Under a permissive umask that is 0o777, and a world-writable
-        // directory in the machine-global store lets another user add or
-        // replace files inside a package every project on the machine
-        // imports. The file rule would be intact and the hole open anyway.
+        // that deliberately — in which case extraction makes them on the way
+        // to the file inside, and `create_dir_all` would take their mode from
+        // the process umask rather than from any rule of ours. Under a
+        // permissive umask that is 0o777, and a world-writable directory in
+        // the machine-global store lets another user add or replace files
+        // inside a package every project on the machine imports. The file rule
+        // would be intact and the hole open anyway.
         //
-        // Pre-creating the parent wide open is that state, reached without
-        // depending on the umask the test happens to run under.
+        // Under a strict umask this holds without the rule, so the `umask 0`
+        // run of the suite is what makes it bite — the same bargain every
+        // directory-mode assertion in this repo takes.
         let dir = TempDir::new().unwrap();
-        std::fs::create_dir_all(dir.path().join("lib")).unwrap();
-        std::fs::set_permissions(
-            dir.path().join("lib"),
-            std::fs::Permissions::from_mode(0o777),
-        )
-        .unwrap();
 
         let tarball = build_tarball(&[TarEntry::file(
             "package/lib/deep/index.js",
@@ -456,6 +430,40 @@ mod tests {
 
         assert_eq!(mode_of(&dir.path().join("lib")), 0o755);
         assert_eq!(mode_of(&dir.path().join("lib/deep")), 0o755);
+    }
+
+    #[test]
+    fn a_directory_extraction_did_not_create_is_left_alone() {
+        // `dest` and anything already inside it belong to the caller. In the
+        // real path that is a staging directory the store made at a mode
+        // `staging` chose and will rename into place, and extraction has no
+        // business overruling it.
+        //
+        // This is also the hot path: extraction used to re-assert 0o755 on
+        // every ancestor of every entry, which on the 93k-file fixture is
+        // several hundred thousand chmods that change nothing. Setting the
+        // mode only on what it created is what removes them, so a test that
+        // one it found keeps its own mode is the test that keeps them gone.
+        //
+        // 0o700 on purpose: no ordinary umask produces it, so a mode that
+        // survives could not be an accident of the environment.
+        let dir = TempDir::new().unwrap();
+        let dest = dir.path().join("dest");
+        std::fs::create_dir(&dest).unwrap();
+        std::fs::create_dir(dest.join("lib")).unwrap();
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(dest.join("lib"), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let tarball = build_tarball(&[TarEntry::file(
+            "package/lib/deep/index.js",
+            "module.exports = 1;",
+        )]);
+
+        extract(&tarball, &dest).unwrap();
+
+        assert_eq!(mode_of(&dest), 0o700, "dest belongs to the caller");
+        assert_eq!(mode_of(&dest.join("lib")), 0o700, "lib was already there");
+        assert_eq!(mode_of(&dest.join("lib/deep")), 0o755, "deep is ours");
     }
 
     #[test]

@@ -1,6 +1,7 @@
 pub mod archive;
 pub mod cli;
 pub mod commands;
+mod directory;
 pub mod error;
 pub mod integrity;
 pub mod linker;
