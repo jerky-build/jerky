@@ -33,6 +33,25 @@ check "format_ms truncates below the hundredth" "0.24s" "$(format_ms 249)"
 check "format_ms carries whole seconds" "11.34s" "$(format_ms 11340)"
 check "format_ms of nothing" "0.00s" "$(format_ms 0)"
 
+# The table. A header and a row are built from one list of columns rather than
+# from a literal per combination of flags, because the pair that drifts prints
+# a separator with the wrong number of cells — which markdown renders as a
+# table with a column missing, silently, off the end of the numbers.
+check "a one-column header" "| scenario | jerky |
+|---|---|" "$(table_header scenario jerky)"
+check "a three-column header" "| scenario | jerky | npm | pnpm |
+|---|---|---|---|" "$(table_header scenario jerky npm pnpm)"
+check "a row formats every column" "| warm store + lockfile | 11.34s | 0.24s |" \
+    "$(table_row 'warm store + lockfile' 11340 249)"
+check "a row of one" "| no-op | 0.04s |" "$(table_row 'no-op' 40)"
+# The three lines of a three-column table have to agree on cell count, since
+# nothing downstream checks. Pinned to the number rather than to each other, so
+# a pair that broke together could not pass together.
+pipes() { printf '%s' "$1" | tr -cd '|' | wc -c | tr -d '[:space:]'; }
+check "the header names four cells" 5 "$(pipes "$(table_header scenario jerky npm pnpm | head -1)")"
+check "the separator has four cells" 5 "$(pipes "$(table_header scenario jerky npm pnpm | tail -1)")"
+check "a three-column row has four cells" 5 "$(pipes "$(table_row x 1 2 3)")"
+
 # The clock. This machine must have one of the three sources, and it must
 # produce a 13-digit millisecond stamp that moves forward — a timer stuck at a
 # constant would report every scenario as instant.
@@ -115,6 +134,35 @@ check "mirror_seeded says no to a directory with nothing in it" "no" \
 check "mirror_seeded says yes to a recording" "yes" \
     "$(mirror_seeded "$seed" && echo yes || echo no)"
 check "mirror_summary counts what is there" "2 packuments, 1 tarballs" \
+    "$(mirror_summary "$seed" | sed 's/, [0-9.]*[KMGB].*//')"
+
+# Which tools a recording covers, per fixture.
+#
+# A recording is complete by construction only for the tool that was driven
+# through the proxy while it was taken, and jerky and pnpm do not ask for the
+# same packages: pnpm installs peer dependencies and jerky does not yet, so a
+# jerky-only recording 404s the first peer pnpm reaches — in the middle of a
+# timed run, which reads as a broken benchmark rather than as a recording to
+# extend. `--pnpm` checks for this up front instead.
+#
+# Absence is the answer for every recording taken before pnpm was measurable,
+# which is why the marker is the thing that is written rather than an
+# only-jerky marker being the thing that is looked for.
+check "a fresh recording covers nothing" "no" \
+    "$(mirror_covers "$seed" pnpm alotta-files && echo yes || echo no)"
+mirror_mark_covered "$seed" pnpm alotta-files
+check "a marked recording covers that tool and fixture" "yes" \
+    "$(mirror_covers "$seed" pnpm alotta-files && echo yes || echo no)"
+# Per fixture, not per tool: `--record --pnpm --fixture alotta-files` records
+# one of the two, and a run that measured the other against it would 404 its
+# way through a scenario.
+check "one fixture's marker does not cover the other" "no" \
+    "$(mirror_covers "$seed" pnpm alotta-packages && echo yes || echo no)"
+check "marking pnpm does not claim npm" "no" \
+    "$(mirror_covers "$seed" npm alotta-files && echo yes || echo no)"
+# The marker sits beside the recording and must stay out of what it holds,
+# or `mirror_summary` would report a packument that is not one.
+check "a marker is not counted as a recorded document" "2 packuments, 1 tarballs" \
     "$(mirror_summary "$seed" | sed 's/, [0-9.]*[KMGB].*//')"
 
 # The pin gets the same treatment as a packument, and for a reason that is easy

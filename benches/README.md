@@ -7,9 +7,11 @@ about cannot show up in it at all.
 
 ```
 ./benches/bench.sh --record                 # seed the replay mirror (once)
+./benches/bench.sh --record --pnpm          # and what pnpm asks for as well
 ./benches/bench.sh                          # both fixtures, jerky only
 ./benches/bench.sh --fixture alotta-files   # one of them
 ./benches/bench.sh --npm --trials 5         # npm alongside, five trials
+./benches/bench.sh --pnpm                   # pnpm alongside, same mirror
 ./benches/bench.sh --pin                    # re-resolve and rewrite the pins
 ```
 
@@ -172,15 +174,41 @@ manifest alone, one from the pin.
 It resumes. An interrupted recording is finished by running it again, since
 anything already on disk is a hit.
 
+**`--record --pnpm` records what pnpm asks for too**, by driving a pnpm install
+per fixture through the same proxy. It has to be asked for, because the two
+tools do not want the same packages: pnpm installs peer dependencies and jerky
+does not yet ([#34](https://github.com/jerky-build/jerky/issues/34)), so a
+recording taken for jerky alone 404s at the first peer pnpm reaches. On
+`alotta-files` that is 49 packuments and 65 tarballs pnpm needs and jerky never
+asked for — 1146 and 1356 against jerky's 1097 and 1291, 15MB on top of 129MB.
+
+One pnpm install per fixture covers all four pnpm rows. The lockfile rows
+install from a `pnpm-lock.yaml` pnpm generates from the same manifest against
+the same frozen recording, so they cannot want anything the manifest install
+did not already ask for.
+
+The recording records which tool it covers, per fixture, as an empty
+`covers-pnpm-<fixture>` file beside the packuments. `--pnpm` checks for it
+before it times anything and names the command that takes what is missing,
+rather than letting a 404 arrive four minutes into a scenario and read as a
+broken benchmark. A recording taken before pnpm was measurable has no such
+file, which is the right answer for it.
+
+The mirror itself needed no changes. It ignores the client's `Accept` and
+serves the abbreviated packument it recorded, so pnpm's content negotiation
+lands on the same document jerky's does; the serve-time `dist.tarball` rewrite
+is on the response rather than on the client, so pnpm's tarball requests are
+redirected at the mirror exactly as jerky's are.
+
 **Do not commit it.** A full recording is roughly **770MB**, measured rather
 than estimated: `alotta-files` is 1,097 packuments and 1,291 tarballs at
 **129MB**, and `alotta-packages` is 2,238 packuments and 2,916 tarballs at
 **643MB** — five times `alotta-files`, not the 2.2x its package count
 suggests, because its packages are larger as well as more numerous. That is
-not a thing to put in a git history that also has to be cloned. It lands in `benches/.mirror/`, which
-is gitignored; `JERKY_BENCH_MIRROR_DIR` moves it elsewhere. A measuring run
-with no recording to replay stops before it times anything and says which
-command to run.
+not a thing to put in a git history that also has to be cloned. It lands in
+`benches/.mirror/`, which is gitignored; `JERKY_BENCH_MIRROR_DIR` moves it
+elsewhere. A measuring run with no recording to replay stops before it times
+anything and says which command to run.
 
 Re-pinning and re-recording go together, in that order: `--pin` resolves
 against the live registry by definition, and a mirror recorded before it is a
@@ -232,7 +260,9 @@ Two things a reader of the numbers should know:
   endpoints and a packument form the recording does not hold — so an `--npm`
   run is the one mode here that reaches the live registry while measuring, and
   its column carries the network where jerky's does not. The tables say so
-  under every one of them.
+  under every one of them. **`--pnpm` does not**: pnpm replays the same
+  recording jerky does, which is what makes that column two times worth reading
+  against each other rather than a shape comparison.
 
 `mirror.py` wants `python3` on `PATH`, and `bench.sh` says so and stops rather
 than discovering it halfway through a run.
@@ -284,16 +314,123 @@ wrote and "warm" refers to the cache. npm's project directory is kept separate
 from jerky's for that reason — a stray `package-lock.json` in jerky's project
 would quietly change what the no-lockfile rows measure.
 
-pnpm is not measured. It is the obvious third column and the harness has no
-support for it yet.
+**Every column here runs with lifecycle scripts off**, npm's included. jerky
+runs none at all — there is no `Command` anywhere in `src/` — so a column that
+ran them would be timing an install plus a node-gyp build against one that was
+not. One convention across the whole table, rather than a different fairness
+rule per column, and both caveats say so.
+
+## Comparing against pnpm
+
+`--pnpm` adds a pnpm column, **against the same replay mirror as jerky's**. So
+unlike the npm column, neither side carries the network and the two numbers are
+comparable as times rather than only as shapes.
+
+### Pointing pnpm at the mirror takes more than `registry=`
+
+A `registry=` line in a project `.npmrc` is the first half, and on its own it
+is **not** enough. npm-family configuration is per scope, and a more specific
+key wins wherever it was written: `registry=` does not override a
+`@scope:registry=` line configured elsewhere. Both fixtures are full of scoped
+names — `alotta-packages` is `@angular/cli`, `@nestjs/cli`, `@vue/cli-service`
+and eleven more, and `alotta-files` reaches dozens of transitive `@babel/*` —
+so a scope pointed somewhere else is a measured install going somewhere else.
+
+That failure is the dangerous kind. The mirror answers a miss with a loud 404,
+so an unscoped leak stops the run; a scoped one never reaches the mirror at
+all, and is silent, live, and inside a number this harness promises is offline.
+
+Three things close it, and it takes all three:
+
+- **`HOME` already points at the scratch directory**, so `~/.npmrc` is not
+  read. That is the layer people think of first, and it was never the problem.
+- **`userconfig` and `globalconfig` are pointed at an empty file** for every
+  pnpm invocation. The global npmrc lives with the node installation rather
+  than under `$HOME`, so redirecting `HOME` does not cover it.
+- **Whatever scope-specific registry still survives is re-pointed at the
+  mirror.** Emptying the files is not sufficient: pnpm ships `@jsr:registry` as
+  a built-in default, which no file can unset. So the harness asks pnpm what
+  scoped registries it would use, writes an override for each into the project
+  `.npmrc`, and then asks again — refusing to measure if any of them still
+  names something other than the mirror. Asked of pnpm rather than derived from
+  the fixture's manifest, because a scope can be configured that no manifest
+  mentions, and because the built-in is in none of them.
+
+### What the column says about itself
+
+It prints the following under every table that has the column, for the reason
+the npm caveat does: a reader pastes one fixture's table into an issue.
+
+- **jerky and pnpm do not count the same tree**, for the same reason jerky and
+  npm do not. jerky resolves no peer dependencies yet
+  ([#34](https://github.com/jerky-build/jerky/issues/34)), so pnpm installs
+  packages jerky never asks for.
+- **pnpm's scenarios are the nearest equivalents rather than identical ones.**
+- **Lifecycle scripts are off in every column**, which is the npm section's
+  point above and applies here unchanged.
+
+The mapping, which is where "nearest equivalent" is decided:
+
+| scenario | what pnpm does |
+|---|---|
+| cold store, no lockfile | pnpm's content-addressable store **and** its metadata cache both wiped. Those are the two things jerky's cold row wipes when it deletes `$HOME`, so "warm" means the same pair on both sides. |
+| warm store, no lockfile | both inherited from the cold row, project started from the manifest alone |
+| warm store + lockfile | installed **frozen** from a `pnpm-lock.yaml` pnpm generated itself in untimed setup |
+| no-op, tree already present | the same, run once untimed first so the timed run finds the tree already there |
+
+Two of those want a word. Like npm, **pnpm writes a lockfile on every
+install**, so "no lockfile" is a property of the directory a run starts in
+rather than a flag — and pnpm's project directory is kept apart from jerky's so
+a stray `pnpm-lock.yaml` cannot change what jerky's no-lockfile rows measure.
+And **the lockfile rows install from a pin pnpm made**, not from a committed
+one: there is no `pnpm-lock.yaml` beside the fixtures the way there is a
+`jerky-lock.json`, and there should not be, since what pnpm's CI row installs
+is a lockfile pnpm wrote. It is generated in untimed setup rather than
+inherited from whichever scenario ran last, so the row cannot quietly measure a
+no-lockfile install the first time it runs.
+
+**Frozen is decided per scenario, not once for the run.** It is on for the two
+lockfile-bearing rows and off for the two without, where there is no lockfile
+to freeze and frozen is an error. Setting it off everywhere — which is what
+this did at first — leaves pnpm re-checking the lockfile against
+`package.json` on the two rows that have one, which is work jerky's lockfile
+row does not do, in the two rows jerky already wins. Frozen is also what pnpm
+turns on by itself when `CI` is set, and CI is what those rows are named after.
+
+On `alotta-files` the correction is small — 0.87s frozen against 0.89s not, and
+no measurable difference on the no-op row — because `prefer-frozen-lockfile`
+already defaults to true and takes the headless path when the lockfile happens
+to be up to date. What the explicit flag buys is that the row no longer depends
+on that happening to hold: non-frozen *falls back* to a full re-resolution when
+anything mismatches, which would turn the CI row into a resolution benchmark
+without saying so, where frozen makes the same mismatch an error.
+
+pnpm's store, cache and state directories are moved into the scratch tree
+rather than left under `$HOME`. That is not tidiness: the cold *jerky* trial
+deletes `$HOME` outright, so a pnpm store under it would be wiped by the other
+column's setup and every pnpm row would measure a cold install.
+
+pnpm is not vendored. `--pnpm` checks for it on `PATH` alongside the checks for
+a millisecond clock and for `python3`, so a missing pnpm is a sentence rather
+than half a table. All of those now run **before** the release build rather
+than after it, which they did not at first: a mistyped flag used to cost a full
+`cargo build --release` before anything told you about it.
 
 ## Tests
 
 `./benches/lib-test.sh` covers the helpers in `benches/lib.sh` — the median,
-the formatting, the link counting, and the mirror's lifecycle and what it
-serves. The timing loop itself is still untested: what it does is run a
+the formatting, the table, the link counting, and the mirror's lifecycle and
+what it serves. The timing loop itself is still untested: what it does is run a
 stopwatch around a subprocess, and the parts of it that could be silently wrong
 are the arithmetic and the mirror, which are both here.
+
+The table is built from a list of column names rather than as a literal per
+combination of flags, and that is what the header and row tests are protecting.
+jerky's column is always there and npm's and pnpm's are each optional, so the
+literal form would be four headers to keep in agreement with four rows; the
+pair that drifts prints a separator with the wrong number of cells, which
+markdown renders as a table with a column quietly missing off the end of the
+numbers.
 
 The mirror's tests run against a synthetic recording of one package, generated
 by the test, so they need neither a real recording nor a network. The rewrite
