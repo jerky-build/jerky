@@ -130,6 +130,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   tar reader rather than by jerky; they are now jerky's own guarantee and a
   test fails if that stops being true
   ([#29](https://github.com/jerky-build/jerky/issues/29))
+- Tarballs are downloaded concurrently rather than one after another, up to
+  sixteen at a time. Resolution still walks serially — it discovers work as it
+  goes — but once the graph is settled every URL is known, so the install half
+  is a fixed work list with nothing to wait for. On a cold store this is the
+  difference between a first `jerky install` that reads as slow and one that
+  does not; a repeat install is unaffected, because it already downloaded
+  nothing. The cap exists so a large tree does not open a connection per
+  package and get the machine rate-limited
+  ([#33](https://github.com/jerky-build/jerky/issues/33)).
+- A lockfile whose recorded integrity disagrees with the registry is now
+  refused before *any* tarball is fetched, rather than after every package
+  ahead of it in the graph had been. Serially "halfway through" at least had
+  an order to it; with sixteen fetches in flight there is no ahead or behind,
+  so the gate became a pass of its own. The check and its message are
+  unchanged, but its *precedence* is not: a corrupt tarball on an early
+  package used to be reported ahead of a locked-integrity mismatch on a later
+  one, and now the mismatch always wins. That is the better answer of the two
+  — a republished tarball is a claim about the lockfile, and it should not
+  depend on where in the graph it landed.
 - `jerky install` is now convergent rather than additive: after it runs, each
   importer's `node_modules` holds what its manifest declares and nothing else.
   A dependency you delete from a `package.json` loses its link on the next
