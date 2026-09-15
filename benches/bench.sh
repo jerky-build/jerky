@@ -30,6 +30,7 @@ source benches/lib.sh
 FIXTURES=(alotta-files alotta-packages)
 TRIALS=3
 WITH_NPM=0
+WITH_PNPM=0
 PIN=0
 RECORD=0
 SELECTED=()
@@ -47,12 +48,15 @@ usage: ./benches/bench.sh [options]
   --fixture NAME   measure one fixture only (repeatable)
   --trials N       trials per scenario, reported as a median (default 3)
   --npm            measure npm alongside jerky; see the caveat it prints
+  --pnpm           measure pnpm alongside jerky, against the same mirror; see
+                   the caveat it prints. Wants a recording taken with --pnpm.
   --pin            re-resolve each fixture and rewrite its committed
                    jerky-lock.json, then exit without measuring
   --record         install both fixtures against the live registry, writing
                    down every packument and tarball they ask for, then exit
                    without measuring. Roughly 470MB, and the one thing here
-                   that touches the network.
+                   that touches the network. Add --pnpm to record what pnpm
+                   asks for as well, which jerky never does.
   -h, --help       this
 
 Fixtures: alotta-files, alotta-packages
@@ -68,6 +72,7 @@ while (($#)); do
         --fixture) SELECTED+=("$2"); shift 2 ;;
         --trials) TRIALS=$2; shift 2 ;;
         --npm) WITH_NPM=1; shift ;;
+        --pnpm) WITH_PNPM=1; shift ;;
         --pin) PIN=1; shift ;;
         --record) RECORD=1; shift ;;
         -h | --help) usage; exit 0 ;;
@@ -119,6 +124,15 @@ if ((WITH_NPM)) && ! command -v npm >/dev/null; then
     exit 1
 fi
 
+# pnpm is not vendored here, and it is checked before anything is timed for the
+# same reason the millisecond clock is: a column that discovers halfway through
+# a scenario that it has nothing to run prints half a table.
+if ((WITH_PNPM)) && ! command -v pnpm >/dev/null; then
+    printf -- '--pnpm was asked for and pnpm is not on PATH.\n' >&2
+    printf 'Install it (npm install -g pnpm, or corepack enable pnpm) and run this again.\n' >&2
+    exit 1
+fi
+
 # `--pin` is the one mode that neither serves nor records, so it is the one
 # mode that does not want the mirror.
 if ((!PIN)) && ! command -v python3 >/dev/null; then
@@ -159,6 +173,40 @@ prepare_project() {
     if [[ -n $lockfile ]]; then
         cp "$lockfile" "$dir/$(basename "$lockfile")"
     fi
+}
+
+# pnpm's project: jerky's, plus the `.npmrc` that tells pnpm where everything
+# is.
+#
+# A project-level `.npmrc` rather than environment variables. `registry` is the
+# setting that has to land whatever else is configured on the machine running
+# this, and a project file is the highest-precedence place pnpm looks short of
+# a command-line flag — so a developer's own `~/.npmrc` cannot point a measured
+# install somewhere else.
+#
+# The three directory settings move what pnpm would otherwise keep under `$HOME`
+# out into the scratch tree. That is not tidiness: the cold *jerky* trial
+# deletes `$HOME` outright, so a pnpm store under it would be wiped by the other
+# column's setup and every pnpm row would measure a cold install. Out here they
+# are wiped exactly when pnpm's own cold row wipes them.
+#
+# `update-notifier` off because it is a request at registry.npmjs.org for
+# pnpm's own latest version, which is precisely the live traffic this harness
+# exists to remove. `frozen-lockfile` off because the two no-lockfile rows start
+# from a directory that has none, and pnpm turns frozen on by itself when `CI`
+# is set in the environment.
+prepare_pnpm_project() {
+    local dir=$1 fixture=$2 lockfile=${3:-}
+    prepare_project "$dir" "$fixture" "$lockfile"
+    cat >"$dir/.npmrc" <<NPMRC
+registry=$MIRROR_URL
+store-dir=$WORK/pnpm-store
+cache-dir=$WORK/pnpm-cache
+state-dir=$WORK/pnpm-state
+update-notifier=false
+frozen-lockfile=false
+confirm-modules-purge=false
+NPMRC
 }
 
 # Milliseconds spent running the command, which must succeed. `now_ms` rather
@@ -269,6 +317,76 @@ npm_trial() {
     (cd "$WORK/npm-proj" && time_ms npm "${npm_args[@]}")
 }
 
+# `--ignore-scripts` because jerky runs no lifecycle scripts at all — there is
+# no `Command` in `src/` — so leaving pnpm's on would put a node-gyp build in
+# one column and not the other. It also keeps the promise this harness makes
+# about the network: a `postinstall` that downloads a prebuilt binary reaches
+# past the mirror for it.
+PNPM_ARGS=(install --ignore-scripts)
+
+# pnpm's equivalents of the same four scenarios.
+#
+# pnpm is the one other column here pointed at the replay mirror, so its
+# numbers and jerky's are taken against the same bytes over the same loopback
+# socket. The mapping is nearest-equivalent rather than identical, because the
+# two tools do not divide their state the same way:
+#
+#   cold      pnpm's content-addressable store *and* its metadata cache, both
+#             wiped. Those are the two things jerky's cold row wipes when it
+#             deletes `$HOME`, so "warm" means the same pair on both sides.
+#   warm      both inherited from the cold row, no lockfile in the project.
+#   lockfile  installed from a `pnpm-lock.yaml`. pnpm's own, generated in
+#             untimed setup: there is no committed pnpm pin the way there is a
+#             jerky-lock.json, and there should not be one — a pin generated by
+#             the tool being measured is what pnpm's CI row actually installs.
+#   noop      the same, run once untimed first so the timed run finds the tree
+#             already there.
+#
+# Like npm, pnpm writes a lockfile on every install, so "no lockfile" is a
+# property of the directory the run starts in rather than a flag.
+pnpm_trial() {
+    local fixture=$1 scenario=$2
+    local pin=$WORK/pnpm-pin-$fixture/pnpm-lock.yaml
+
+    # Generated in untimed setup rather than inherited from whichever scenario
+    # ran last, for the reason npm's is: depending on the order would make
+    # "warm store + lockfile" quietly measure a no-lockfile install the first
+    # time it ran, which is a wrong number rather than an error.
+    if [[ $scenario == lockfile || $scenario == noop ]] && [[ ! -f $pin ]]; then
+        prepare_pnpm_project "$WORK/pnpm-proj" "$fixture"
+        (cd "$WORK/pnpm-proj" && time_ms pnpm "${PNPM_ARGS[@]}" >/dev/null)
+        mkdir -p "$(dirname "$pin")"
+        cp "$WORK/pnpm-proj/pnpm-lock.yaml" "$pin"
+    fi
+
+    case $scenario in
+        cold)
+            rm -rf "$WORK/pnpm-store" "$WORK/pnpm-cache" "$WORK/pnpm-state"
+            prepare_pnpm_project "$WORK/pnpm-proj" "$fixture"
+            ;;
+        warm) prepare_pnpm_project "$WORK/pnpm-proj" "$fixture" ;;
+        lockfile) prepare_pnpm_project "$WORK/pnpm-proj" "$fixture" "$pin" ;;
+        noop)
+            prepare_pnpm_project "$WORK/pnpm-proj" "$fixture" "$pin"
+            (cd "$WORK/pnpm-proj" && time_ms pnpm "${PNPM_ARGS[@]}" >/dev/null)
+            ;;
+    esac
+
+    (cd "$WORK/pnpm-proj" && time_ms pnpm "${PNPM_ARGS[@]}")
+}
+
+# One trial of one scenario, for whichever tool the column belongs to. The
+# dispatch is here so the table loop below iterates over column names rather
+# than branching on a flag per column, which is what stops the header and the
+# rows from disagreeing about how many cells there are.
+trial() {
+    case $1 in
+        jerky) jerky_trial "$2" "$3" ;;
+        npm) npm_trial "$2" "$3" ;;
+        pnpm) pnpm_trial "$2" "$3" ;;
+    esac
+}
+
 # Re-resolve each fixture and commit the result as its pin.
 #
 # alotta-files is carets all the way down and alotta-packages pins only its
@@ -310,6 +428,9 @@ record_mirror() {
     printf 'This is the one thing here that touches the network, and it is\n' >&2
     printf 'roughly 470MB for both fixtures. It resumes, so an interrupted\n' >&2
     printf 'recording can be finished by running this again.\n\n' >&2
+    if ((WITH_PNPM)); then
+        printf 'Recording what pnpm asks for as well as what jerky does.\n\n' >&2
+    fi
 
     mirror_start "$MIRROR" "$MIRROR_LOG" --record --upstream "$UPSTREAM"
     export JERKY_REGISTRY_URL=$MIRROR_URL
@@ -328,6 +449,26 @@ record_mirror() {
             mkdir -p "$HOME"
             prepare_project "$WORK/proj" "$fixture" "$pin"
             (cd "$WORK/proj" && time_ms "$JERKY" install >/dev/null)
+        fi
+
+        # The same observation trick, for the other tool that will replay this.
+        # pnpm asks for packages jerky never does — it installs peer
+        # dependencies and jerky does not yet (#34) — so a recording taken for
+        # jerky alone 404s the first peer pnpm reaches, in the middle of a
+        # timed run. One install from the manifest covers all four pnpm rows:
+        # the lockfile rows install from a `pnpm-lock.yaml` pnpm generates from
+        # this same manifest against this same frozen recording, so they can
+        # want nothing this did not ask for.
+        #
+        # The store and cache are wiped first so every tarball is genuinely
+        # requested rather than found locally, and the marker is written at the
+        # end of the fixture, after the install that earns it.
+        if ((WITH_PNPM)); then
+            printf '  %s: resolving with pnpm\n' "$fixture" >&2
+            rm -rf "$WORK/pnpm-store" "$WORK/pnpm-cache" "$WORK/pnpm-state"
+            prepare_pnpm_project "$WORK/pnpm-proj" "$fixture"
+            (cd "$WORK/pnpm-proj" && time_ms pnpm "${PNPM_ARGS[@]}" >/dev/null)
+            mirror_mark_covered "$MIRROR" pnpm "$fixture"
         fi
     done
 
@@ -376,6 +517,31 @@ MSG
     exit 1
 fi
 
+# Asked before anything is timed, rather than discovered as a 404 four minutes
+# into a scenario. A recording holds what the tool that was driven through the
+# proxy asked for, and pnpm asks for more than jerky does.
+if ((WITH_PNPM)); then
+    for fixture in "${FIXTURES[@]}"; do
+        mirror_covers "$MIRROR" pnpm "$fixture" || {
+            cat >&2 <<MSG
+The recording at $MIRROR does not cover pnpm for $fixture.
+
+pnpm and jerky do not ask for the same packages: pnpm installs peer
+dependencies and jerky does not yet (#34), so a recording taken for jerky alone
+404s at the first peer pnpm reaches — in the middle of a timed run. Extend it
+with
+
+    ./benches/bench.sh --record --pnpm --fixture $fixture
+
+which drives a pnpm install through the recording proxy and writes down
+whatever jerky never asked for. Anything already recorded is a hit, so this
+costs only the difference.
+MSG
+            exit 1
+        }
+    done
+fi
+
 mirror_start "$MIRROR" "$MIRROR_LOG"
 # The whole point of the issue, in one line: jerky is pointed at the mirror,
 # and `main` is the only place that reads this.
@@ -405,6 +571,33 @@ like-for-like time.
 CAVEAT
 }
 
+# The same, for pnpm, and printed under every table that has that column for
+# the same reason: a reader pastes one fixture's table into an issue.
+pnpm_caveat() {
+    cat <<'CAVEAT'
+
+Both columns replay the same local recording over loopback, so neither carries
+the network and the two times can be read against each other as times. That is
+what makes this column a comparison rather than a shape check.
+
+They do not count the same tree. jerky does not resolve peer dependencies yet
+(#34), so pnpm installs packages jerky never asks for; that is also why the
+recording has to be taken with `--pnpm` before this run can happen at all.
+The rows are two package managers each doing their own job on one manifest,
+not a scoreboard.
+
+pnpm's scenarios are the nearest equivalents rather than identical ones. Its
+"warm" is its content-addressable store plus its metadata cache, which is the
+pair jerky's warm rows mean; "no lockfile" means starting from a directory that
+has no `pnpm-lock.yaml`, since pnpm writes one on every install; and the
+lockfile rows install from a lockfile pnpm generated itself, because there is
+no committed pnpm pin the way there is a jerky-lock.json.
+
+pnpm runs with `--ignore-scripts`. jerky runs no lifecycle scripts at all, so
+leaving pnpm's on would time a node-gyp build in one column and not the other.
+CAVEAT
+}
+
 SCENARIOS=(cold warm lockfile noop)
 label_for() {
     case $1 in
@@ -415,48 +608,53 @@ label_for() {
     esac
 }
 
+# jerky first, always: it is the column every table has, its cold row is what
+# fills the store the three warm rows inherit, and the footer's tree figures are
+# read off the directory its last trial left behind.
+#
+# `TOOLS` rather than the obvious `COLUMNS`, which is a variable bash itself
+# owns: it holds the terminal width, and a shell with `checkwinsize` on
+# rewrites it after every command. A table whose column list is silently
+# replaced by `80` is a thing to not find out about later.
+TOOLS=(jerky)
+if ((WITH_NPM)); then TOOLS+=(npm); fi
+if ((WITH_PNPM)); then TOOLS+=(pnpm); fi
+
 for fixture in "${FIXTURES[@]}"; do
     printf '\n## %s (median of %s)\n\n' "$fixture" "$TRIALS"
-
-    if ((WITH_NPM)); then
-        printf '| scenario | jerky | npm |\n|---|---|---|\n'
-    else
-        printf '| scenario | jerky |\n|---|---|\n'
-    fi
+    table_header scenario "${TOOLS[@]}"
 
     packages="" links="" dangling=""
     for scenario in "${SCENARIOS[@]}"; do
         printf '  %s ' "$(label_for "$scenario")" >&2
-        times=()
-        for ((i = 0; i < TRIALS; i++)); do
-            times+=("$(jerky_trial "$fixture" "$scenario")")
-            printf '.' >&2
-        done
-        # Read off the tree the last trial left in the scratch directory,
-        # rather than out of `jerky_trial` — a trial runs in a command
-        # substitution, so nothing it assigns survives it.
-        #
-        # Keyed on the scenario rather than on `packages` still being empty.
-        # The empty test would re-fire on the next scenario if the summary line
-        # ever stopped matching, quietly attributing the no-op row's tree to the
-        # cold row; `packages_installed` fails loudly instead.
-        if [[ $scenario == cold ]]; then
-            packages=$(packages_installed "$WORK/last-run.log")
-            links=$(count_links "$WORK/proj")
-            dangling=$(count_dangling "$WORK/proj")
-        fi
-        row="| $(label_for "$scenario") | $(format_ms "$(median "${times[@]}")") |"
-
-        if ((WITH_NPM)); then
-            npm_times=()
+        medians=()
+        for tool in "${TOOLS[@]}"; do
+            times=()
             for ((i = 0; i < TRIALS; i++)); do
-                npm_times+=("$(npm_trial "$fixture" "$scenario")")
+                times+=("$(trial "$tool" "$fixture" "$scenario")")
                 printf '.' >&2
             done
-            row="$row $(format_ms "$(median "${npm_times[@]}")") |"
-        fi
+            medians+=("$(median "${times[@]}")")
+
+            # Read off the tree the last trial left in the scratch directory,
+            # rather than out of `jerky_trial` — a trial runs in a command
+            # substitution, so nothing it assigns survives it. jerky's column
+            # goes first, so this happens before any other tool has written
+            # over `last-run.log`.
+            #
+            # Keyed on the scenario rather than on `packages` still being
+            # empty. The empty test would re-fire on the next scenario if the
+            # summary line ever stopped matching, quietly attributing the no-op
+            # row's tree to the cold row; `packages_installed` fails loudly
+            # instead.
+            if [[ $tool == jerky && $scenario == cold ]]; then
+                packages=$(packages_installed "$WORK/last-run.log")
+                links=$(count_links "$WORK/proj")
+                dangling=$(count_dangling "$WORK/proj")
+            fi
+        done
         printf '\n' >&2
-        printf '%s\n' "$row"
+        table_row "$(label_for "$scenario")" "${medians[@]}"
     done
 
     printf '\njerky installed %s packages; %s dangling links out of %s.\n' \
@@ -466,4 +664,5 @@ for fixture in "${FIXTURES[@]}"; do
         printf 'the timings above as measuring something other than a working install.\n'
     fi
     if ((WITH_NPM)); then npm_caveat; fi
+    if ((WITH_PNPM)); then pnpm_caveat; fi
 done

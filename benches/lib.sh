@@ -68,6 +68,41 @@ format_ms() {
     printf '%d.%02ds\n' $((ms / 1000)) $(((ms % 1000) / 10))
 }
 
+# The two lines of a markdown table header, from the column names:
+#
+#   table_header scenario jerky pnpm
+#   | scenario | jerky | pnpm |
+#   |---|---|---|
+#
+# Built from a list rather than as a literal per combination of flags. jerky's
+# column is always there and npm's and pnpm's are each optional, which is four
+# header literals to keep in agreement with four row literals; the pair that
+# drifts prints a separator with the wrong number of cells, and markdown
+# renders that as a table with a column quietly missing off the end of the
+# numbers. One list, two consumers, and the agreement is arithmetic.
+table_header() {
+    local column names='|' rule='|'
+    for column in "$@"; do
+        names="$names $column |"
+        rule="$rule---|"
+    done
+    printf '%s\n%s\n' "$names" "$rule"
+}
+
+# A row of that table: a label, then one millisecond figure per column.
+#
+#   table_row 'warm store + lockfile' 11340 249
+#   | warm store + lockfile | 11.34s | 0.24s |
+table_row() {
+    local label=$1 ms row
+    shift
+    row="| $label |"
+    for ms in "$@"; do
+        row="$row $(format_ms "$ms") |"
+    done
+    printf '%s\n' "$row"
+}
+
 # The package count out of an install's output.
 #
 # Returns non-zero when the line is not there, which is the point: the caller
@@ -122,6 +157,37 @@ mirror_seeded() {
 # What a recording holds, as `N packuments, M tarballs, S`.
 mirror_summary() {
     python3 "$JERKY_BENCH_MIRROR_PY" check "$1" 2>/dev/null
+}
+
+# Which package manager a recording covers, and for which fixture.
+#
+# A recording is complete by construction only for the tool that was driven
+# through the proxy while it was taken, and jerky and pnpm do not ask for the
+# same packages: pnpm installs peer dependencies and jerky does not yet, so a
+# recording taken for jerky alone 404s the first peer pnpm reaches. That
+# arrives in the middle of a timed run and reads as a broken benchmark rather
+# than as a recording to extend, so `--pnpm` asks this first and names the
+# command that takes what it wants.
+#
+# Per fixture, because `--record --fixture alotta-files` covers one of the two
+# and a run measuring the other against it would 404 its way through a
+# scenario.
+#
+# A file beside the recording rather than a key in `recording.json`: bash has
+# no JSON reader, and `mirror.py` owns that file's schema. It sits at the root
+# of the recording, where `mirror.py check` — which counts only `packuments/`
+# and `tarballs/` — cannot mistake it for something recorded. Absence means
+# "not covered", which is the right answer for every recording taken before
+# pnpm was measurable at all.
+mirror_covers() {
+    local dir=$1 tool=$2 fixture=$3
+    [[ -f $dir/covers-$tool-$fixture ]]
+}
+
+mirror_mark_covered() {
+    local dir=$1 tool=$2 fixture=$3
+    mkdir -p "$dir"
+    : >"$dir/covers-$tool-$fixture"
 }
 
 MIRROR_PID=
