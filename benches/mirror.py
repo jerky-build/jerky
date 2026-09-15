@@ -42,6 +42,7 @@ so integrity still verifies.
 import argparse
 import json
 import os
+import socketserver
 import sys
 import threading
 import time
@@ -183,6 +184,26 @@ class Server(ThreadingHTTPServer):
     """
 
     daemon_threads = True
+
+    def server_bind(self):
+        """Bind without asking the resolver who we are.
+
+        `HTTPServer.server_bind` follows the bind with `socket.getfqdn()` on
+        the address just bound, to fill in `server_name`. That is a reverse DNS
+        lookup, and on a machine whose resolver has nothing to say about
+        `127.0.0.1` it blocks for as long as the resolver takes to give up —
+        tens of seconds on a macOS CI runner, where it made the mirror look
+        like it had hung: the port file is written after this returns, so the
+        harness timed out against a process that was alive, silent, and stuck
+        inside `__init__`.
+
+        Nothing here wants the name. `server_name` and `server_port` are read
+        by the CGI handler to fill in environment variables, and this serves
+        packuments and tarballs. So the bound address is the answer, and no
+        question is asked.
+        """
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
 
     def handle_error(self, request, client_address):
         if isinstance(sys.exc_info()[1], (ConnectionResetError, BrokenPipeError)):

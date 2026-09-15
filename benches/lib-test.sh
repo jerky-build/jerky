@@ -141,6 +141,30 @@ rewrite_registry "$work/pin.json" "$work/pin-plain.json" https://registry.npmjs.
 check "rewrite_registry with nowhere to point is a plain copy" "yes" \
     "$(cmp -s "$work/pin.json" "$work/pin-plain.json" && echo yes || echo no)"
 
+# The mirror starts even when the resolver will not say who 127.0.0.1 is.
+#
+# `HTTPServer.server_bind` ends with a `socket.getfqdn()` on the address it
+# just bound, and on a macOS CI runner that reverse lookup blocked for tens of
+# seconds — long enough that `mirror_start` gave up on a process that was alive
+# and silent, because the port file is only written once the bind returns. The
+# mirror overrides `server_bind` to skip the question; this is what proves it,
+# by making the answer arrive far too late to be waited for.
+stall=$work/stall
+mkdir -p "$stall"
+cat >"$stall/sitecustomize.py" <<'PY'
+import socket, time
+_real = socket.getfqdn
+socket.getfqdn = lambda *a, **kw: (time.sleep(120), _real(*a, **kw))[1]
+PY
+stall_log=$work/stalled-mirror.log
+: >"$stall_log"
+if PYTHONPATH=$stall mirror_start "$seed" "$stall_log"; then
+    check "the mirror starts without a reverse DNS lookup" "started" "started"
+    mirror_stop
+else
+    check "the mirror starts without a reverse DNS lookup" "started" "failed"
+fi
+
 mirror_log=$work/mirror.log
 : >"$mirror_log"
 if mirror_start "$seed" "$mirror_log"; then
