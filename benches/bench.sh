@@ -103,16 +103,9 @@ fi
     exit 2
 }
 
-# A release build, because a debug jerky measures the optimiser rather than the
-# install. `JERKY_BIN` is the escape hatch for measuring a binary built
-# elsewhere — a previous commit, say, which is the whole point of a benchmark.
-JERKY=${JERKY_BIN:-$REPO/target/release/jerky}
-if [[ -z ${JERKY_BIN:-} ]]; then
-    printf 'building jerky --release\n' >&2
-    cargo build --release --quiet
-fi
-[[ -x $JERKY ]] || { printf 'not executable: %s\n' "$JERKY" >&2; exit 1; }
-
+# Everything a run needs, asked for before anything is built or timed. The
+# release build is last: it is the slowest step here by a wide margin, and a
+# missing pnpm or a BSD `date` is not worth a compile to find out about.
 if [[ $JERKY_BENCH_TIMER == none ]]; then
     printf 'no millisecond clock: this wants bash 5 (for EPOCHREALTIME), GNU date,\n' >&2
     printf 'or gdate from coreutils. On macOS: brew install bash, or brew install coreutils.\n' >&2
@@ -124,9 +117,10 @@ if ((WITH_NPM)) && ! command -v npm >/dev/null; then
     exit 1
 fi
 
-# pnpm is not vendored here, and it is checked before anything is timed for the
-# same reason the millisecond clock is: a column that discovers halfway through
-# a scenario that it has nothing to run prints half a table.
+# pnpm is not vendored here. Checked up here with the rest of them because a
+# precheck that runs after the release build makes a typo cost a compile, and
+# because a column that discovers halfway through a scenario that it has
+# nothing to run prints half a table.
 if ((WITH_PNPM)) && ! command -v pnpm >/dev/null; then
     printf -- '--pnpm was asked for and pnpm is not on PATH.\n' >&2
     printf 'Install it (npm install -g pnpm, or corepack enable pnpm) and run this again.\n' >&2
@@ -140,6 +134,16 @@ if ((!PIN)) && ! command -v python3 >/dev/null; then
     printf 'See benches/README.md; there is nothing to measure against without it.\n' >&2
     exit 1
 fi
+
+# A release build, because a debug jerky measures the optimiser rather than the
+# install. `JERKY_BIN` is the escape hatch for measuring a binary built
+# elsewhere — a previous commit, say, which is the whole point of a benchmark.
+JERKY=${JERKY_BIN:-$REPO/target/release/jerky}
+if [[ -z ${JERKY_BIN:-} ]]; then
+    printf 'building jerky --release\n' >&2
+    cargo build --release --quiet
+fi
+[[ -x $JERKY ]] || { printf 'not executable: %s\n' "$JERKY" >&2; exit 1; }
 
 WORK=$(mktemp -d)
 # INT and TERM as well as EXIT: a run that is interrupted has a `node_modules`
@@ -156,6 +160,10 @@ export HOME=$WORK/home
 # jerky log alone would only show a 404 without saying what missed.
 MIRROR_LOG=$WORK/mirror.log
 : >"$MIRROR_LOG"
+
+# The empty file `run_pnpm` points pnpm's user and global config at. See there
+# for why a project `.npmrc` is not enough on its own.
+: >"$WORK/empty-npmrc"
 
 # Lay out a project to install into: the fixture's manifest, and a lockfile
 # only when the scenario is one that has one.
@@ -178,11 +186,15 @@ prepare_project() {
 # pnpm's project: jerky's, plus the `.npmrc` that tells pnpm where everything
 # is.
 #
-# A project-level `.npmrc` rather than environment variables. `registry` is the
-# setting that has to land whatever else is configured on the machine running
-# this, and a project file is the highest-precedence place pnpm looks short of
-# a command-line flag — so a developer's own `~/.npmrc` cannot point a measured
-# install somewhere else.
+# The registry lines come from `pnpm_registry_npmrc`, which is where the
+# scope-specific half of that question is dealt with. A project `.npmrc` is the
+# highest-precedence file pnpm reads, so these beat anything configured on the
+# machine — but only key for key, which is the trap that function exists to
+# close.
+#
+# Not a command substitution: `pnpm_registry_npmrc` refuses to return a
+# registry list it could not make safe, and an `exit` inside `$(...)` would
+# leave the subshell and let the run carry on measuring.
 #
 # The three directory settings move what pnpm would otherwise keep under `$HOME`
 # out into the scratch tree. That is not tidiness: the cold *jerky* trial
@@ -192,20 +204,18 @@ prepare_project() {
 #
 # `update-notifier` off because it is a request at registry.npmjs.org for
 # pnpm's own latest version, which is precisely the live traffic this harness
-# exists to remove. `frozen-lockfile` off because the two no-lockfile rows start
-# from a directory that has none, and pnpm turns frozen on by itself when `CI`
-# is set in the environment.
+# exists to remove. Whether the lockfile is frozen is deliberately *not* here:
+# it differs per scenario, and setting it project-wide is what made the
+# lockfile rows measure a re-check jerky's lockfile row does not do.
 prepare_pnpm_project() {
     local dir=$1 fixture=$2 lockfile=${3:-}
     prepare_project "$dir" "$fixture" "$lockfile"
-    cat >"$dir/.npmrc" <<NPMRC
-registry=$MIRROR_URL
+    pnpm_registry_npmrc >"$dir/.npmrc"
+    cat >>"$dir/.npmrc" <<NPMRC
 store-dir=$WORK/pnpm-store
 cache-dir=$WORK/pnpm-cache
 state-dir=$WORK/pnpm-state
 update-notifier=false
-frozen-lockfile=false
-confirm-modules-purge=false
 NPMRC
 }
 
@@ -284,10 +294,15 @@ jerky_trial() {
 # package-lock.json, so "no lockfile" means deleting the one the previous run
 # wrote, and the cache is what "warm" refers to. `--legacy-peer-deps` is not a
 # thumb on the scale — npm refuses both fixtures outright without it.
+#
+# `--ignore-scripts` for the reason pnpm's column passes it: jerky runs no
+# lifecycle scripts at all, so a table whose columns disagreed about whether to
+# run them would be comparing an install against an install plus a node-gyp
+# build. One convention across every column, stated in both caveats.
 npm_trial() {
     local fixture=$1 scenario=$2
     export npm_config_cache=$WORK/npm-cache
-    local -a npm_args=(install --legacy-peer-deps --no-audit --no-fund)
+    local -a npm_args=(install --legacy-peer-deps --no-audit --no-fund --ignore-scripts)
     local pin=$WORK/npm-pin-$fixture/package-lock.json
 
     # The lockfile rows produce their own lockfile in untimed setup rather than
@@ -317,12 +332,83 @@ npm_trial() {
     (cd "$WORK/npm-proj" && time_ms npm "${npm_args[@]}")
 }
 
-# `--ignore-scripts` because jerky runs no lifecycle scripts at all — there is
-# no `Command` in `src/` — so leaving pnpm's on would put a node-gyp build in
-# one column and not the other. It also keeps the promise this harness makes
-# about the network: a `postinstall` that downloads a prebuilt binary reaches
-# past the mirror for it.
+# The arguments every pnpm invocation here shares. A file-scope array rather
+# than a `local -a` inside `pnpm_trial`, which is what npm's equivalent is,
+# because `record_mirror` drives a pnpm install too and the two have to agree:
+# a recording taken with one set of arguments and replayed against another is
+# a recording of the wrong install. The scenario-dependent part — whether the
+# lockfile is frozen — is added at the call site.
+#
+# `--ignore-scripts` because jerky runs no lifecycle scripts at all; there is no
+# `Command` anywhere in `src/`. npm's column passes it too, so the whole table
+# is one convention. It also keeps the promise this harness makes about the
+# network: a `postinstall` that downloads a prebuilt binary reaches past the
+# mirror for it.
 PNPM_ARGS=(install --ignore-scripts)
+
+# Every pnpm invocation goes through this, for the two environment variables.
+#
+# `registry=` in a project `.npmrc` does **not** override a `@scope:registry=`
+# line in a user or global one — npm's config is per-scope, and the more
+# specific key wins wherever it was written. Both fixtures are full of scoped
+# names (`alotta-packages` is `@angular/cli`, `@nestjs/cli`, `@vue/cli-service`
+# and eleven more), so a developer with a scoped registry configured would have
+# a measured install go to it. That failure is the dangerous kind: the mirror
+# 404s loudly on a miss, but a request that never reaches the mirror at all is
+# silent, live, and in the middle of a number this harness promises is offline.
+#
+# Emptying `userconfig` and `globalconfig` is what removes those layers. It is
+# not enough on its own — pnpm ships `@jsr:registry` as a built-in default,
+# which no file can unset — so `pnpm_registry_npmrc` below re-points whatever
+# survives. The two together are what makes the guarantee whole.
+run_pnpm() {
+    npm_config_userconfig=$WORK/empty-npmrc \
+        npm_config_globalconfig=$WORK/empty-npmrc \
+        pnpm "$@"
+}
+
+# The registry lines for a pnpm project: the default, plus an override for
+# every scope pnpm still believes has a registry of its own.
+#
+# Asked of pnpm rather than derived from the fixture's manifest, because a
+# scoped registry can be configured for a scope no manifest mentions — a
+# transitive `@babel/...` is reached through no line of `package.json` — and
+# because the built-in `@jsr` is in none of them. Whatever pnpm says it would
+# use is what gets pointed at the mirror.
+#
+# Computed once per run and cached: it is the same answer every time, and
+# `prepare_pnpm_project` runs twice per trial.
+pnpm_registry_npmrc() {
+    local cache=$WORK/pnpm-registry.npmrc probe=$WORK/pnpm-probe scope
+    if [[ -f $cache ]]; then
+        cat "$cache"
+        return
+    fi
+
+    rm -rf "$probe"
+    mkdir -p "$probe"
+    printf 'registry=%s\n' "$MIRROR_URL" >"$probe/.npmrc"
+    printf 'registry=%s\n' "$MIRROR_URL" >"$cache"
+    (cd "$probe" && run_pnpm config list) |
+        sed -n 's/^\(@[^:]*\):registry=.*/\1/p' |
+        while IFS= read -r scope; do
+            printf '%s:registry=%s\n' "$scope" "$MIRROR_URL" >>"$cache"
+        done
+
+    # Loud rather than silent, and checked rather than assumed: this is the one
+    # setting whose failure mode is a live request nothing else here would
+    # notice.
+    cp "$cache" "$probe/.npmrc"
+    if (cd "$probe" && run_pnpm config list) |
+        grep ':registry=' |
+        grep -qv ":registry=$MIRROR_URL/*\$"; then
+        printf 'a scope-specific registry survives that does not name the mirror:\n' >&2
+        (cd "$probe" && run_pnpm config list) | grep ':registry=' >&2
+        printf 'pnpm would fetch those scopes live, so this is refusing to measure.\n' >&2
+        exit 1
+    fi
+    cat "$cache"
+}
 
 # pnpm's equivalents of the same four scenarios.
 #
@@ -335,7 +421,7 @@ PNPM_ARGS=(install --ignore-scripts)
 #             wiped. Those are the two things jerky's cold row wipes when it
 #             deletes `$HOME`, so "warm" means the same pair on both sides.
 #   warm      both inherited from the cold row, no lockfile in the project.
-#   lockfile  installed from a `pnpm-lock.yaml`. pnpm's own, generated in
+#   lockfile  installed frozen from a `pnpm-lock.yaml`. pnpm's own, generated in
 #             untimed setup: there is no committed pnpm pin the way there is a
 #             jerky-lock.json, and there should not be one — a pin generated by
 #             the tool being measured is what pnpm's CI row actually installs.
@@ -344,17 +430,33 @@ PNPM_ARGS=(install --ignore-scripts)
 #
 # Like npm, pnpm writes a lockfile on every install, so "no lockfile" is a
 # property of the directory the run starts in rather than a flag.
+#
+# **Frozen is per scenario, and getting that wrong is not symmetric.** A
+# non-frozen install re-checks the lockfile against `package.json` before it
+# does anything, which is work jerky's lockfile row does not do — so leaving it
+# off across the board put a re-resolution pnpm would never perform in CI into
+# the two rows jerky already wins, and made the margin look bigger than it is.
+# Frozen is also what pnpm turns on by itself when `CI` is set, which is the
+# scenario those two rows are named after. Off for the two no-lockfile rows,
+# where there is no lockfile to freeze and frozen is an error.
 pnpm_trial() {
     local fixture=$1 scenario=$2
     local pin=$WORK/pnpm-pin-$fixture/pnpm-lock.yaml
+    local -a args=("${PNPM_ARGS[@]}")
+    case $scenario in
+        cold | warm) args+=(--no-frozen-lockfile) ;;
+        lockfile | noop) args+=(--frozen-lockfile) ;;
+    esac
 
     # Generated in untimed setup rather than inherited from whichever scenario
     # ran last, for the reason npm's is: depending on the order would make
     # "warm store + lockfile" quietly measure a no-lockfile install the first
-    # time it ran, which is a wrong number rather than an error.
+    # time it ran, which is a wrong number rather than an error. Necessarily
+    # not frozen — this is the install that writes the lockfile the frozen ones
+    # then install from.
     if [[ $scenario == lockfile || $scenario == noop ]] && [[ ! -f $pin ]]; then
         prepare_pnpm_project "$WORK/pnpm-proj" "$fixture"
-        (cd "$WORK/pnpm-proj" && time_ms pnpm "${PNPM_ARGS[@]}" >/dev/null)
+        (cd "$WORK/pnpm-proj" && time_ms run_pnpm "${PNPM_ARGS[@]}" --no-frozen-lockfile >/dev/null)
         mkdir -p "$(dirname "$pin")"
         cp "$WORK/pnpm-proj/pnpm-lock.yaml" "$pin"
     fi
@@ -368,17 +470,39 @@ pnpm_trial() {
         lockfile) prepare_pnpm_project "$WORK/pnpm-proj" "$fixture" "$pin" ;;
         noop)
             prepare_pnpm_project "$WORK/pnpm-proj" "$fixture" "$pin"
-            (cd "$WORK/pnpm-proj" && time_ms pnpm "${PNPM_ARGS[@]}" >/dev/null)
+            (cd "$WORK/pnpm-proj" && time_ms run_pnpm "${args[@]}" >/dev/null)
             ;;
     esac
 
-    (cd "$WORK/pnpm-proj" && time_ms pnpm "${PNPM_ARGS[@]}")
+    (cd "$WORK/pnpm-proj" && time_ms run_pnpm "${args[@]}")
 }
 
 # One trial of one scenario, for whichever tool the column belongs to. The
 # dispatch is here so the table loop below iterates over column names rather
 # than branching on a flag per column, which is what stops the header and the
 # rows from disagreeing about how many cells there are.
+#
+# The three `_trial` functions above share a shape — a four-arm `case` and a
+# trailing timed install — and are deliberately **not** folded into one
+# parameterised function. What differs between them is not a value or two:
+#
+#   - jerky wipes `$HOME`; npm wipes one cache directory; pnpm wipes three.
+#   - jerky installs from a committed pin, rewritten to name the mirror. npm
+#     and pnpm each generate their own, because neither has a committed one.
+#   - each takes a different argument array, and pnpm's varies by scenario.
+#   - only pnpm needs an `.npmrc` written before every install.
+#
+# A single function taking those would take four arrays and two paths. bash 3.2
+# has no associative arrays and cannot return an array, so they would arrive as
+# positional parameters or through `eval`-style indirect expansion — and the
+# failure mode of getting one wrong is a scenario that silently measures
+# something else, which is the exact class of bug this harness is built to
+# avoid. The shape was worth extracting where it could be checked by a test
+# (`table_header`, `table_row`, and this dispatch); the bodies were not.
+#
+# The cost is real and is the reason to write this down rather than leave it
+# implied: a fifth scenario means editing `SCENARIOS`, `label_for`, and the
+# `case` in each of the three. If that happens twice, revisit this.
 trial() {
     case $1 in
         jerky) jerky_trial "$2" "$3" ;;
@@ -429,7 +553,9 @@ record_mirror() {
     printf 'roughly 470MB for both fixtures. It resumes, so an interrupted\n' >&2
     printf 'recording can be finished by running this again.\n\n' >&2
     if ((WITH_PNPM)); then
-        printf 'Recording what pnpm asks for as well as what jerky does.\n\n' >&2
+        printf 'Recording what pnpm asks for as well as what jerky does, which is\n' >&2
+        printf 'the peer dependencies jerky never resolves — another 12%% or so on\n' >&2
+        printf 'top of that, measured on alotta-files.\n\n' >&2
     fi
 
     mirror_start "$MIRROR" "$MIRROR_LOG" --record --upstream "$UPSTREAM"
@@ -467,7 +593,7 @@ record_mirror() {
             printf '  %s: resolving with pnpm\n' "$fixture" >&2
             rm -rf "$WORK/pnpm-store" "$WORK/pnpm-cache" "$WORK/pnpm-state"
             prepare_pnpm_project "$WORK/pnpm-proj" "$fixture"
-            (cd "$WORK/pnpm-proj" && time_ms pnpm "${PNPM_ARGS[@]}" >/dev/null)
+            (cd "$WORK/pnpm-proj" && time_ms run_pnpm "${PNPM_ARGS[@]}" --no-frozen-lockfile >/dev/null)
             mirror_mark_covered "$MIRROR" pnpm "$fixture"
         fi
     done
@@ -555,13 +681,17 @@ printf 'replaying %s from %s\n' "$(mirror_summary "$MIRROR")" "$MIRROR" >&2
 npm_caveat() {
     cat <<'CAVEAT'
 
-The two columns do not count the same tree. jerky does not resolve peer
+jerky and npm do not count the same tree. jerky does not resolve peer
 dependencies yet (#34), so it installs fewer packages than npm does from the
 same manifest, and npm refuses both fixtures outright without
 `--legacy-peer-deps`, which this passes. npm also writes more files than jerky
 for the same fixture, because a hoisted tree duplicates what an isolated store
 shares. These are different trees, measured for shape rather than as a
 scoreboard.
+
+Every column here runs with lifecycle scripts off. jerky runs none at all, so
+a column that ran them would be timing an install plus a node-gyp build
+against one that was not.
 
 The two columns also do not talk to the same registry: jerky replays a local
 recording and npm fetches live, so npm's numbers carry the network and jerky's
@@ -576,25 +706,26 @@ CAVEAT
 pnpm_caveat() {
     cat <<'CAVEAT'
 
-Both columns replay the same local recording over loopback, so neither carries
-the network and the two times can be read against each other as times. That is
-what makes this column a comparison rather than a shape check.
+The pnpm column and the jerky column replay the same local recording over
+loopback. Neither carries the network, so those two times can be read against
+each other as times — which is what makes pnpm a comparison here rather than
+the shape check an npm column is. (If this table has an npm column too, that
+one still fetches live; its own caveat says so.)
 
-They do not count the same tree. jerky does not resolve peer dependencies yet
-(#34), so pnpm installs packages jerky never asks for; that is also why the
-recording has to be taken with `--pnpm` before this run can happen at all.
-The rows are two package managers each doing their own job on one manifest,
-not a scoreboard.
+jerky and pnpm do not count the same tree. jerky does not resolve peer
+dependencies yet (#34), so pnpm installs packages jerky never asks for; that is
+also why the recording has to be taken with `--pnpm` before this run can happen
+at all. The rows are two package managers each doing their own job on one
+manifest, not a scoreboard.
 
 pnpm's scenarios are the nearest equivalents rather than identical ones. Its
 "warm" is its content-addressable store plus its metadata cache, which is the
 pair jerky's warm rows mean; "no lockfile" means starting from a directory that
 has no `pnpm-lock.yaml`, since pnpm writes one on every install; and the
-lockfile rows install from a lockfile pnpm generated itself, because there is
-no committed pnpm pin the way there is a jerky-lock.json.
-
-pnpm runs with `--ignore-scripts`. jerky runs no lifecycle scripts at all, so
-leaving pnpm's on would time a node-gyp build in one column and not the other.
+lockfile rows install from a lockfile pnpm generated itself, frozen, because
+there is no committed pnpm pin the way there is a jerky-lock.json. Frozen is
+what pnpm does in CI, and it is what stops those rows timing a re-check of the
+lockfile against `package.json` that jerky's lockfile row does not perform.
 CAVEAT
 }
 
