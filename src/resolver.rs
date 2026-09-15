@@ -4,10 +4,26 @@
 //! graph, writing nothing to disk. That is what lets the tree-shape tests run
 //! with no filesystem at all, and it is why the lockfile can be a straight
 //! serialization of the result.
+//!
+//! A resolution is two passes over the same graph, and the split is the answer
+//! to a question rather than an implementation detail. **The crawl** — see
+//! [`Walk::prefetch`] — is a continuous worklist: it descends the graph on a
+//! pool of threads, and the moment a packument lands it schedules the names
+//! that packument reveals, so the whole thing is paced by the graph's longest
+//! chain rather than by its depth times the slowest fetch on each level.
+//! **The walk** — [`Walk::run`] — then builds the graph on one thread, in one
+//! fixed order, out of a memo that is already full.
+//!
+//! Keeping them apart is what makes completion order unable to reach the
+//! lockfile. The crawl decides nothing: it fills a memo keyed by package name,
+//! and a map keyed by name has the same contents whatever order it was filled
+//! in. Every decision — which version satisfies a range, which edge is
+//! recorded where, which failure is reported — is taken by the walk, which
+//! visits in the order it always has and cannot tell how its memo got full.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Condvar, Mutex};
 
 use thiserror::Error;
 
@@ -523,8 +539,107 @@ pub fn resolve(
     members: &BTreeMap<String, ImporterPath>,
 ) -> Result<ResolvedGraph, ResolveError> {
     let mut walk = Walk::seeded(registry, roots, members)?;
+    walk.prefetch();
     walk.run()?;
     Ok(walk.into_graph())
+}
+
+/// One packument per package name, shared by the crawl and the walk.
+///
+/// The one piece of state several threads touch, and it is deliberately the
+/// only one. Its contents are a function of the names asked for and nothing
+/// else — same name, same answer, whoever asked and whenever — so the order it
+/// is filled in is not observable from the outside. That is what confines the
+/// worklist's nondeterminism to a place it cannot escape from, and it is why
+/// a `HashMap` is allowed here at all despite everything downstream of it
+/// reaching the lockfile.
+#[derive(Default)]
+struct Memo {
+    state: Mutex<MemoState>,
+    landed: Condvar,
+}
+
+#[derive(Default)]
+struct MemoState {
+    /// Each entry carries the freshness it was fetched under, so a name first
+    /// seen as a range and later asked for by dist-tag is re-fetched rather
+    /// than answered from a copy that was never required to be current.
+    packuments: HashMap<String, (Arc<Packument>, Freshness)>,
+    /// Names some thread is fetching *right now*.
+    ///
+    /// Without this the crawl loses the property that one package is one
+    /// request. Two dependents asking for two different ranges of the same
+    /// name are two items on the worklist, so two workers reach the memo
+    /// together, both miss, and both fetch — a diamond paid for twice, on a
+    /// real tree several hundred times over.
+    claimed: HashSet<String>,
+}
+
+impl Memo {
+    /// The packument for `name`, current enough for `needed`, fetching it if
+    /// the memo holds nothing good enough.
+    ///
+    /// A caller that finds the name already claimed waits for the claim to
+    /// settle and then re-asks, rather than starting a second request. It
+    /// re-asks rather than taking whatever landed because the two are not the
+    /// same question: a fetch made for a range does not answer a dist-tag, and
+    /// a caller that wanted the stricter one has to go and claim it itself.
+    ///
+    /// Waiting cannot deadlock: whoever holds a claim is not waiting on
+    /// anything here, so some thread is always making progress on it.
+    fn obtain(
+        &self,
+        registry: &dyn RegistryClient,
+        name: &str,
+        needed: Freshness,
+    ) -> Result<Arc<Packument>, RegistryError> {
+        let mut state = self.state.lock().unwrap();
+        loop {
+            if let Some(packument) = state.satisfying(name, needed) {
+                return Ok(packument);
+            }
+            if !state.claimed.contains(name) {
+                break;
+            }
+            state = self.landed.wait(state).unwrap();
+        }
+        state.claimed.insert(name.to_string());
+        drop(state);
+
+        let fetched = registry.packument(name, needed);
+
+        let mut state = self.state.lock().unwrap();
+        state.claimed.remove(name);
+        let answer = fetched.map(|packument| {
+            let packument = Arc::new(packument);
+            state
+                .packuments
+                .insert(name.to_string(), (Arc::clone(&packument), needed));
+            packument
+        });
+        drop(state);
+        // A failure is released as well as a success. Nothing is recorded for
+        // it, so a waiter wakes, misses, and makes the request itself — which
+        // is what puts the failure in front of whoever can report it usefully.
+        self.landed.notify_all();
+
+        answer
+    }
+}
+
+impl MemoState {
+    /// The stored packument for `name`, if it is current enough for `needed`.
+    ///
+    /// An entry fetched under `MustBeCurrent` satisfies a later range, but not
+    /// the other way round.
+    fn satisfying(&self, name: &str, needed: Freshness) -> Option<Arc<Packument>> {
+        match self.packuments.get(name)? {
+            (packument, Freshness::MustBeCurrent) => Some(Arc::clone(packument)),
+            (packument, Freshness::MayBeCached) => {
+                (needed == Freshness::MayBeCached).then(|| Arc::clone(packument))
+            }
+        }
+    }
 }
 
 /// One dependency walk: everything it accumulates, and the steps that move it.
@@ -539,19 +654,14 @@ struct Walk<'a> {
     registry: &'a dyn RegistryClient,
     packages: BTreeMap<PackageId, ResolvedPackage>,
     importers: BTreeMap<ImporterPath, Importer>,
-    /// One request per package, however many dependents ask for it.
-    ///
-    /// A `HashMap` rather than a `BTreeMap` deliberately: it is a memo that
-    /// never reaches disk, so nothing about the result depends on the order it
-    /// is filled in, which is what lets [`Walk::warm`] fill it from several
-    /// threads at once.
-    /// Each entry carries the freshness it was fetched under, so a name first
-    /// seen as a range and later asked for by dist-tag is re-fetched rather
-    /// than answered from a copy that was never required to be current.
-    packuments: HashMap<String, (Packument, Freshness)>,
-    /// Identical `(name, range)` pairs select once.
+    /// One request per package, however many dependents ask for it. The only
+    /// field the crawl touches, and the only one behind a lock.
+    memo: Memo,
+    /// Identical `(name, range)` pairs select once. Owned by the walk thread,
+    /// which is the whole of what "selection stays single-threaded" means
+    /// here: nothing shared decides a version.
     selections: HashMap<(String, String), PackageId>,
-    /// Edges discovered but not yet visited. Drained a level at a time.
+    /// Edges discovered but not yet visited, oldest first.
     work: VecDeque<Pending>,
 }
 
@@ -580,7 +690,7 @@ impl<'a> Walk<'a> {
                 .keys()
                 .map(|importer| (importer.clone(), Importer::default()))
                 .collect(),
-            packuments: HashMap::new(),
+            memo: Memo::default(),
             selections: HashMap::new(),
             work: VecDeque::new(),
         };
@@ -626,31 +736,90 @@ impl<'a> Walk<'a> {
         Ok(walk)
     }
 
+    /// Fetch every packument the walk will ask for, as a continuous worklist.
+    ///
+    /// One item is one `(name, range)` pair. Fetching its packument is what
+    /// reveals the pairs below it, so those go on the list the moment the
+    /// fetch lands and are claimed by whichever worker is free — there is no
+    /// point at which the crawl waits for a level to finish. A chain of ten
+    /// costs ten round trips because it is ten round trips; what it no longer
+    /// costs is ten round trips *for everything else in the tree too*.
+    ///
+    /// **It decides nothing, and that is the load-bearing claim.** It writes
+    /// only [`Walk::memo`], whose contents are keyed by name and therefore
+    /// identical however the crawl was scheduled. It reads a version out of
+    /// each packument, but only to know which dependencies to ask for next —
+    /// the answer is thrown away, and [`Walk::select`] computes it again on
+    /// the walk thread from the same packument with the same function. So the
+    /// graph is not a function of this at all: run the crawl twice, or not at
+    /// all, and the walk produces the same bytes.
+    ///
+    /// Failures are dropped for the same reason the level-warming pass before
+    /// it dropped them. A name the crawl could not fetch is simply not in the
+    /// memo; the walk reaches it in its own fixed order, asks for it itself,
+    /// and reports the failure from there — which is what keeps "which error
+    /// does a user see" a question about the walk's order rather than about
+    /// which worker lost a race.
+    fn prefetch(&self) {
+        // Seeded from the importers' own declarations, which is the same set
+        // of edges `run` starts from.
+        let mut scouted: HashSet<(String, String)> = HashSet::new();
+        let seeds: Vec<Asked> = self
+            .work
+            .iter()
+            .map(|pending| pending.asked.clone())
+            .filter(|asked| scouted.insert((asked.name.clone(), asked.range.clone())))
+            .collect();
+        let scouted = Mutex::new(scouted);
+
+        pool::crawl(seeds, MAX_CONCURRENT_FETCHES, |asked, work| {
+            let needed = Self::freshness_for(&asked.range);
+            let Ok(packument) = self.memo.obtain(self.registry, &asked.name, needed) else {
+                return;
+            };
+            let Ok(version) = choose(&packument, &asked.name, &asked.range) else {
+                return;
+            };
+            // `choose` refuses a version the packument does not publish, on
+            // both of its paths, so this cannot miss.
+            let Some(metadata) = packument.versions.get(&version) else {
+                return;
+            };
+
+            // `dependencies` only, exactly as `visit` reads them: a
+            // dependency's `devDependencies` must never be followed, and
+            // `VersionMetadata` has no field they could arrive through.
+            for (name, specifier) in &metadata.dependencies {
+                let Ok(next) = Asked::read(name, specifier) else {
+                    continue;
+                };
+                let unseen = scouted
+                    .lock()
+                    .unwrap()
+                    .insert((next.name.clone(), next.range.clone()));
+                if unseen {
+                    work.push(next);
+                }
+            }
+        });
+    }
+
     /// Walk until nothing is left to visit.
     ///
-    /// A level at a time rather than an edge at a time: the whole frontier is
-    /// taken, every packument it will ask for is fetched concurrently, and
-    /// then the frontier is visited exactly as it was when each edge fetched
-    /// its own. Draining the queue and refilling it preserves the FIFO order
-    /// the single-edge loop had, so the walk visits the same edges in the same
-    /// sequence — the concurrency is confined to the fetching.
+    /// One edge at a time, oldest first, on this thread alone. After
+    /// [`Walk::prefetch`] every packument it wants is already in the memo, so
+    /// what this loop costs is arithmetic rather than round trips — but it is
+    /// written as though the memo were empty, and on the failure path it is:
+    /// a name the crawl could not fetch is requested here, and reported here.
     ///
-    /// The cost of that confinement is a barrier per level: the slowest
-    /// packument on one level holds up the next. A worklist drained by N
-    /// workers would not have it, but it would also make `packuments` and
-    /// `selections` shared mutable state, and with them the questions of which
-    /// failure gets reported and whether discovery order can reach the
-    /// lockfile. A tree's levels are few and wide — express is 69 packages in
-    /// 7 levels — so the barrier costs a handful of round trips and buys back
-    /// the entire design.
+    /// The order is the order the walk has always had, which is what makes the
+    /// error a user sees the same one on every run. It is also why there is no
+    /// machinery in this module for reconciling failures discovered out of
+    /// order — the only pass that can discover one is this one, and it takes
+    /// them one at a time.
     fn run(&mut self) -> Result<(), ResolveError> {
-        while !self.work.is_empty() {
-            let level: Vec<Pending> = self.work.drain(..).collect();
-            self.warm(&level);
-
-            for pending in level {
-                self.visit(pending)?;
-            }
+        while let Some(pending) = self.work.pop_front() {
+            self.visit(pending)?;
         }
 
         Ok(())
@@ -668,7 +837,7 @@ impl<'a> Walk<'a> {
         // Selection is keyed on the package asked for, not on the name it was
         // asked under, so two local names for one package share a node, a
         // packument and a store entry rather than each getting their own.
-        let id = self.select(&asked.name, &asked.range)?;
+        let (id, packument) = self.select(&asked.name, &asked.range)?;
 
         // Record the edge on whoever asked for it. An importer's own
         // dependency is recorded against the importer rather than against a
@@ -698,11 +867,7 @@ impl<'a> Walk<'a> {
             return Ok(());
         }
 
-        let (packument, _) = self
-            .packuments
-            .get(&id.name)
-            .expect("select fetched this packument");
-        // Both paths in `select` check membership before returning: the range
+        // Both paths in `choose` check membership before returning: the range
         // path picks from `versions_sorted`, and the tag path rejects a
         // dangling target. Neither can hand back a version that is absent.
         let metadata = packument
@@ -745,80 +910,6 @@ impl<'a> Walk<'a> {
         Ok(())
     }
 
-    /// Fetch every packument this level will ask for, concurrently, into the
-    /// memo.
-    ///
-    /// Purely a warming pass: it decides nothing and records nothing but the
-    /// memo, so [`Walk::visit`] behaves exactly as it did when it made these
-    /// requests one at a time. That is what keeps the awkward questions from
-    /// arriving with the concurrency. Which failure is reported stays the
-    /// serial walk's answer, because a failure here is simply *not* a warm
-    /// entry — the walk reaches that name in its own order, makes the request
-    /// itself, and reports it there.
-    ///
-    /// Names are deduplicated, so the diamond that made the memo worth having
-    /// is still fetched once even when both dependents sit on this level.
-    /// Below two distinct names there is nothing to overlap and no pool is
-    /// started.
-    fn warm(&mut self, level: &[Pending]) {
-        // The strictest requirement any edge on this level makes of each name.
-        // One packument serves every edge that asked for the name, so if any
-        // of them was a dist-tag the fetch has to satisfy that one.
-        let mut wanted: BTreeMap<&str, Freshness> = BTreeMap::new();
-        for pending in level {
-            let name = pending.asked.name.as_str();
-            let needed = Self::freshness_for(&pending.asked.range);
-            if self.already_have(name, needed) {
-                continue;
-            }
-            let entry = wanted.entry(name).or_insert(needed);
-            if needed == Freshness::MustBeCurrent {
-                *entry = Freshness::MustBeCurrent;
-            }
-        }
-        let wanted: Vec<(&str, Freshness)> = wanted.into_iter().collect();
-
-        if wanted.len() < 2 {
-            return;
-        }
-
-        let registry = self.registry;
-        let fetched: Mutex<Vec<(String, Packument, Freshness)>> = Mutex::new(Vec::new());
-
-        // The error is discarded rather than propagated, and that is the whole
-        // trick: see the note above on which failure a user sees. `drain`
-        // stopping on the first failure is what keeps the wasted requests to
-        // the names already claimed rather than the whole level.
-        let _: Result<(), RegistryError> =
-            pool::drain(&wanted, MAX_CONCURRENT_FETCHES, |(name, freshness)| {
-                let packument = registry.packument(name, *freshness)?;
-                fetched
-                    .lock()
-                    .unwrap()
-                    .push(((*name).to_string(), packument, *freshness));
-                Ok(())
-            });
-
-        // Insertion order cannot matter — the keys are distinct names and the
-        // memo never reaches disk — which is why it is allowed to be a
-        // `HashMap` at all.
-        for (name, packument, freshness) in fetched.into_inner().unwrap() {
-            self.packuments.insert(name, (packument, freshness));
-        }
-    }
-
-    /// Is the memo already good enough for this requirement?
-    ///
-    /// An entry fetched under `MustBeCurrent` satisfies a later range, but not
-    /// the other way round.
-    fn already_have(&self, name: &str, needed: Freshness) -> bool {
-        match self.packuments.get(name) {
-            None => false,
-            Some((_, Freshness::MustBeCurrent)) => true,
-            Some((_, Freshness::MayBeCached)) => needed == Freshness::MayBeCached,
-        }
-    }
-
     /// What a spec requires of the registry.
     ///
     /// A range names a set, and a version that satisfied it a few hours ago
@@ -839,70 +930,39 @@ impl<'a> Walk<'a> {
         }
     }
 
-    /// Choose the concrete version satisfying one `(name, range)` pair,
-    /// fetching and caching the packument as needed.
-    fn select(&mut self, name: &str, range: &str) -> Result<PackageId, ResolveError> {
+    /// Choose the concrete version satisfying one `(name, range)` pair, and
+    /// hand back the packument it was chosen from.
+    ///
+    /// The packument comes back with it because [`Walk::visit`] needs the same
+    /// one to read the chosen version's tarball, integrity and edges. Looking
+    /// it up a second time would be a second chance to disagree about which
+    /// freshness was asked for, on a path where disagreeing means recording a
+    /// hash from one copy and a URL from another.
+    ///
+    /// Only ever called on the walk thread. The memo may have been filled by
+    /// the crawl, but which version a range selects is decided here and
+    /// nowhere else.
+    fn select(
+        &mut self,
+        name: &str,
+        range: &str,
+    ) -> Result<(PackageId, Arc<Packument>), ResolveError> {
+        let packument = self
+            .memo
+            .obtain(self.registry, name, Self::freshness_for(range))?;
+
         let key = (name.to_string(), range.to_string());
         if let Some(id) = self.selections.get(&key) {
-            return Ok(id.clone());
+            return Ok((id.clone(), packument));
         }
 
-        let needed = Self::freshness_for(range);
-        if !self.already_have(name, needed) {
-            let packument = self.registry.packument(name, needed)?;
-            self.packuments
-                .insert(name.to_string(), (packument, needed));
-        }
-        let packument = &self.packuments[name].0;
-
-        // Range syntax is tried first, and a dist-tag is only the fallback for a
-        // spec that is not a range at all. npm resolves in this order for a
-        // reason: were tags consulted first, a registry could publish a tag named
-        // `^1.0.0` and silently override what that range means.
-        let version = match Range::parse(range) {
-            Ok(parsed) => {
-                let available = packument.versions_sorted();
-                match parsed.max_satisfying(&available) {
-                    Some(chosen) => chosen.as_str().to_string(),
-                    None => {
-                        return Err(ResolveError::Unsatisfiable {
-                            name: name.to_string(),
-                            range: range.to_string(),
-                            available: available.iter().map(|v| v.as_str().to_string()).collect(),
-                        });
-                    }
-                }
-            }
-            Err(_) => match packument.resolve_tag(range) {
-                Some(tagged) => {
-                    // A tag is a pointer the registry maintains, and it can dangle:
-                    // unpublishing a version leaves the tag behind. Trusting it
-                    // blindly would panic on the lookup further down.
-                    if !packument.versions.contains_key(tagged) {
-                        return Err(ResolveError::DanglingTag {
-                            name: name.to_string(),
-                            tag: range.to_string(),
-                            version: tagged.to_string(),
-                        });
-                    }
-                    tagged.to_string()
-                }
-                None => {
-                    return Err(ResolveError::UnresolvableSpec {
-                        name: name.to_string(),
-                        spec: range.to_string(),
-                        tags: packument.dist_tags.keys().cloned().collect(),
-                    });
-                }
-            },
-        };
-
+        let version = choose(&packument, name, range)?;
         let id = PackageId {
             name: name.to_string(),
             version,
         };
         self.selections.insert(key, id.clone());
-        Ok(id)
+        Ok((id, packument))
     }
 
     fn into_graph(self) -> ResolvedGraph {
@@ -910,6 +970,55 @@ impl<'a> Walk<'a> {
             importers: self.importers,
             packages: self.packages,
         }
+    }
+}
+
+/// Which version of `packument` a spec selects.
+///
+/// A free function and a pure one, because two passes have to agree about it
+/// exactly: [`Walk::select`] takes the answer as the graph's, and
+/// [`Walk::prefetch`] takes it only to know which dependencies to ask the
+/// registry for next. Two spellings of this rule would be two chances for the
+/// crawl to fetch a version's dependencies that the walk then does not use —
+/// which would not be wrong, only wasteful, and silently so.
+///
+/// Range syntax is tried first, and a dist-tag is only the fallback for a spec
+/// that is not a range at all. npm resolves in this order for a reason: were
+/// tags consulted first, a registry could publish a tag named `^1.0.0` and
+/// silently override what that range means.
+fn choose(packument: &Packument, name: &str, range: &str) -> Result<String, ResolveError> {
+    match Range::parse(range) {
+        Ok(parsed) => {
+            let available = packument.versions_sorted();
+            match parsed.max_satisfying(&available) {
+                Some(chosen) => Ok(chosen.as_str().to_string()),
+                None => Err(ResolveError::Unsatisfiable {
+                    name: name.to_string(),
+                    range: range.to_string(),
+                    available: available.iter().map(|v| v.as_str().to_string()).collect(),
+                }),
+            }
+        }
+        Err(_) => match packument.resolve_tag(range) {
+            Some(tagged) => {
+                // A tag is a pointer the registry maintains, and it can dangle:
+                // unpublishing a version leaves the tag behind. Trusting it
+                // blindly would panic on the lookup the caller makes next.
+                if !packument.versions.contains_key(tagged) {
+                    return Err(ResolveError::DanglingTag {
+                        name: name.to_string(),
+                        tag: range.to_string(),
+                        version: tagged.to_string(),
+                    });
+                }
+                Ok(tagged.to_string())
+            }
+            None => Err(ResolveError::UnresolvableSpec {
+                name: name.to_string(),
+                spec: range.to_string(),
+                tags: packument.dist_tags.keys().cloned().collect(),
+            }),
+        },
     }
 }
 

@@ -277,6 +277,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   rate-limited revalidation is reported as one, where the only status that path
   reads as an answer is the `304` it asked for
   ([#82](https://github.com/jerky-build/jerky/issues/82)).
+- **Resolution no longer waits for a whole level of the tree before starting
+  the next one.** jerky used to fetch every packument one depth of the
+  dependency graph wanted, wait for the slowest of them, and only then look at
+  what they depended on — so a cold resolve cost the graph's depth times its
+  slowest fetch per level, and `alotta-packages` is ten levels deep. A
+  completed packument now schedules the packages it names immediately, so what
+  a cold resolve waits for is the longest single chain of dependencies rather
+  than the depth of the tree multiplied by its unluckiest fetch. The saving is
+  a network one and shows up where round trips are slow and uneven: over the
+  benchmark's local replay mirror, where a packument arrives in about a
+  millisecond, it is inside the run-to-run noise
+  ([#87](https://github.com/jerky-build/jerky/issues/87)).
+
+  **It resolves to the same bytes.** Which version satisfies a range is still
+  decided on one thread, in the order the walk has always taken, from a
+  packument cache that is keyed by package name and therefore holds the same
+  thing whatever order it was filled in — so the order answers arrive in
+  cannot reach the lockfile. Six cold resolutions of `alotta-files` produce one
+  byte-identical 1291-package lockfile, and it is the same file the previous
+  resolver wrote. The freshness rule is untouched: a range may still be
+  answered from the cache and a dist-tag still reaches the registry every time.
 
 ### Removed
 

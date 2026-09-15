@@ -188,7 +188,7 @@ pub fn build_tarball(entries: &[TarEntry<'_>]) -> Vec<u8> {
     encoder.finish().expect("in-memory gzip cannot fail")
 }
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
@@ -224,6 +224,15 @@ const RENDEZVOUS_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Debug)]
 struct Rendezvous {
     width: usize,
+    /// The names that meet here, or `None` for every caller.
+    ///
+    /// A gate every caller meets can only ever prove that callers *on one
+    /// level* overlapped, because the gate is synchronous: nothing it holds
+    /// completes, so nothing below it is ever discovered. Naming the
+    /// participants is what lets a test hold one fetch open while the walk
+    /// descends past it on another branch, which is the only way to put two
+    /// different depths in flight at once.
+    only: Option<BTreeSet<String>>,
     state: Mutex<RendezvousState>,
     arrived: Condvar,
 }
@@ -251,8 +260,26 @@ impl Rendezvous {
     fn new(width: usize) -> Self {
         Self {
             width,
+            only: None,
             state: Mutex::new(RendezvousState::default()),
             arrived: Condvar::new(),
+        }
+    }
+
+    /// A rendezvous only these names meet. Everything else passes straight
+    /// through without waiting and without being counted.
+    fn only(names: &[&str], width: usize) -> Self {
+        Self {
+            only: Some(names.iter().map(|name| (*name).to_string()).collect()),
+            ..Self::new(width)
+        }
+    }
+
+    /// Does `name` meet this gate at all?
+    fn admits(&self, name: &str) -> bool {
+        match &self.only {
+            None => true,
+            Some(only) => only.contains(name),
         }
     }
 
@@ -574,6 +601,23 @@ impl FixtureRegistry {
         self
     }
 
+    /// Make the `packument` calls for these names — and only these — wait
+    /// until `width` of them are in flight.
+    ///
+    /// What [`Self::with_packument_rendezvous`] cannot express. That gate
+    /// stops every caller, so the only fetches that can ever meet at it are
+    /// ones the resolver had already started together; a fetch it is holding
+    /// never completes, so nothing that depends on it is ever discovered, and
+    /// a level-synchronous walk and a continuous one are indistinguishable.
+    /// Naming the participants leaves every other fetch free to complete, so
+    /// the walk goes on descending past a held one — and a gate naming a
+    /// package at depth 0 and another at depth N is met only if those two
+    /// depths were genuinely in flight together.
+    pub fn with_packument_rendezvous_for(mut self, names: &[&str], width: usize) -> Self {
+        self.packument_rendezvous = Some(Rendezvous::only(names, width));
+        self
+    }
+
     /// Whether the packument rendezvous was satisfied rather than timed out.
     pub fn packuments_met_rendezvous(&self) -> bool {
         self.packument_rendezvous
@@ -640,7 +684,9 @@ impl RegistryClient for FixtureRegistry {
             .or_insert(0) += 1;
 
         InFlight::enter(&self.packuments_in_flight);
-        if let Some(rendezvous) = &self.packument_rendezvous {
+        if let Some(rendezvous) = &self.packument_rendezvous
+            && rendezvous.admits(name)
+        {
             rendezvous.meet();
         }
         let answer = self

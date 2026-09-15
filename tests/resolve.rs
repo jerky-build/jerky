@@ -726,6 +726,89 @@ fn a_level_wider_than_the_cap_still_reaches_it() {
     );
 }
 
+/// A chain of `depth` packages named `<prefix>0` .. `<prefix>{depth-1}`, each
+/// declaring the next.
+///
+/// A chain is the shape a level-synchronous walk is worst at, and the shape a
+/// worklist cannot speed up on its own: every link is on the critical path, so
+/// its packuments are fetched one after another either way. What a worklist
+/// changes is what may happen *beside* it, which is what the tests below hold
+/// a second branch open to observe.
+fn chain(mut registry: FixtureRegistry, prefix: &str, depth: usize) -> FixtureRegistry {
+    for step in 0..depth {
+        let name = format!("{prefix}{step}");
+        let next = format!("{prefix}{}", step + 1);
+        let edges: &[(&str, &str)] = if step + 1 < depth {
+            &[(next.as_str(), "^1.0.0")]
+        } else {
+            &[]
+        };
+        registry = registry.with_packument(&name, &[("1.0.0", edges)]);
+    }
+    registry
+}
+
+#[test]
+fn a_fetch_at_one_depth_overlaps_a_fetch_at_another() {
+    // The claim the worklist exists to make. `held` is a dependency of the
+    // importer, so it is requested in the walk's first breath, and the gate
+    // holds it open. Beside it a chain descends six packuments, and the gate
+    // opens only when the *deepest* of them arrives — so a depth-0 fetch and a
+    // depth-5 fetch were provably in flight at one moment.
+    //
+    // A level-synchronous walk cannot satisfy this at any speed. `held` and
+    // `chain0` share the first level, and the barrier at the end of that level
+    // waits for `held`, which is never coming; `chain1` is not so much as
+    // requested. It blocks until the gate gives up and reports itself broken,
+    // which is what makes this a discriminator rather than a race that usually
+    // passes.
+    const DEPTH: usize = 6;
+    let deepest = format!("chain{}", DEPTH - 1);
+
+    let registry = chain(FixtureRegistry::new(), "chain", DEPTH)
+        .with_packument("held", &[("1.0.0", &[])])
+        .with_packument_rendezvous_for(&["held", deepest.as_str()], 2);
+
+    resolve(
+        &registry,
+        &roots(&[("held", "^1.0.0"), ("chain0", "^1.0.0")]),
+        &no_members(),
+    )
+    .unwrap();
+
+    assert!(
+        registry.packuments_met_rendezvous(),
+        "the deepest packument was never in flight while a depth-0 fetch was, \
+         so the walk is still paced one level at a time"
+    );
+}
+
+#[test]
+fn three_different_depths_are_in_flight_together() {
+    // The same trick twice over, and the reason the pair above is not the
+    // whole claim: depth 0, depth 2 and depth 5 all wait at one gate three
+    // wide. Holding `mid2` open does not stop the `deep` branch descending
+    // past it, so the gate opens only if three distinct depths overlapped —
+    // not merely two.
+    let registry = chain(FixtureRegistry::new(), "mid", 3);
+    let registry = chain(registry, "deep", 6)
+        .with_packument("held", &[("1.0.0", &[])])
+        .with_packument_rendezvous_for(&["held", "mid2", "deep5"], 3);
+
+    resolve(
+        &registry,
+        &roots(&[("held", "^1.0.0"), ("mid0", "^1.0.0"), ("deep0", "^1.0.0")]),
+        &no_members(),
+    )
+    .unwrap();
+
+    assert!(
+        registry.packuments_met_rendezvous(),
+        "three depths never overlapped, so fetching is still bounded by the \
+         slowest packument on each level"
+    );
+}
+
 #[test]
 fn a_package_two_dependents_share_is_still_fetched_once() {
     // The memo that stops a diamond being fetched twice is the thing
@@ -833,6 +916,150 @@ fn the_same_tree_resolves_identically_every_time() {
     assert!(
         first.contains("leaf@1.0.0"),
         "the walk never reached the deepest package: {first}"
+    );
+}
+
+/// A registry that answers packuments in a deliberately varied order.
+///
+/// The one thing a continuous worklist adds that a level-synchronous walk did
+/// not have is that *when* a packument lands is no longer fixed, and a test
+/// that resolved the same tree twenty times and hoped the machine would shake
+/// it would be testing the scheduler rather than the resolver — on an idle box
+/// a small tree is likely to complete in the same order every time.
+///
+/// So the order is permuted on purpose: each answer is held back by an amount
+/// derived from the package's name *and a per-run seed*, so a different name
+/// wins the race on each run. The order is also recorded, which is the half
+/// that makes this adversarial rather than hopeful — the test asserts the
+/// order genuinely varied before it claims anything about the lockfiles.
+struct Jumbled {
+    inner: FixtureRegistry,
+    seed: u64,
+    completed: std::sync::Mutex<Vec<String>>,
+}
+
+impl Jumbled {
+    fn new(inner: FixtureRegistry, seed: u64) -> Self {
+        Self {
+            inner,
+            seed,
+            completed: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// The order the registry finished answering in, as one comparable string.
+    fn completion_order(&self) -> String {
+        self.completed.lock().unwrap().join(",")
+    }
+
+    /// Hold this answer back for a while that depends on the name and the run.
+    ///
+    /// Not a hash anything relies on; it only has to scramble a dozen names
+    /// into a different order for each seed. The delays are sub-millisecond,
+    /// so a run costs about as long as the tree is deep.
+    fn hold(&self, name: &str) {
+        let mut mixed = self.seed.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        for byte in name.bytes() {
+            mixed = mixed
+                .rotate_left(7)
+                .wrapping_add(u64::from(byte))
+                .wrapping_mul(0x0000_0001_0000_01b3);
+        }
+        std::thread::sleep(std::time::Duration::from_micros(200 * (mixed % 12)));
+    }
+}
+
+impl jerky::registry::RegistryClient for Jumbled {
+    fn version_metadata(
+        &self,
+        name: &str,
+        version: &str,
+    ) -> Result<jerky::registry::VersionMetadata, RegistryError> {
+        self.inner.version_metadata(name, version)
+    }
+
+    fn packument_conditional(
+        &self,
+        name: &str,
+        etag: Option<&str>,
+    ) -> Result<jerky::registry::Fetched, RegistryError> {
+        self.hold(name);
+        let answer = self.inner.packument_conditional(name, etag);
+        self.completed.lock().unwrap().push(name.to_string());
+        answer
+    }
+
+    fn fetch_tarball(&self, url: &str) -> Result<Vec<u8>, RegistryError> {
+        self.inner.fetch_tarball(url)
+    }
+}
+
+#[test]
+fn the_lockfile_is_the_same_bytes_whatever_order_packuments_land_in() {
+    // The gate on this whole design. Compared as the *serialized file* rather
+    // than as a graph, because that is what two machines have to agree on and
+    // because a comparison of the in-memory shape would pass against a
+    // `BTreeMap` that had quietly been fed different contents.
+    // Three importers, and `apps/web` is there for one reason: it asks for
+    // `r2` at `^1.0.0` while `right` asks for it at `^2.0.0`. That is the pair
+    // a worklist puts in flight together and the pair that has to come back as
+    // two nodes — a memo or a selection keyed on the *name* would let whichever
+    // landed first decide what the other importer got, which is exactly the
+    // failure this test exists to catch and exactly the one a level-synchronous
+    // walk could not have.
+    let roots = BTreeMap::from([
+        (
+            ImporterPath::root(),
+            section(&[("app", "^1.0.0")], Kind::Prod),
+        ),
+        (
+            ImporterPath::new("packages/ui").unwrap(),
+            section(&[("left", "^1.0.0")], Kind::Dev),
+        ),
+        (
+            ImporterPath::new("apps/web").unwrap(),
+            section(&[("r2", "^1.0.0"), ("shared", "^1.0.0")], Kind::Prod),
+        ),
+    ]);
+
+    let mut lockfiles: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
+    let mut orders = std::collections::BTreeSet::new();
+
+    for seed in 1..=24u64 {
+        let registry = Jumbled::new(tangled(), seed);
+        let graph = resolve(&registry, &roots, &no_members()).unwrap();
+
+        let dir = tempfile::TempDir::new().unwrap();
+        jerky::lockfile::save(&graph, dir.path()).unwrap();
+        let written = std::fs::read(dir.path().join(jerky::lockfile::LOCKFILE_NAME)).unwrap();
+
+        let text = String::from_utf8_lossy(&written).into_owned();
+        assert!(
+            text.contains("leaf@1.0.0"),
+            "the walk never reached the deepest package, so this proves nothing"
+        );
+        assert!(
+            text.contains("r2@1.0.0") && text.contains("r2@2.0.0"),
+            "the contested name came back as one node, so the two ranges did \
+             not both survive: {text}"
+        );
+        lockfiles.insert(written);
+        orders.insert(registry.completion_order());
+    }
+
+    // Checked first and deliberately: without it a resolver that had gone
+    // fully serial would pass this test while testing nothing at all.
+    assert!(
+        orders.len() > 1,
+        "packuments completed in the same order every run, so the ordering \
+         hazard was never exercised: {orders:?}"
+    );
+    assert_eq!(
+        lockfiles.len(),
+        1,
+        "the lockfile varied with the order packuments landed in, across \
+         {} distinct completion orders",
+        orders.len()
     );
 }
 
