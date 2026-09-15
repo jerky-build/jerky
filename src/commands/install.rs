@@ -430,7 +430,7 @@ pub fn sync(
     // there is no latency to hide, and keeping one writer means the tree is
     // built the same way every run.
     for (id, package) in &graph.packages {
-        let entry = store.entry_path(&package.integrity.store_key());
+        let entry = store.entry_path(&package.integrity);
         let virtual_dir =
             linker::populate_virtual_store(&entry, &node_modules, &id.to_string(), &id.name)?;
         entries.insert(id.clone(), virtual_dir);
@@ -720,7 +720,7 @@ fn fetch_missing(
     let missing: Vec<(&PackageId, &ResolvedPackage)> = graph
         .packages
         .iter()
-        .filter(|(_, package)| !store.contains(&package.integrity.store_key()))
+        .filter(|(_, package)| !store.contains(&package.integrity))
         .collect();
 
     if missing.is_empty() {
@@ -767,7 +767,7 @@ fn fetch_one(
     // the key is the content hash. Two workers asked for the same entry —
     // which cannot happen within one install, but can across concurrent
     // processes — both end up correct.
-    store.commit(&package.integrity.store_key(), |staging| {
+    store.commit(&package.integrity, |staging| {
         archive::extract(&tarball, staging)
     })?;
 
