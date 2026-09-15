@@ -281,11 +281,12 @@ impl jerky::registry::RegistryClient for HandBuilt {
         unreachable!("the resolver only fetches packuments")
     }
 
-    fn packument(
+    fn packument_conditional(
         &self,
         name: &str,
-    ) -> Result<jerky::registry::Packument, jerky::registry::RegistryError> {
-        use jerky::registry::{Dist, Packument, VersionMetadata};
+        _etag: Option<&str>,
+    ) -> Result<jerky::registry::Fetched, jerky::registry::RegistryError> {
+        use jerky::registry::{Dist, Fetched, Packument, VersionMetadata};
 
         let versions = self
             .versions
@@ -310,14 +311,17 @@ impl jerky::registry::RegistryClient for HandBuilt {
             })
             .collect();
 
-        Ok(Packument {
-            name: name.to_string(),
-            versions,
-            dist_tags: self
-                .tags
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect(),
+        Ok(Fetched::Body {
+            packument: Box::new(Packument {
+                name: name.to_string(),
+                versions,
+                dist_tags: self
+                    .tags
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            }),
+            etag: None,
         })
     }
 
@@ -563,15 +567,21 @@ impl jerky::registry::RegistryClient for RawRegistry {
         ))
     }
 
-    fn packument(
+    fn packument_conditional(
         &self,
         name: &str,
-    ) -> Result<jerky::registry::Packument, jerky::registry::RegistryError> {
+        _etag: Option<&str>,
+    ) -> Result<jerky::registry::Fetched, jerky::registry::RegistryError> {
         let raw = self
             .packuments
             .get(name)
             .ok_or_else(|| jerky::registry::RegistryError::PackageNotFound(name.to_string()))?;
-        Ok(serde_json::from_str(raw).expect("the fixture JSON is well formed"))
+        Ok(jerky::registry::Fetched::Body {
+            packument: Box::new(
+                serde_json::from_str(raw).expect("the fixture JSON is well formed"),
+            ),
+            etag: None,
+        })
     }
 
     fn fetch_tarball(&self, url: &str) -> Result<Vec<u8>, jerky::registry::RegistryError> {
@@ -1121,5 +1131,92 @@ fn two_importers_aliasing_one_package_share_its_node() {
             Resolution::Registry(id) => assert_eq!(id.to_string(), "string-width@4.2.3"),
             other => panic!("expected a registry resolution, got {other:?}"),
         }
+    }
+}
+
+/// The freshness rule, end to end through a real resolve.
+///
+/// Unit tests cover the cache's policy in isolation; these prove the resolver
+/// actually asks for what it should. The distinction matters because the
+/// requirement is computed from the *specifier*, several layers above the
+/// thing that honours it.
+mod freshness {
+    use super::*;
+
+    use std::time::Duration;
+
+    use jerky::metadata_cache::{CachedRegistry, DEFAULT_WINDOW, MetadataCache};
+    use jerky::testing::FixtureRegistry;
+
+    fn fixture() -> FixtureRegistry {
+        FixtureRegistry::new().with_packument("a", &[("1.0.0", &[]), ("2.0.0", &[])])
+    }
+
+    fn cached(dir: &tempfile::TempDir, window: Duration) -> CachedRegistry<FixtureRegistry> {
+        CachedRegistry::new(fixture(), MetadataCache::new(dir.path(), window))
+    }
+
+    #[test]
+    fn a_range_is_answered_from_the_cache_on_the_second_resolve() {
+        // The whole point: an install that re-resolves an unchanged manifest
+        // inside the window reaches the registry not at all.
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let first = cached(&dir, DEFAULT_WINDOW);
+        resolve(&first, &roots(&[("a", "^1.0.0")]), &no_members()).unwrap();
+        assert_eq!(
+            first.inner().packument_calls_for("a"),
+            1,
+            "a cold cache must fetch"
+        );
+
+        // A second resolver over the same cache directory, standing in for a
+        // second `jerky install` in the same project.
+        let second = cached(&dir, DEFAULT_WINDOW);
+        resolve(&second, &roots(&[("a", "^1.0.0")]), &no_members()).unwrap();
+        assert_eq!(
+            second.inner().packument_calls_for("a"),
+            0,
+            "a range inside the window must not reach the registry"
+        );
+    }
+
+    #[test]
+    fn a_dist_tag_reaches_the_registry_even_with_a_warm_cache() {
+        // jerky promises that only the registry can say what `latest` means
+        // today. The window must not quietly answer that question.
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let first = cached(&dir, DEFAULT_WINDOW);
+        resolve(&first, &roots(&[("a", "latest")]), &no_members()).unwrap();
+        assert_eq!(first.inner().packument_calls_for("a"), 1);
+
+        let second = cached(&dir, DEFAULT_WINDOW);
+        resolve(&second, &roots(&[("a", "latest")]), &no_members()).unwrap();
+        assert_eq!(
+            second.inner().packument_calls_for("a"),
+            1,
+            "a dist-tag must ask every time, warm cache or not"
+        );
+    }
+
+    #[test]
+    fn a_cached_range_does_not_satisfy_a_later_dist_tag() {
+        // The memo case. One packument serves every edge that names the
+        // package, so an entry fetched for a range must not be handed to a tag
+        // that demanded the registry — within one run or across two.
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let ranged = cached(&dir, DEFAULT_WINDOW);
+        resolve(&ranged, &roots(&[("a", "^1.0.0")]), &no_members()).unwrap();
+        assert_eq!(ranged.inner().packument_calls_for("a"), 1);
+
+        let tagged = cached(&dir, DEFAULT_WINDOW);
+        resolve(&tagged, &roots(&[("a", "latest")]), &no_members()).unwrap();
+        assert_eq!(
+            tagged.inner().packument_calls_for("a"),
+            1,
+            "a warm entry fetched for a range must not answer a dist-tag"
+        );
     }
 }

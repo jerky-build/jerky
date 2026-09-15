@@ -10,6 +10,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Registry metadata is cached on disk, in `~/.jerky/cache` beside the store.
+  A packument answers from there for **24 hours** without reaching the
+  registry at all, so re-resolving a manifest you just edited — the most
+  common install there is — now does no network work for metadata. Measured on
+  a 2910-package tree: the metadata walk was ~9s of round trips, and inside the
+  window it is none. Past 24 hours an entry is *revalidated* rather than
+  re-downloaded: jerky sends the stored `ETag`, and a `304` re-stamps the entry
+  as current without moving a byte of body, which on that tree is 0.7 MB
+  instead of 470 MB.
+
+  **A dist-tag still asks every time.** `jerky install lodash`, `react@next` or
+  a `"latest"` in a `package.json` reaches the registry however warm the cache
+  is, because only the registry can say what a tag points at today — the
+  promise below, kept. The request is conditional, so it is usually a `304`
+  rather than a download. A range or an exact version is answered from the
+  window, which is sound because a version that satisfied `^4.0.0` a few hours
+  ago satisfies it still.
+
+  **If the registry cannot be reached and the entry is past its window, the
+  install stops** rather than resolving from it. The window is what bounds how
+  stale an answer may be, and quietly serving a lapsed entry because the
+  network happened to be down would remove that bound exactly when nobody is
+  watching. The error says how old the cached copy is so you can decide what to
+  do about it. Inside the window there is no request to fail, so a fresh cache
+  resolves offline as a matter of course
+  ([#70](https://github.com/jerky-build/jerky/issues/70)).
+
 - Scoped packages install. `@types/node` and every `@babel/*`, `@eslint/*` and
   `@nodelib/*` a real tree pulls in now resolve, download and link, where
   before the install died on the first one with an `ENOENT` from the rename

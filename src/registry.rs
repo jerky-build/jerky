@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::integrity::{Integrity, IntegrityError};
@@ -39,6 +39,22 @@ pub enum RegistryError {
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+    // Deliberately says what is on disk and how old it is, rather than only
+    // that the network failed. The user's next decision is whether to wait for
+    // a network or to change what they asked for, and the age of what jerky
+    // already has is what informs it.
+    #[error(
+        "could not reach the registry for `{name}`, and the cached copy is \
+         {days}d {hours}h old — past the freshness window, so jerky will not \
+         resolve from it"
+    )]
+    StaleCacheOnly {
+        name: String,
+        days: u64,
+        hours: u64,
+        #[source]
+        source: Box<RegistryError>,
+    },
     #[error("the registry returned a response jerky could not understand for {url}")]
     MalformedResponse {
         url: String,
@@ -49,7 +65,7 @@ pub enum RegistryError {
 
 /// The subset of a version manifest jerky needs. Unknown fields are ignored,
 /// so registry additions do not break deserialization.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct VersionMetadata {
     pub name: String,
     pub version: String,
@@ -64,7 +80,7 @@ pub struct VersionMetadata {
 }
 
 /// Every published version of one package, in the registry's abbreviated form.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Packument {
     pub name: String,
     #[serde(default)]
@@ -98,7 +114,7 @@ impl Packument {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Dist {
     pub tarball: String,
     #[serde(default)]
@@ -121,6 +137,33 @@ impl Dist {
     }
 }
 
+/// How current an answer has to be.
+///
+/// Carried by the caller rather than decided by the client, because only the
+/// caller knows what was asked. A range names a set of versions and any
+/// member of it that was valid a few hours ago is still a member; a dist-tag
+/// names whatever the registry means by it *today*, so `latest` answered from
+/// a day-old copy is a different question answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Freshness {
+    /// A cache inside its freshness window may answer this without asking.
+    MayBeCached,
+    /// The registry must be asked. A conditional request satisfies this — a
+    /// `304` is the registry stating, just now, that the copy is current.
+    MustBeCurrent,
+}
+
+/// What a conditional fetch came back with.
+#[derive(Debug)]
+pub enum Fetched {
+    /// The registry confirmed the caller's copy is current. No body.
+    NotModified,
+    Body {
+        packument: Box<Packument>,
+        etag: Option<String>,
+    },
+}
+
 /// Everything jerky needs from a package registry.
 ///
 /// The trait exists so the install pipeline can be driven by a fixture in
@@ -138,8 +181,36 @@ pub trait RegistryClient: Sync {
     fn version_metadata(&self, name: &str, version: &str)
     -> Result<VersionMetadata, RegistryError>;
 
+    /// Every published version of a package, optionally conditionally.
+    ///
+    /// The primitive rather than a convenience: a cache needs to ask "is my
+    /// copy still current" and get an answer cheaper than a body, and a client
+    /// that could only return bodies would make the cache re-download
+    /// everything it revalidated. Passing `None` always yields a `Body`.
+    fn packument_conditional(
+        &self,
+        name: &str,
+        etag: Option<&str>,
+    ) -> Result<Fetched, RegistryError>;
+
     /// Every published version of a package, for range resolution.
-    fn packument(&self, name: &str) -> Result<Packument, RegistryError>;
+    ///
+    /// The default ignores `freshness` and always fetches, which is right for
+    /// any client with nothing stored: it is already as current as it can be.
+    /// Only a caching client overrides this.
+    fn packument(&self, name: &str, freshness: Freshness) -> Result<Packument, RegistryError> {
+        let _ = freshness;
+        match self.packument_conditional(name, None)? {
+            Fetched::Body { packument, .. } => Ok(*packument),
+            // Unreachable over HTTP — a server may only answer `304` to a
+            // conditional request, and none was made. Reported rather than
+            // panicked because it describes a peer misbehaving, not a bug here.
+            Fetched::NotModified => Err(RegistryError::MalformedResponse {
+                url: name.to_string(),
+                source: "the registry answered 304 to an unconditional request".into(),
+            }),
+        }
+    }
 
     fn fetch_tarball(&self, url: &str) -> Result<Vec<u8>, RegistryError>;
 }
@@ -273,6 +344,73 @@ impl HttpRegistry {
         })
     }
 
+    /// Fetch a packument, sending `If-None-Match` when the caller has an ETag.
+    ///
+    /// `Ok(None)` is a `304`. ureq surfaces it as a successful response rather
+    /// than an error — it is not a 4xx and carries no `Location` to follow —
+    /// so the status is read rather than matched on an error variant, which is
+    /// the detail that makes revalidation work at all.
+    ///
+    /// Separate from `get_json` rather than another flag on it: this one needs
+    /// a response header and a status code back, and threading two more
+    /// out-parameters through the shared helper for the sake of one caller
+    /// would make the simple endpoint read like the complicated one.
+    fn get_packument(
+        &self,
+        url: &str,
+        etag: Option<&str>,
+        not_found: impl Fn() -> RegistryError,
+    ) -> Result<Option<(String, Option<String>)>, RegistryError> {
+        Self::with_retries(|| {
+            let mut request = self
+                .agent
+                .get(url)
+                // The unabbreviated document for a popular package is
+                // megabytes of every version ever published, so this is not
+                // an optimisation.
+                .header("Accept", "application/vnd.npm.install-v1+json");
+            if let Some(etag) = etag {
+                request = request.header("If-None-Match", etag);
+            }
+
+            match request.call() {
+                Ok(mut response) => {
+                    if response.status().as_u16() == 304 {
+                        return Ok(None);
+                    }
+                    let etag = response
+                        .headers()
+                        .get("etag")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string);
+                    response
+                        .body_mut()
+                        .with_config()
+                        .limit(MAX_METADATA_BYTES)
+                        .read_to_string()
+                        .map(|body| Some((body, etag)))
+                        .map_err(|source| {
+                            (
+                                RegistryError::MalformedResponse {
+                                    url: url.to_string(),
+                                    source: Box::new(source),
+                                },
+                                Retry::Yes,
+                            )
+                        })
+                }
+                Err(ureq::Error::StatusCode(404)) => Err((not_found(), Retry::No)),
+                Err(source) => Err((
+                    RegistryError::Network {
+                        url: url.to_string(),
+                        source: Box::new(source),
+                    },
+                    Retry::Yes,
+                )),
+            }
+        })
+    }
+
     /// Does this package exist at all? Used only on the error path, to turn a
     /// 404 into either `PackageNotFound` or `VersionNotFound`.
     fn package_exists(&self, name: &str) -> bool {
@@ -308,16 +446,28 @@ impl RegistryClient for HttpRegistry {
         })
     }
 
-    fn packument(&self, name: &str) -> Result<Packument, RegistryError> {
+    fn packument_conditional(
+        &self,
+        name: &str,
+        etag: Option<&str>,
+    ) -> Result<Fetched, RegistryError> {
         let url = format!("{}/{}", self.base_url, Self::encode_name(name));
 
-        let body = self.get_json(&url, true, || {
+        let Some((body, etag)) = self.get_packument(&url, etag, || {
             RegistryError::PackageNotFound(name.to_string())
-        })?;
+        })?
+        else {
+            return Ok(Fetched::NotModified);
+        };
 
-        serde_json::from_str(&body).map_err(|source| RegistryError::MalformedResponse {
-            url,
-            source: Box::new(source),
+        let packument =
+            serde_json::from_str(&body).map_err(|source| RegistryError::MalformedResponse {
+                url,
+                source: Box::new(source),
+            })?;
+        Ok(Fetched::Body {
+            packument: Box::new(packument),
+            etag,
         })
     }
 

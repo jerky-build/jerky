@@ -60,7 +60,13 @@ fn run(cli: Cli) -> Result<(), JerkyError> {
             }
 
             let store = jerky::store::Store::new(store_root()?);
-            let registry = jerky::registry::HttpRegistry::new();
+            let registry = jerky::metadata_cache::CachedRegistry::new(
+                jerky::registry::HttpRegistry::new(),
+                jerky::metadata_cache::MetadataCache::new(
+                    cache_root()?,
+                    jerky::metadata_cache::DEFAULT_WINDOW,
+                ),
+            );
 
             match spec {
                 // Which importer the user is standing in is asked *only* here.
@@ -169,6 +175,18 @@ fn importer_for(workspace: &Workspace, dir: &Path) -> Result<ImporterPath, Jerky
 fn store_root() -> Result<PathBuf, JerkyError> {
     let home = dirs::home_dir().ok_or(JerkyError::NoHomeDirectory)?;
     Ok(home.join(".jerky").join("store"))
+}
+
+/// Beside the store, not inside it.
+///
+/// The store is content-addressed and immutable: an entry's name is the hash
+/// of what is in it, and nothing ever rewrites one. The metadata cache is
+/// neither — entries are keyed by package name and are overwritten every time
+/// the registry answers. Sharing a directory would leave `jerky store prune`
+/// unable to say which rule applies to what it finds.
+fn cache_root() -> Result<PathBuf, JerkyError> {
+    let home = dirs::home_dir().ok_or(JerkyError::NoHomeDirectory)?;
+    Ok(home.join(".jerky").join("cache"))
 }
 
 /// `1 package`, `2 packages`.

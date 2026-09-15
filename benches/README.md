@@ -71,6 +71,12 @@ into one picture rather than three.
 | warm store + lockfile | CI, and a fresh clone |
 | no-op, tree already present | |
 
+"Warm" means everything jerky keeps under `$HOME`: the content store **and**
+the metadata cache. Both are filled by the cold run that precedes the warm
+rows, which is what makes the second row measure a real re-resolution rather
+than a first install — and, since the metadata cache landed, what makes it
+fast.
+
 Each is a median over `--trials` runs (3 by default). Medians rather than
 means, because one run that lost a connection and retried moves a mean and does
 not move a median, and a benchmark against a live registry gets one of those

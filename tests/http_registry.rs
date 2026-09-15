@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use jerky::registry::{HttpRegistry, RegistryClient, RegistryError};
+use jerky::registry::{Freshness, HttpRegistry, RegistryClient, RegistryError};
 
 /// A canned response for one request path.
 struct Route {
@@ -222,7 +222,9 @@ fn packument_requests_the_abbreviated_form() {
     )]);
     let registry = HttpRegistry::with_base_url(base);
 
-    registry.packument("lodash").unwrap();
+    registry
+        .packument("lodash", Freshness::MayBeCached)
+        .unwrap();
 
     let seen = accepts.lock().unwrap().clone();
     assert!(
@@ -243,7 +245,9 @@ fn packument_returns_every_published_version() {
     )]);
     let registry = HttpRegistry::with_base_url(base);
 
-    let p = registry.packument("lodash").unwrap();
+    let p = registry
+        .packument("lodash", Freshness::MayBeCached)
+        .unwrap();
 
     assert_eq!(p.name, "lodash");
     assert_eq!(p.versions.len(), 2);
@@ -256,7 +260,7 @@ fn packument_reports_an_unknown_package() {
     let registry = HttpRegistry::with_base_url(base);
 
     assert!(matches!(
-        registry.packument("nope"),
+        registry.packument("nope", Freshness::MayBeCached),
         Err(RegistryError::PackageNotFound(_))
     ));
 }
@@ -267,7 +271,7 @@ fn packument_does_not_retry_a_404() {
     let (base, hits) = serve(vec![]);
     let registry = HttpRegistry::with_base_url(base);
 
-    let _ = registry.packument("nope");
+    let _ = registry.packument("nope", Freshness::MayBeCached);
 
     assert_eq!(hits.load(Ordering::Relaxed), 1);
 }
@@ -284,7 +288,7 @@ fn packument_retries_a_server_error() {
     let registry = HttpRegistry::with_base_url(base);
 
     assert!(matches!(
-        registry.packument("lodash"),
+        registry.packument("lodash", Freshness::MayBeCached),
         Err(RegistryError::Network { .. })
     ));
     assert_eq!(hits.load(Ordering::Relaxed), 3, "three attempts");
@@ -299,7 +303,9 @@ fn resolves_a_real_packument_and_selects_a_version() {
     use jerky::range::Range;
 
     let registry = HttpRegistry::new();
-    let packument = registry.packument("express").unwrap();
+    let packument = registry
+        .packument("express", Freshness::MayBeCached)
+        .unwrap();
 
     assert_eq!(packument.name, "express");
     assert!(
@@ -323,4 +329,125 @@ fn resolves_a_real_packument_and_selects_a_version() {
         .max_satisfying(&versions)
         .expect("express has a 4.x release");
     assert!(chosen.as_str().starts_with('4'), "chose {chosen}");
+}
+
+/// A server that speaks conditional requests: it holds one ETag, answers `304`
+/// to anyone who presents it, and records every `If-None-Match` it saw.
+///
+/// Worth a real server rather than a fake client. The whole revalidation path
+/// turns on ureq surfacing a `304` as a *successful* response — it is neither a
+/// 4xx nor a redirect to follow — and a hand-written fake would simply encode
+/// whatever this code already believes about that.
+fn serve_conditional(
+    etag: &'static str,
+    body: &'static str,
+) -> (String, Arc<Mutex<Vec<Option<String>>>>) {
+    let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+    let port = server.server_addr().to_ip().unwrap().port();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&seen);
+
+    std::thread::spawn(move || {
+        for request in server.incoming_requests() {
+            let sent = request
+                .headers()
+                .iter()
+                .find(|h| h.field.equiv("If-None-Match"))
+                .map(|h| h.value.as_str().to_string());
+            recorder.lock().unwrap().push(sent.clone());
+
+            let response = if sent.as_deref() == Some(etag) {
+                tiny_http::Response::from_string("").with_status_code(304)
+            } else {
+                tiny_http::Response::from_string(body)
+                    .with_status_code(200)
+                    .with_header(
+                        tiny_http::Header::from_bytes(&b"ETag"[..], etag.as_bytes()).unwrap(),
+                    )
+            };
+            let _ = request.respond(response);
+        }
+    });
+
+    (format!("http://127.0.0.1:{port}"), seen)
+}
+
+const LODASH_PACKUMENT: &str = r#"{
+    "name": "lodash",
+    "dist-tags": { "latest": "4.17.21" },
+    "versions": {
+        "4.17.21": {
+            "name": "lodash", "version": "4.17.21",
+            "dist": { "tarball": "https://example.test/lodash-4.17.21.tgz" }
+        }
+    }
+}"#;
+
+#[test]
+fn an_unconditional_packument_fetch_reports_the_etag() {
+    // Without the ETag coming back out, nothing downstream could ever make a
+    // conditional request.
+    let (base, _) = serve_conditional("\"abc123\"", LODASH_PACKUMENT);
+    let registry = HttpRegistry::with_base_url(base);
+
+    let fetched = registry.packument_conditional("lodash", None).unwrap();
+
+    let jerky::registry::Fetched::Body { packument, etag } = fetched else {
+        panic!("an unconditional request must come back with a body");
+    };
+    assert_eq!(packument.name, "lodash");
+    assert_eq!(etag.as_deref(), Some("\"abc123\""));
+}
+
+#[test]
+fn a_matching_etag_comes_back_as_not_modified() {
+    // The assumption the whole freshness design rests on: ureq hands a 304
+    // back as a successful response, so it is read off the status rather than
+    // caught as an error.
+    let (base, seen) = serve_conditional("\"abc123\"", LODASH_PACKUMENT);
+    let registry = HttpRegistry::with_base_url(base);
+
+    let fetched = registry
+        .packument_conditional("lodash", Some("\"abc123\""))
+        .unwrap();
+
+    assert!(
+        matches!(fetched, jerky::registry::Fetched::NotModified),
+        "a matching ETag must be reported as NotModified, not as a body"
+    );
+    assert_eq!(
+        seen.lock().unwrap().as_slice(),
+        [Some("\"abc123\"".to_string())],
+        "the If-None-Match header must actually have been sent"
+    );
+}
+
+#[test]
+fn a_stale_etag_comes_back_as_a_fresh_body() {
+    let (base, _) = serve_conditional("\"new\"", LODASH_PACKUMENT);
+    let registry = HttpRegistry::with_base_url(base);
+
+    let fetched = registry
+        .packument_conditional("lodash", Some("\"old\""))
+        .unwrap();
+
+    let jerky::registry::Fetched::Body { etag, .. } = fetched else {
+        panic!("a non-matching ETag must yield a body");
+    };
+    assert_eq!(etag.as_deref(), Some("\"new\""));
+}
+
+#[test]
+fn a_scoped_name_is_escaped_in_a_conditional_request_too() {
+    // `@types/node` must be requested as `@types%2fnode`; a path with a real
+    // slash in it is a different resource.
+    let (base, _) = serve_conditional("\"abc\"", LODASH_PACKUMENT);
+    let registry = HttpRegistry::with_base_url(base);
+
+    let fetched = registry.packument_conditional("@types/node", None);
+
+    assert!(
+        fetched.is_ok(),
+        "a scoped name should reach the server, got {fetched:?}"
+    );
 }
