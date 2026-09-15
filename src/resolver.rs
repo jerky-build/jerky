@@ -7,12 +7,14 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Mutex;
 
 use thiserror::Error;
 
 use crate::integrity::{Integrity, IntegrityError};
+use crate::pool;
 use crate::range::{Range, RangeError};
-use crate::registry::{Packument, RegistryClient, RegistryError};
+use crate::registry::{MAX_CONCURRENT_FETCHES, Packument, RegistryClient, RegistryError};
 
 /// The protocol marking a dependency as a workspace member rather than a
 /// registry package. `workspace:*` and `workspace:^1.0.0` both select the
@@ -431,88 +433,165 @@ pub fn resolve(
         }
     }
 
-    while let Some(Pending {
-        dependent,
-        name,
-        range,
-    }) = work.pop_front()
-    {
-        let id = select(registry, &mut packuments, &mut selections, &name, &range)?;
+    // The walk proceeds a level at a time rather than an edge at a time: the
+    // whole frontier is taken, every packument it will ask for is fetched
+    // concurrently, and then the frontier is walked exactly as it always was
+    // against a warm memo. Draining the queue and refilling it preserves the
+    // FIFO order the single-edge loop had, so the walk visits the same edges
+    // in the same sequence — the concurrency is confined to the fetching.
+    //
+    // The cost of that confinement is a barrier per level: the slowest
+    // packument on one level holds up the next. A worklist drained by N
+    // workers would not have it, but it would also make `packuments` and
+    // `selections` shared mutable state, and with them the questions of which
+    // failure gets reported and whether discovery order can reach the
+    // lockfile. A tree's levels are few and its levels are wide — express is
+    // 69 packages in 7 levels — so the barrier costs a handful of round trips
+    // and buys back the entire design.
+    while !work.is_empty() {
+        let level: Vec<Pending> = work.drain(..).collect();
+        warm_packuments(registry, &mut packuments, &level);
 
-        // Record the edge on whoever asked for it. An importer's own
-        // dependency is recorded against the importer rather than against a
-        // package, because that is what its `node_modules` is built from.
-        match dependent {
-            Dependent::Package(parent) => {
-                if let Some(package) = packages.get_mut(&parent) {
-                    package.dependencies.insert(name.clone(), id.clone());
+        for Pending {
+            dependent,
+            name,
+            range,
+        } in level
+        {
+            let id = select(registry, &mut packuments, &mut selections, &name, &range)?;
+
+            // Record the edge on whoever asked for it. An importer's own
+            // dependency is recorded against the importer rather than against a
+            // package, because that is what its `node_modules` is built from.
+            match dependent {
+                Dependent::Package(parent) => {
+                    if let Some(package) = packages.get_mut(&parent) {
+                        package.dependencies.insert(name.clone(), id.clone());
+                    }
+                }
+                Dependent::Importer { path, kind } => {
+                    importers.entry(path).or_default().dependencies.insert(
+                        name.clone(),
+                        Dependency {
+                            specifier: range.clone(),
+                            kind,
+                            resolution: Resolution::Registry(id.clone()),
+                        },
+                    );
                 }
             }
-            Dependent::Importer { path, kind } => {
-                importers.entry(path).or_default().dependencies.insert(
-                    name.clone(),
-                    Dependency {
-                        specifier: range.clone(),
-                        kind,
-                        resolution: Resolution::Registry(id.clone()),
-                    },
-                );
+
+            // Recursion is gated on node novelty, not on path. That is what makes
+            // a cycle terminate: the second visit finds the node present, records
+            // the edge above, and stops here without needing a visited-path stack.
+            if packages.contains_key(&id) {
+                continue;
             }
+
+            let packument = packuments
+                .get(&id.name)
+                .expect("select fetched this packument");
+            // Both paths in `select` check membership before returning: the range
+            // path picks from `versions_sorted`, and the tag path rejects a
+            // dangling target. Neither can hand back a version that is absent.
+            let metadata = packument
+                .versions
+                .get(&id.version)
+                .expect("select verified this version is present");
+
+            let integrity =
+                metadata
+                    .dist
+                    .integrity()
+                    .map_err(|source| ResolveError::Integrity {
+                        name: id.name.clone(),
+                        version: id.version.clone(),
+                        source,
+                    })?;
+
+            // `dependencies` only. A dependency's `devDependencies` must never be
+            // followed — doing so pulls in most of the registry — which is why
+            // `VersionMetadata` has no field for them to be read from.
+            for (dep_name, dep_range) in &metadata.dependencies {
+                work.push_back(Pending {
+                    dependent: Dependent::Package(id.clone()),
+                    name: dep_name.clone(),
+                    range: dep_range.clone(),
+                });
+            }
+
+            packages.insert(
+                id.clone(),
+                ResolvedPackage {
+                    id,
+                    resolved: metadata.dist.tarball.clone(),
+                    integrity,
+                    dependencies: BTreeMap::new(),
+                },
+            );
         }
-
-        // Recursion is gated on node novelty, not on path. That is what makes
-        // a cycle terminate: the second visit finds the node present, records
-        // the edge above, and stops here without needing a visited-path stack.
-        if packages.contains_key(&id) {
-            continue;
-        }
-
-        let packument = packuments
-            .get(&id.name)
-            .expect("select fetched this packument");
-        // Both paths in `select` check membership before returning: the range
-        // path picks from `versions_sorted`, and the tag path rejects a
-        // dangling target. Neither can hand back a version that is absent.
-        let metadata = packument
-            .versions
-            .get(&id.version)
-            .expect("select verified this version is present");
-
-        let integrity = metadata
-            .dist
-            .integrity()
-            .map_err(|source| ResolveError::Integrity {
-                name: id.name.clone(),
-                version: id.version.clone(),
-                source,
-            })?;
-
-        // `dependencies` only. A dependency's `devDependencies` must never be
-        // followed — doing so pulls in most of the registry — which is why
-        // `VersionMetadata` has no field for them to be read from.
-        for (dep_name, dep_range) in &metadata.dependencies {
-            work.push_back(Pending {
-                dependent: Dependent::Package(id.clone()),
-                name: dep_name.clone(),
-                range: dep_range.clone(),
-            });
-        }
-
-        packages.insert(
-            id.clone(),
-            ResolvedPackage {
-                id,
-                resolved: metadata.dist.tarball.clone(),
-                integrity,
-                dependencies: BTreeMap::new(),
-            },
-        );
     }
 
     Ok(ResolvedGraph {
         importers,
         packages,
     })
+}
+
+/// Fetch every packument this level will ask for, concurrently, into the memo.
+///
+/// Purely a warming pass: it decides nothing and records nothing but the memo,
+/// so the walk below behaves exactly as it did when it made these requests one
+/// at a time. That is what keeps the awkward questions from arriving with the
+/// concurrency. Which failure is reported stays the serial walk's answer,
+/// because a failure here is simply *not* a warm entry — the walk reaches that
+/// name in its own order, makes the request itself, and reports it there. The
+/// cost is one repeated request on a resolution that is about to fail anyway.
+///
+/// Names are deduplicated, so the diamond that made the memo worth having is
+/// still fetched once even when both dependents sit on this level. Below two
+/// distinct names there is nothing to overlap and no pool is started.
+fn warm_packuments(
+    registry: &dyn RegistryClient,
+    packuments: &mut HashMap<String, Packument>,
+    level: &[Pending],
+) {
+    let wanted: Vec<&str> = level
+        .iter()
+        .map(|pending| pending.name.as_str())
+        .filter(|name| !packuments.contains_key(*name))
+        .collect::<BTreeSet<&str>>()
+        .into_iter()
+        .collect();
+
+    if wanted.len() < 2 {
+        return;
+    }
+
+    let fetched: Mutex<Vec<(String, Packument)>> = Mutex::new(Vec::new());
+
+    // The error is discarded rather than propagated, and that is the whole
+    // trick: a name this failed to fetch is simply not a warm entry, so the
+    // walk reaches it in its own order, makes the request itself, and reports
+    // it there. Which failure a user sees stays the serial walk's answer
+    // without this pass having to decide anything. `drain` stopping on the
+    // first failure is what keeps the extra requests to the names already
+    // claimed rather than the whole level.
+    let _: Result<(), RegistryError> = pool::drain(&wanted, MAX_CONCURRENT_FETCHES, |name| {
+        let packument = registry.packument(name)?;
+        fetched
+            .lock()
+            .unwrap()
+            .push(((*name).to_string(), packument));
+        Ok(())
+    });
+
+    // Insertion order cannot matter — the keys are distinct names and the memo
+    // never reaches disk — which is why this map is allowed to be a `HashMap`
+    // at all.
+    for (name, packument) in fetched.into_inner().unwrap() {
+        packuments.insert(name, packument);
+    }
 }
 
 /// Where `member` sits, as seen from `importer`.

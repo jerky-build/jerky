@@ -6,6 +6,7 @@ pub mod integrity;
 pub mod linker;
 pub mod lockfile;
 pub mod manifest;
+pub mod pool;
 pub mod range;
 pub mod registry;
 pub mod resolver;

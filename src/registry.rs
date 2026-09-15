@@ -6,6 +6,27 @@ use thiserror::Error;
 use crate::integrity::{Integrity, IntegrityError};
 use crate::range::Version;
 
+/// How many requests jerky has in flight at the registry at once.
+///
+/// One number shared by resolution and installation rather than one each,
+/// because what it bounds is a property of the registry rather than of either
+/// caller. It is *not* a bound on the two together — two pools of this width
+/// would be twice it — and does not need to be: an install resolves to
+/// completion before it fetches a single tarball, so only one of them is ever
+/// running.
+///
+/// Both are latency-bound fan-out rather than a CPU workload, so the cap is
+/// not tied to core count: a thread waiting on a socket is not competing for
+/// anything. Sixteen is where the measured gain on a real tree flattens.
+/// Installing express's 69 packages into a cold store from a matching lockfile
+/// — the CI and fresh-clone case, where every tarball is fetched and no
+/// metadata is — went from 3.36s serially to 0.40s at this width, and
+/// resolving that tree went from 2.60s to 0.70s. It stays far below the point
+/// where a registry starts treating one client as abusive. A cap exists at all
+/// because a resolved graph can hold thousands of packages, and one thread per
+/// package is how an install gets an IP rate-limited.
+pub const MAX_CONCURRENT_FETCHES: usize = 16;
+
 #[derive(Debug, Error)]
 pub enum RegistryError {
     #[error("package `{0}` was not found in the registry")]

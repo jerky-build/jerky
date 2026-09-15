@@ -130,10 +130,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   tar reader rather than by jerky; they are now jerky's own guarantee and a
   test fails if that stops being true
   ([#29](https://github.com/jerky-build/jerky/issues/29))
+- Packuments are fetched concurrently during resolution, up to sixteen at a
+  time. The walk now proceeds a level at a time: it takes the whole frontier,
+  fetches every packument that frontier will ask for at once, and then walks it
+  exactly as before against a warm memo. Resolution discovers its own work, so
+  unlike the tarball half this cannot be one flat work list — but a tree has
+  few levels and wide ones, and express's 69 packages sit in seven, so seven
+  rounds of requests replace sixty-eight. On that tree a cold install goes from
+  3.00s to **1.04s**, and the re-resolution an edited `package.json` forces —
+  warm store, stale lockfile, the common developer install — from 2.60s to
+  **0.70s**. An install that reuses its lockfile is unaffected, because it
+  asks the registry nothing ([#71](https://github.com/jerky-build/jerky/issues/71)).
 - Tarballs are downloaded concurrently rather than one after another, up to
-  sixteen at a time. Resolution still walks serially — it discovers work as it
-  goes — but once the graph is settled every URL is known, so the install half
-  is a fixed work list with nothing to wait for. On a cold store this is the
+  sixteen at a time. Once the graph is settled every URL is known, so this half
+  is a fixed work list with nothing to wait for — unlike resolution, which
+  discovers its own work and is parallelised differently, above. On a cold store this is the
   difference between a first `jerky install` that reads as slow and one that
   does not; a repeat install is unaffected, because it already downloaded
   nothing. The cap exists so a large tree does not open a connection per
