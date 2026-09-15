@@ -7,7 +7,9 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use jerky::registry::Freshness;
 use jerky::registry::MAX_CONCURRENT_FETCHES;
+use jerky::registry::RegistryClient as _;
 use jerky::registry::RegistryError;
 use jerky::resolver::{Declared, ImporterPath, Kind, Resolution, ResolveError, resolve};
 use jerky::testing::FixtureRegistry;
@@ -952,12 +954,19 @@ impl Jumbled {
         self.completed.lock().unwrap().join(",")
     }
 
-    /// Hold this answer back for a while that depends on the name and the run.
+    /// Hold this answer back for a while that depends on the request and the
+    /// run.
     ///
-    /// Not a hash anything relies on; it only has to scramble a dozen names
+    /// Keyed on the freshness as well as the name, and that is not a detail.
+    /// One name asked as a range and as a dist-tag is two different questions
+    /// racing each other, and a delay keyed on the name alone gives them the
+    /// same delay — so the order they settle in would be left to the thread
+    /// scheduler, which is the thing this wrapper exists to stop relying on.
+    ///
+    /// Not a hash anything relies on; it only has to scramble a dozen requests
     /// into a different order for each seed. The delays are sub-millisecond,
     /// so a run costs about as long as the tree is deep.
-    fn hold(&self, name: &str) {
+    fn hold(&self, name: &str, freshness: Freshness) {
         let mut mixed = self.seed.wrapping_mul(0x9e37_79b9_7f4a_7c15);
         for byte in name.bytes() {
             mixed = mixed
@@ -965,7 +974,19 @@ impl Jumbled {
                 .wrapping_add(u64::from(byte))
                 .wrapping_mul(0x0000_0001_0000_01b3);
         }
+        if freshness == Freshness::MustBeCurrent {
+            mixed = mixed.rotate_left(29).wrapping_mul(0x0000_0001_0000_01b3);
+        }
         std::thread::sleep(std::time::Duration::from_micros(200 * (mixed % 12)));
+    }
+
+    /// What the registry answered, in the order it finished answering.
+    fn record(&self, name: &str, freshness: Freshness) {
+        let mark = match freshness {
+            Freshness::MayBeCached => "",
+            Freshness::MustBeCurrent => "!",
+        };
+        self.completed.lock().unwrap().push(format!("{name}{mark}"));
     }
 }
 
@@ -983,9 +1004,25 @@ impl jerky::registry::RegistryClient for Jumbled {
         name: &str,
         etag: Option<&str>,
     ) -> Result<jerky::registry::Fetched, RegistryError> {
-        self.hold(name);
+        self.hold(name, Freshness::MustBeCurrent);
         let answer = self.inner.packument_conditional(name, etag);
-        self.completed.lock().unwrap().push(name.to_string());
+        self.record(name, Freshness::MustBeCurrent);
+        answer
+    }
+
+    /// Forwarded rather than left to the default, which drops `freshness`.
+    ///
+    /// A wrapper that took the default would answer every request from the
+    /// same view, and a test of what the two freshnesses do would be a test of
+    /// this file's own blind spot.
+    fn packument(
+        &self,
+        name: &str,
+        freshness: Freshness,
+    ) -> Result<jerky::registry::Packument, RegistryError> {
+        self.hold(name, freshness);
+        let answer = self.inner.packument(name, freshness);
+        self.record(name, freshness);
         answer
     }
 
@@ -1060,6 +1097,249 @@ fn the_lockfile_is_the_same_bytes_whatever_order_packuments_land_in() {
         "the lockfile varied with the order packuments landed in, across \
          {} distinct completion orders",
         orders.len()
+    );
+}
+
+/// A tree in which one package is reachable by a range edge and by a dist-tag
+/// edge at once, and in which the two freshnesses genuinely differ.
+///
+/// `x` and `y` were both published to inside the metadata cache's window, so
+/// each has a version a range cannot see and a dist-tag can. The shape then
+/// arranges for the crawl to be able to reach `x` by either question first:
+/// `r` leads to the range edge and `t` to the dist-tag edge, so which of the
+/// two asks about `x` arrives first is decided by how long `r` and `t` take.
+///
+/// The sting is in `x@1.0.0`, which the *cached* view of `x` makes the answer
+/// to `^1.0.0` and the current view does not. It declares `y` by dist-tag
+/// where `x@1.5.0` declares it by range — so a crawl that transiently reads
+/// the cached `x` asks a question about `y` that the resolved graph never
+/// contains.
+fn window() -> FixtureRegistry {
+    FixtureRegistry::new()
+        .with_tree(&[
+            ("r", "1.0.0", &[("x", "^1.0.0")]),
+            ("t", "1.0.0", &[("x-current", "npm:x@latest")]),
+            ("x", "1.0.0", &[("y", "latest")]),
+            ("y", "1.0.0", &[]),
+        ])
+        .with_current_version("x", "1.5.0", &[("y", "^1.0.0")])
+        .with_current_version("y", "1.9.0", &[])
+}
+
+#[test]
+fn a_dist_tag_edge_cannot_change_what_a_range_edge_resolves_to() {
+    // The hazard a continuous worklist adds that no `BTreeMap` defends
+    // against. A crawl worker reading the cached `x` picks `1.0.0`, whose
+    // dependency on `y` is a *dist-tag* — so it asks for `y` under
+    // `MustBeCurrent` and a fresh `y` lands in the memo. A worker that read
+    // the current `x` first picks `1.5.0` instead, whose dependency on `y` is
+    // a range, and nothing ever asks `y` for a current copy at all.
+    //
+    // Either way the walk resolves `x@1.5.0` and follows its range edge to
+    // `y`. What it finds there must not depend on which of those two crawls
+    // happened, and a memo that lets a `MustBeCurrent` entry answer a
+    // `MayBeCached` ask makes it depend on exactly that: `y@^1.0.0` selects
+    // 1.9.0 when the spurious ask happened and 1.0.0 when it did not.
+    //
+    // The correctness half of the freshness rule is asserted separately
+    // below, because a resolver could make this test pass by serving every
+    // range a current copy — which would be deterministic and wrong.
+    let roots = roots(&[("r", "^1.0.0"), ("t", "^1.0.0")]);
+
+    let mut lockfiles: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
+    let mut orders = std::collections::BTreeSet::new();
+
+    for seed in 1..=40u64 {
+        let registry = Jumbled::new(window(), seed);
+        let graph = resolve(&registry, &roots, &no_members()).unwrap();
+
+        let dir = tempfile::TempDir::new().unwrap();
+        jerky::lockfile::save(&graph, dir.path()).unwrap();
+        lockfiles.insert(std::fs::read(dir.path().join(jerky::lockfile::LOCKFILE_NAME)).unwrap());
+        orders.insert(registry.completion_order());
+    }
+
+    assert!(
+        orders.len() > 1,
+        "every run settled in the same order, so the hazard was never \
+         exercised: {orders:?}"
+    );
+    assert_eq!(
+        lockfiles.len(),
+        1,
+        "a range edge resolved differently depending on whether a dist-tag \
+         edge happened to be asked first, across {} completion orders",
+        orders.len()
+    );
+}
+
+#[test]
+fn a_range_is_still_answered_from_the_window_and_a_dist_tag_is_not() {
+    // The other half, and the one that stops the test above being satisfied
+    // by handing everybody a current copy. Two claims about one resolution:
+    // `x@^1.0.0` may be answered from the window, so it selects 1.0.0 and not
+    // the 1.5.0 published since; `x@latest` must reach the registry, so it
+    // selects 1.5.0. Two questions, two answers, two nodes.
+    let graph = resolve(
+        &window(),
+        &roots(&[("r", "^1.0.0"), ("t", "^1.0.0")]),
+        &no_members(),
+    )
+    .unwrap();
+
+    let versions: Vec<String> = graph
+        .packages
+        .keys()
+        .filter(|id| id.name == "x")
+        .map(|id| id.version.clone())
+        .collect();
+    assert_eq!(
+        versions,
+        ["1.0.0", "1.5.0"],
+        "the range and the dist-tag did not get the answers they asked for"
+    );
+
+    // And the fixture really does answer differently per freshness, so the
+    // assertion above is not passing against a registry that cannot tell the
+    // two apart.
+    let registry = window();
+    let cached = registry.packument("x", Freshness::MayBeCached).unwrap();
+    let current = registry.packument("x", Freshness::MustBeCurrent).unwrap();
+    assert!(!cached.versions.contains_key("1.5.0"));
+    assert!(current.versions.contains_key("1.5.0"));
+}
+
+/// A registry that keeps every request waiting until one named package has
+/// been asked for and refused, and then answers the rest slowly.
+///
+/// Both halves exist to take the timing out of a claim about timing. Holding
+/// the others back until the failure has happened is what stops the chain
+/// running ahead *before* the crawl has anything to react to — which is the
+/// race that made the first version of the test below flaky under load. The
+/// delay afterwards is the other side: the crawl's stop lands within
+/// microseconds of the failure, so a chain that costs milliseconds a link
+/// cannot get more than one link past it without the stop being genuinely
+/// broken.
+struct AfterFailure {
+    inner: FixtureRegistry,
+    missing: &'static str,
+    state: std::sync::Mutex<bool>,
+    happened: std::sync::Condvar,
+}
+
+impl AfterFailure {
+    fn new(inner: FixtureRegistry, missing: &'static str) -> Self {
+        Self {
+            inner,
+            missing,
+            state: std::sync::Mutex::new(false),
+            happened: std::sync::Condvar::new(),
+        }
+    }
+
+    fn gate(&self, name: &str) {
+        if name == self.missing {
+            return;
+        }
+        let guard = self.state.lock().unwrap();
+        // Timed, so a resolver that never asks for the missing package fails
+        // the assertions below rather than hanging the suite.
+        let _unblocked = self
+            .happened
+            .wait_timeout_while(guard, std::time::Duration::from_secs(5), |seen| !*seen)
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(3));
+    }
+
+    fn release(&self) {
+        *self.state.lock().unwrap() = true;
+        self.happened.notify_all();
+    }
+}
+
+impl jerky::registry::RegistryClient for AfterFailure {
+    fn version_metadata(
+        &self,
+        name: &str,
+        version: &str,
+    ) -> Result<jerky::registry::VersionMetadata, RegistryError> {
+        self.inner.version_metadata(name, version)
+    }
+
+    fn packument_conditional(
+        &self,
+        name: &str,
+        etag: Option<&str>,
+    ) -> Result<jerky::registry::Fetched, RegistryError> {
+        self.gate(name);
+        let answer = self.inner.packument_conditional(name, etag);
+        if name == self.missing {
+            self.release();
+        }
+        answer
+    }
+
+    fn packument(
+        &self,
+        name: &str,
+        freshness: Freshness,
+    ) -> Result<jerky::registry::Packument, RegistryError> {
+        self.gate(name);
+        let answer = self.inner.packument(name, freshness);
+        if name == self.missing {
+            self.release();
+        }
+        answer
+    }
+
+    fn fetch_tarball(&self, url: &str) -> Result<Vec<u8>, RegistryError> {
+        self.inner.fetch_tarball(url)
+    }
+}
+
+#[test]
+fn a_missing_package_does_not_drag_the_whole_graph_through_the_registry() {
+    // A typo in one dependency name used to cost one level of fetches before
+    // it was reported, because the level pass ran on `pool::drain` and `drain`
+    // stops claiming work at the first failure. A crawl that could not be
+    // stopped would instead fetch everything reachable from every *other*
+    // root before the walk got as far as saying which name was wrong — on a
+    // real tree, thousands of requests to say that one of them was a 404.
+    //
+    // Thirty links, none of which the resolution needs. `link05` is the
+    // assertion rather than an exact total because the link already claimed
+    // when the crawl stops still finishes and still pushes its successor;
+    // what must not happen is the chain carrying on down.
+    let mut registry = FixtureRegistry::new();
+    for step in 0..30 {
+        let name = format!("link{step:02}");
+        let next = format!("link{:02}", step + 1);
+        let edges: &[(&str, &str)] = if step + 1 < 30 {
+            &[(next.as_str(), "^1.0.0")]
+        } else {
+            &[]
+        };
+        registry = registry.with_packument(&name, &[("1.0.0", edges)]);
+    }
+    let registry = AfterFailure::new(registry, "gone");
+
+    let err = resolve(
+        &registry,
+        &roots(&[("gone", "^1.0.0"), ("link00", "^1.0.0")]),
+        &no_members(),
+    )
+    .unwrap_err();
+
+    assert!(
+        matches!(err, ResolveError::Registry(_)),
+        "expected the missing package to be reported, got {err:?}"
+    );
+    assert_eq!(
+        registry.inner.packument_calls_for("link05"),
+        0,
+        "the crawl was still walking the chain after a root dependency had \
+         already been refused; it fetched {} packuments in all",
+        registry.inner.packument_calls()
     );
 }
 

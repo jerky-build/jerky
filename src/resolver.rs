@@ -15,11 +15,30 @@
 //! fixed order, out of a memo that is already full.
 //!
 //! Keeping them apart is what makes completion order unable to reach the
-//! lockfile. The crawl decides nothing: it fills a memo keyed by package name,
-//! and a map keyed by name has the same contents whatever order it was filled
-//! in. Every decision — which version satisfies a range, which edge is
+//! lockfile. Every decision — which version satisfies a range, which edge is
 //! recorded where, which failure is reported — is taken by the walk, which
 //! visits in the order it always has and cannot tell how its memo got full.
+//!
+//! That argument has a trap in it, and it is worth stating because the obvious
+//! version of it is wrong. It is *not* enough for the memo to converge on the
+//! same contents whatever order a fixed set of requests completes in, because
+//! **the set of requests is itself order-dependent**: a crawl worker that
+//! reads a cached packument can select a version whose dependencies the
+//! resolved graph never contains, and go on to ask the registry about names,
+//! or at freshnesses, that nothing real ever wanted. What is needed is that
+//! such an ask cannot *disturb* anything — and that is why [`Memo`] is keyed
+//! by [`Request`], a package **and** the freshness asked of it, rather than by
+//! package alone. Each entry is then the answer to its own key and to nothing
+//! else, so a spurious request adds an entry nobody reads instead of changing
+//! one somebody does.
+//!
+//! **Not done here, and cheap now:** tarball fetching still waits for the
+//! whole of resolution to finish. The crawl already holds each selected
+//! version and its `dist.tarball` at the moment that version's packument
+//! lands, so the information needed to start a download arrives long before
+//! the walk does — overlapping the two phases no longer needs anything
+//! discovered that is not already in hand. The barrier itself lives in
+//! `commands::install`, which is why it is only noted here.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
@@ -544,15 +563,54 @@ pub fn resolve(
     Ok(walk.into_graph())
 }
 
-/// One packument per package name, shared by the crawl and the walk.
+/// One question for the registry: which package, and how current the answer
+/// has to be.
+///
+/// A *pair*, and the pair is the whole of what makes the memo below safe. It
+/// is tempting to key a packument cache on the name alone, because a name is
+/// what a registry addresses — but with the metadata cache behind it the two
+/// freshnesses are two different answers for one name, since a release
+/// published inside the cache's window is in one and not the other. Keyed on
+/// the name, "what is in the memo for `y`" would depend on whether anything
+/// had happened to ask for `y` by dist-tag; keyed on the pair, it does not.
+///
+/// The freshness is carried as a `bool` only because [`Freshness`] is
+/// `registry`'s type and does not derive `Hash`. `must_be_current` is the
+/// whole of what it says.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct Request {
+    name: String,
+    must_be_current: bool,
+}
+
+impl Request {
+    fn new(name: &str, needed: Freshness) -> Self {
+        Self {
+            name: name.to_string(),
+            must_be_current: matches!(needed, Freshness::MustBeCurrent),
+        }
+    }
+}
+
+/// One packument per distinct request, shared by the crawl and the walk.
 ///
 /// The one piece of state several threads touch, and it is deliberately the
-/// only one. Its contents are a function of the names asked for and nothing
-/// else — same name, same answer, whoever asked and whenever — so the order it
-/// is filled in is not observable from the outside. That is what confines the
-/// worklist's nondeterminism to a place it cannot escape from, and it is why
-/// a `HashMap` is allowed here at all despite everything downstream of it
-/// reaching the lockfile.
+/// only one. Each entry is the registry's answer to its own key and to
+/// nothing else, so no entry can be changed — or brought into existence — by
+/// what some other caller happened to ask for. That is a stronger property
+/// than "the memo ends up the same", and it is the one that is actually
+/// needed: the crawl's set of asks is *itself* order-dependent, because a
+/// worker that reads a cached packument can select a version that names
+/// dependencies the resolved graph never contains. Those asks must be unable
+/// to disturb anything, not merely unable to disagree.
+///
+/// This is what confines the worklist's nondeterminism somewhere it cannot
+/// escape from, and it is why a `HashMap` is allowed here at all despite
+/// everything downstream of it reaching the lockfile.
+///
+/// The cost is that a name asked both ways is fetched twice. That is the
+/// honest price of the two questions being different: the second fetch is the
+/// one the dist-tag asked for and could not have been given from the first.
 #[derive(Default)]
 struct Memo {
     state: Mutex<MemoState>,
@@ -561,60 +619,60 @@ struct Memo {
 
 #[derive(Default)]
 struct MemoState {
-    /// Each entry carries the freshness it was fetched under, so a name first
-    /// seen as a range and later asked for by dist-tag is re-fetched rather
-    /// than answered from a copy that was never required to be current.
-    packuments: HashMap<String, (Arc<Packument>, Freshness)>,
-    /// Names some thread is fetching *right now*.
+    packuments: HashMap<Request, Arc<Packument>>,
+    /// Requests some thread is making *right now*.
     ///
-    /// Without this the crawl loses the property that one package is one
-    /// request. Two dependents asking for two different ranges of the same
-    /// name are two items on the worklist, so two workers reach the memo
-    /// together, both miss, and both fetch — a diamond paid for twice, on a
-    /// real tree several hundred times over.
-    claimed: HashSet<String>,
+    /// Without this the crawl loses the property that one request is one
+    /// fetch. Two dependents asking for two different ranges of the same name
+    /// are two items on the worklist and one request, so two workers reach the
+    /// memo together, both miss, and both fetch — a diamond paid for twice, on
+    /// a real tree several hundred times over.
+    claimed: HashSet<Request>,
 }
 
 impl Memo {
-    /// The packument for `name`, current enough for `needed`, fetching it if
-    /// the memo holds nothing good enough.
+    /// The packument answering one request, fetching it if the memo has not
+    /// got it already.
     ///
-    /// A caller that finds the name already claimed waits for the claim to
-    /// settle and then re-asks, rather than starting a second request. It
-    /// re-asks rather than taking whatever landed because the two are not the
-    /// same question: a fetch made for a range does not answer a dist-tag, and
-    /// a caller that wanted the stricter one has to go and claim it itself.
+    /// A caller that finds the request already claimed waits for the claim to
+    /// settle rather than starting a second fetch of the same thing. Waiting
+    /// cannot deadlock: whoever holds a claim is not waiting on anything here,
+    /// so some thread is always making progress on it.
     ///
-    /// Waiting cannot deadlock: whoever holds a claim is not waiting on
-    /// anything here, so some thread is always making progress on it.
+    /// Note what is deliberately *not* here: an entry fetched under
+    /// `MustBeCurrent` is not offered to a later range. It would save a
+    /// request, and it is what this module used to do, and it is precisely the
+    /// coupling that let one edge's freshness decide another edge's answer.
+    /// A range asks whether a cached copy will do; being handed a current one
+    /// instead is a different question answered.
     fn obtain(
         &self,
         registry: &dyn RegistryClient,
         name: &str,
         needed: Freshness,
     ) -> Result<Arc<Packument>, RegistryError> {
+        let request = Request::new(name, needed);
+
         let mut state = self.state.lock().unwrap();
         loop {
-            if let Some(packument) = state.satisfying(name, needed) {
-                return Ok(packument);
+            if let Some(packument) = state.packuments.get(&request) {
+                return Ok(Arc::clone(packument));
             }
-            if !state.claimed.contains(name) {
+            if !state.claimed.contains(&request) {
                 break;
             }
             state = self.landed.wait(state).unwrap();
         }
-        state.claimed.insert(name.to_string());
+        state.claimed.insert(request.clone());
         drop(state);
 
         let fetched = registry.packument(name, needed);
 
         let mut state = self.state.lock().unwrap();
-        state.claimed.remove(name);
+        state.claimed.remove(&request);
         let answer = fetched.map(|packument| {
             let packument = Arc::new(packument);
-            state
-                .packuments
-                .insert(name.to_string(), (Arc::clone(&packument), needed));
+            state.packuments.insert(request, Arc::clone(&packument));
             packument
         });
         drop(state);
@@ -624,21 +682,6 @@ impl Memo {
         self.landed.notify_all();
 
         answer
-    }
-}
-
-impl MemoState {
-    /// The stored packument for `name`, if it is current enough for `needed`.
-    ///
-    /// An entry fetched under `MustBeCurrent` satisfies a later range, but not
-    /// the other way round.
-    fn satisfying(&self, name: &str, needed: Freshness) -> Option<Arc<Packument>> {
-        match self.packuments.get(name)? {
-            (packument, Freshness::MustBeCurrent) => Some(Arc::clone(packument)),
-            (packument, Freshness::MayBeCached) => {
-                (needed == Freshness::MayBeCached).then(|| Arc::clone(packument))
-            }
-        }
     }
 }
 
@@ -760,6 +803,15 @@ impl<'a> Walk<'a> {
     /// and reports the failure from there — which is what keeps "which error
     /// does a user see" a question about the walk's order rather than about
     /// which worker lost a race.
+    ///
+    /// Dropped, but not ignored: a registry failure stops the crawl. The level
+    /// pass got that for free from `pool::drain`, and losing it would mean a
+    /// typo'd dependency name fetching the entire rest of the graph before
+    /// anything was reported — several thousand requests to say that one of
+    /// them was a 404. Stopping cannot affect the answer, only the work: a
+    /// half-full memo is one the walk fills in itself, in its own order.
+    /// A crawl stopped by a failure the walk never reaches costs some
+    /// prefetching and nothing else.
     fn prefetch(&self) {
         // Seeded from the importers' own declarations, which is the same set
         // of edges `run` starts from.
@@ -775,6 +827,10 @@ impl<'a> Walk<'a> {
         pool::crawl(seeds, MAX_CONCURRENT_FETCHES, |asked, work| {
             let needed = Self::freshness_for(&asked.range);
             let Ok(packument) = self.memo.obtain(self.registry, &asked.name, needed) else {
+                // The walk is going to stop at this name, or at one before it.
+                // Either way the rest of the graph is prefetching for a
+                // resolution that is not going to happen.
+                work.stop();
                 return;
             };
             let Ok(version) = choose(&packument, &asked.name, &asked.range) else {

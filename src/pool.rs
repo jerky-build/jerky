@@ -102,10 +102,31 @@ impl<T> Worklist<T> {
         self.wake.notify_one();
     }
 
+    /// End the run now, leaving whatever is still on the list untaken.
+    ///
+    /// [`drain`]'s early stop, in the form a growing list can have one. A
+    /// crawl has no failure of its own to report, so it cannot decide to stop
+    /// on an error the way `drain` does; only the body knows whether what it
+    /// just found makes the rest of the run pointless.
+    ///
+    /// Work already claimed still finishes, exactly as in `drain`: what is
+    /// guaranteed is that no *new* item is taken.
+    pub fn stop(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.done = true;
+        self.wake.notify_all();
+    }
+
     /// The next item, or `None` once the run is over.
     fn take(&self) -> Option<T> {
         let mut state = self.state.lock().unwrap();
         loop {
+            // Checked before the queue, not after, so `stop` takes effect
+            // against a list that still has items on it — which is the only
+            // situation it is ever called in.
+            if state.done {
+                return None;
+            }
             // LIFO. Nothing depends on the order — a crawl's callers key their
             // own memo — and taking the most recently discovered item first is
             // what walks down a long dependency chain rather than fanning the
@@ -113,9 +134,6 @@ impl<T> Worklist<T> {
             // critical path, so reaching it early is the whole point.
             if let Some(item) = state.queue.pop() {
                 return Some(item);
-            }
-            if state.done {
-                return None;
             }
 
             state.idle += 1;
@@ -150,6 +168,11 @@ impl<T> Worklist<T> {
 /// can say something useful about it. Attributing a failure here would mean
 /// choosing between the failures of a list that has no fixed order to choose
 /// by.
+///
+/// What a body that has hit something fatal should do instead is call
+/// [`Worklist::stop`]. Not doing so is how a crawl turns a typo'd dependency
+/// into a walk of the entire graph before anything is reported, which is the
+/// half of `drain`'s early stop that does carry over.
 pub fn crawl<T, F>(seeds: Vec<T>, workers: usize, body: F)
 where
     T: Send,
@@ -329,5 +352,51 @@ mod tests {
     #[test]
     fn an_empty_crawl_starts_no_threads() {
         crawl(Vec::<usize>::new(), 16, |_, _| unreachable!("no seeds"));
+    }
+
+    #[test]
+    fn stopping_a_crawl_leaves_the_rest_of_the_list_untaken() {
+        // Not a timing assertion: one worker, and the first item it takes
+        // stops the run, so every later item is provably unclaimed rather than
+        // merely likely to be. The same shape as
+        // `a_failure_stops_new_work_being_claimed`, which is the property this
+        // restores to the growing list.
+        let seen = Mutex::new(Vec::new());
+
+        crawl(vec![0usize], 1, |step, work| {
+            seen.lock().unwrap().push(step);
+            for next in 1..=10 {
+                work.push(step + next);
+            }
+            if step == 0 {
+                work.stop();
+            }
+        });
+
+        assert_eq!(
+            seen.into_inner().unwrap(),
+            [0],
+            "the crawl kept taking work after it was stopped"
+        );
+    }
+
+    #[test]
+    fn a_stopped_crawl_ends_even_with_workers_parked() {
+        // Fifteen of sixteen workers are parked on the condvar while the
+        // sixteenth decides to stop. They have to be woken, or the run never
+        // returns.
+        let seen = Mutex::new(0usize);
+
+        crawl(vec![0usize], 16, |step, work| {
+            *seen.lock().unwrap() += 1;
+            if step < 3 {
+                work.push(step + 1);
+            } else {
+                work.push(99);
+                work.stop();
+            }
+        });
+
+        assert!(*seen.lock().unwrap() >= 4);
     }
 }

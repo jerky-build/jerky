@@ -292,12 +292,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
   **It resolves to the same bytes.** Which version satisfies a range is still
   decided on one thread, in the order the walk has always taken, from a
-  packument cache that is keyed by package name and therefore holds the same
-  thing whatever order it was filled in — so the order answers arrive in
-  cannot reach the lockfile. Six cold resolutions of `alotta-files` produce one
-  byte-identical 1291-package lockfile, and it is the same file the previous
-  resolver wrote. The freshness rule is untouched: a range may still be
-  answered from the cache and a dist-tag still reaches the registry every time.
+  packument cache keyed by the *request* — the package **and** how current the
+  answer had to be — so the order answers arrive in cannot reach the lockfile.
+  Keying that cache on the package alone is not enough and is the mistake this
+  entry was nearly shipped with: inside the metadata cache's window the two
+  freshnesses are two different answers for one package, and a resolution that
+  shared them would let one dependency's use of a dist-tag quietly change
+  which version a completely different dependency's range resolved to. Six
+  cold resolutions of `alotta-files` produce one byte-identical 1291-package
+  lockfile, and it is the same file the previous resolver wrote.
+
+  **The freshness rule is unchanged, and now costs one more request in one
+  case.** A range may still be answered from the window and a dist-tag still
+  reaches the registry every time. A package asked for *both* ways in one
+  install — `jerky install lodash` in a project that already depends on
+  `lodash@^4`, say — is now fetched once for each question rather than once in
+  total, because the answer to one is not the answer to the other. Inside the
+  window the range's fetch makes no network request at all, so what this
+  actually costs is a single conditional request.
 
 ### Removed
 

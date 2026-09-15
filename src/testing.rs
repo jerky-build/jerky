@@ -194,7 +194,9 @@ use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
 use crate::integrity::Integrity;
-use crate::registry::{Dist, Fetched, Packument, RegistryClient, RegistryError, VersionMetadata};
+use crate::registry::{
+    Dist, Fetched, Freshness, Packument, RegistryClient, RegistryError, VersionMetadata,
+};
 
 /// One version in a fixture: its number and the dependencies it declares.
 pub type FixtureVersion<'a> = (&'a str, &'a [(&'a str, &'a str)]);
@@ -324,7 +326,13 @@ impl Rendezvous {
 #[derive(Default)]
 pub struct FixtureRegistry {
     versions: HashMap<(String, String), VersionMetadata>,
+    /// What every request sees, unless the name also has a current view.
     packuments: BTreeMap<String, Packument>,
+    /// What a `MustBeCurrent` request sees, for the names that have one.
+    ///
+    /// Empty for every fixture that has not asked for one, which is why the
+    /// rest of the suite is unaffected by its existence.
+    current: BTreeMap<String, Packument>,
     tarballs: HashMap<String, Vec<u8>>,
     metadata_calls: AtomicUsize,
     tarball_calls: AtomicUsize,
@@ -427,33 +435,100 @@ impl FixtureRegistry {
     /// alone can only register leaves.
     pub fn with_packument(mut self, name: &str, versions: &[FixtureVersion<'_>]) -> Self {
         for (version, dependencies) in versions {
-            let tarball = build_tarball(&[TarEntry::file(
-                "package/package.json",
-                &format!(r#"{{"name":"{name}","version":"{version}"}}"#),
-            )]);
-            let url = format!("https://fixture.test/{name}/-/{name}-{version}.tgz");
-            let integrity = Integrity {
-                algo: crate::integrity::Algo::Sha512,
-                digest: <sha2::Sha512 as sha2::Digest>::digest(&tarball).to_vec(),
-            };
-
-            let metadata = VersionMetadata {
-                name: name.to_string(),
-                version: version.to_string(),
-                dist: Dist {
-                    tarball: url.clone(),
-                    integrity: Some(integrity.to_ssri()),
-                    shasum: None,
-                },
-                dependencies: dependencies
-                    .iter()
-                    .map(|(n, r)| (n.to_string(), r.to_string()))
-                    .collect(),
-            };
-
-            self.tarballs.insert(url, tarball);
+            let (metadata, tarball) = Self::build_version(name, version, dependencies);
+            self.tarballs.insert(metadata.dist.tarball.clone(), tarball);
             self.register(name, version, metadata);
         }
+        self
+    }
+
+    /// One version's metadata and the tarball its integrity hash is taken
+    /// from, self-consistent by construction.
+    ///
+    /// Shared rather than written twice: the current-view builder below needs
+    /// exactly the same version, and two spellings of how a fixture version is
+    /// made would be two chances for a hash to stop matching its bytes.
+    fn build_version(
+        name: &str,
+        version: &str,
+        dependencies: &[(&str, &str)],
+    ) -> (VersionMetadata, Vec<u8>) {
+        let tarball = build_tarball(&[TarEntry::file(
+            "package/package.json",
+            &format!(r#"{{"name":"{name}","version":"{version}"}}"#),
+        )]);
+        let url = format!("https://fixture.test/{name}/-/{name}-{version}.tgz");
+        let integrity = Integrity {
+            algo: crate::integrity::Algo::Sha512,
+            digest: <sha2::Sha512 as sha2::Digest>::digest(&tarball).to_vec(),
+        };
+
+        let metadata = VersionMetadata {
+            name: name.to_string(),
+            version: version.to_string(),
+            dist: Dist {
+                tarball: url,
+                integrity: Some(integrity.to_ssri()),
+                shasum: None,
+            },
+            dependencies: dependencies
+                .iter()
+                .map(|(n, r)| (n.to_string(), r.to_string()))
+                .collect(),
+        };
+
+        (metadata, tarball)
+    }
+
+    /// Publish a version that only a `MustBeCurrent` request can see.
+    ///
+    /// The one thing that makes [`Freshness`] observable at all. Every other
+    /// builder here registers a package that answers identically whatever is
+    /// asked of it, and the default `packument` drops its `freshness` argument
+    /// on the floor -- so without this, no test in the suite can tell the two
+    /// questions apart, and a resolver that confused them would pass every one
+    /// of them.
+    ///
+    /// What it models is a release published *inside* the metadata cache's
+    /// freshness window. A range may be answered from the window, so it
+    /// selects from the versions the cache knew about; a dist-tag must reach
+    /// the registry, so it sees this one too. The fixture holds no cache of
+    /// its own -- the split between the two views is the fiction that stands
+    /// in for one, which is what keeps this usable by a test driving the
+    /// resolver directly.
+    ///
+    /// The current view is a superset of the cached one, because that is what
+    /// a publish looks like, and `latest` moves with it.
+    pub fn with_current_version(
+        mut self,
+        name: &str,
+        version: &str,
+        dependencies: &[(&str, &str)],
+    ) -> Self {
+        let mut packument = self
+            .current
+            .get(name)
+            .or_else(|| self.packuments.get(name))
+            .unwrap_or_else(|| panic!("no packument for `{name}` to publish onto"))
+            .clone();
+
+        let (metadata, tarball) = Self::build_version(name, version, dependencies);
+        self.tarballs.insert(metadata.dist.tarball.clone(), tarball);
+        packument.versions.insert(version.to_string(), metadata);
+
+        // The same rule `register` applies: `latest` is the highest stable
+        // version, not the most recent call.
+        let sorted = packument.versions_sorted();
+        let highest = sorted
+            .iter()
+            .rev()
+            .find(|candidate| !candidate.is_prerelease())
+            .or_else(|| sorted.last())
+            .map(|v| v.as_str().to_string())
+            .unwrap_or_else(|| version.to_string());
+        packument.dist_tags.insert("latest".to_string(), highest);
+
+        self.current.insert(name.to_string(), packument);
         self
     }
 
@@ -648,6 +723,42 @@ impl FixtureRegistry {
     fn knows_package(&self, name: &str) -> bool {
         self.versions.keys().any(|(n, _)| n == name)
     }
+
+    /// Answer one packument request: count it, let the rendezvous see it, and
+    /// hand back the view the requested freshness is entitled to.
+    ///
+    /// One body for both entry points, so a request is counted once however
+    /// it arrived and the two views cannot drift apart.
+    fn answer(&self, name: &str, freshness: Freshness) -> Result<Packument, RegistryError> {
+        *self
+            .packument_calls
+            .lock()
+            .unwrap()
+            .entry(name.to_string())
+            .or_insert(0) += 1;
+
+        InFlight::enter(&self.packuments_in_flight);
+        if let Some(rendezvous) = &self.packument_rendezvous
+            && rendezvous.admits(name)
+        {
+            rendezvous.meet();
+        }
+
+        // A name with no current view answers the same thing either way, which
+        // is every fixture that has not deliberately asked to be otherwise.
+        let view = match freshness {
+            Freshness::MustBeCurrent => {
+                self.current.get(name).or_else(|| self.packuments.get(name))
+            }
+            Freshness::MayBeCached => self.packuments.get(name),
+        };
+        let answer = view
+            .cloned()
+            .ok_or_else(|| RegistryError::PackageNotFound(name.to_string()));
+        InFlight::leave(&self.packuments_in_flight);
+
+        answer
+    }
 }
 
 impl RegistryClient for FixtureRegistry {
@@ -667,40 +778,34 @@ impl RegistryClient for FixtureRegistry {
         }
     }
 
-    /// The fixture has no notion of a version changing, so it answers every
-    /// conditional request with a body. A cache layered over it therefore
-    /// always takes the `200` path, which is what makes the *window* the thing
+    /// The fixture never answers `304`, so a cache layered over it always
+    /// takes the `200` path -- which is what makes the *window* the thing
     /// under test rather than the revalidation.
+    ///
+    /// A conditional request is one that reaches the registry, so it is
+    /// answered from the current view: whatever has been published by now.
     fn packument_conditional(
         &self,
         name: &str,
         _etag: Option<&str>,
     ) -> Result<Fetched, RegistryError> {
-        *self
-            .packument_calls
-            .lock()
-            .unwrap()
-            .entry(name.to_string())
-            .or_insert(0) += 1;
-
-        InFlight::enter(&self.packuments_in_flight);
-        if let Some(rendezvous) = &self.packument_rendezvous
-            && rendezvous.admits(name)
-        {
-            rendezvous.meet();
-        }
-        let answer = self
-            .packuments
-            .get(name)
-            .cloned()
+        self.answer(name, Freshness::MustBeCurrent)
             .map(|packument| Fetched::Body {
                 packument: Box::new(packument),
                 etag: None,
             })
-            .ok_or_else(|| RegistryError::PackageNotFound(name.to_string()));
-        InFlight::leave(&self.packuments_in_flight);
+    }
 
-        answer
+    /// Overridden rather than left to the default, which discards its
+    /// `freshness` argument.
+    ///
+    /// That default is right for a client with nothing stored -- it is already
+    /// as current as it can be -- but it makes a fixture unable to tell the
+    /// two questions apart, and a resolver that answered a dist-tag from a
+    /// copy taken for a range would pass every test written against it. See
+    /// [`FixtureRegistry::with_current_version`].
+    fn packument(&self, name: &str, freshness: Freshness) -> Result<Packument, RegistryError> {
+        self.answer(name, freshness)
     }
 
     fn fetch_tarball(&self, url: &str) -> Result<Vec<u8>, RegistryError> {
@@ -723,7 +828,7 @@ impl RegistryClient for FixtureRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::{Freshness, RegistryClient};
+    use crate::registry::RegistryClient;
 
     #[test]
     fn with_packument_registers_versions_and_their_edges() {
