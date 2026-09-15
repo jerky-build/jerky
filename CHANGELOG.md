@@ -157,6 +157,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `jerky-lock.json` is written at the workspace root, keyed by importer. There
   is one lockfile per workspace, not one per project
   ([#47](https://github.com/jerky-build/jerky/issues/47)).
+- `JERKY_REGISTRY_URL` points jerky at a registry other than
+  `https://registry.npmjs.org`. An empty value means the same as an unset one,
+  so `JERKY_REGISTRY_URL= jerky install` is how a shell says "not the one my
+  parent exported". The client could always take a base URL and the tests
+  always drove it that way; the binary was what hardcoded the default, so
+  nothing built out of `main` could be pointed anywhere else. This is not an
+  offline mode ([#80](https://github.com/jerky-build/jerky/issues/80)) — a
+  different registry is still a registry, and a missing one is still fatal.
+  The benchmark is what wanted it: `./benches/bench.sh` now replays packuments
+  and tarballs from a local recording instead of making ~22,600 anonymous
+  requests at npm per run ([#83](https://github.com/jerky-build/jerky/issues/83)).
 
 ### Changed
 
@@ -247,6 +258,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   agreement is deliberately not forced.
 - A missing package is now reported through resolution rather than directly
   from the registry, since version selection is what asks.
+- The registry client keeps a connection per worker rather than the HTTP
+  library's three per host, so jerky's sixteen-way fan-out at a single registry
+  stops paying a fresh TCP and TLS handshake for roughly thirteen of every
+  sixteen requests. A cold install of a large tree made some 2,900 handshakes
+  where it now makes tens. The churn that removes is also the pattern a
+  registry rate-limits on, so the fix and the next entry are the same fix from
+  two directions ([#82](https://github.com/jerky-build/jerky/issues/82)).
+- A `429 Too Many Requests` is now an instruction rather than a transient
+  fault. jerky waits the `Retry-After` the registry advertised, or a second and
+  then two seconds when it advertised none, where before it retried after 100ms
+  and 200ms exactly as it does for a 5xx — tripling traffic at the endpoint
+  that had just asked for less. Still three attempts, so a rate limit that
+  outlasts three seconds is reported rather than outwaited, and a `Retry-After`
+  longer than a minute is reported straight away rather than slept off: it is
+  more time than a command-line tool can sit on. This covers the revalidation
+  the metadata cache does for a stale entry as much as a first fetch: a
+  rate-limited revalidation is reported as one, where the only status that path
+  reads as an answer is the `304` it asked for
+  ([#82](https://github.com/jerky-build/jerky/issues/82)).
 
 ### Removed
 

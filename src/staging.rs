@@ -10,6 +10,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::directory;
+
 pub(crate) const STAGING_DIR: &str = ".staging";
 
 /// A filesystem operation that failed, with the path it was applied to.
@@ -30,25 +32,6 @@ fn unique_suffix() -> String {
     format!("{}-{}-{}", std::process::id(), nanos, n)
 }
 
-/// Put a freshly created staging directory at 0o755.
-///
-/// `create_dir` derives its mode from the process umask, and the store renames
-/// this directory into place as the entry root — so under a permissive umask
-/// the store would hold a group- or world-writable directory, and another user
-/// could add or replace files inside a package every project on the machine
-/// imports. `archive::extract` normalises what it writes *into* the directory
-/// but never the directory itself, which the caller owns; this is that caller.
-fn set_traversable(path: &Path) -> Result<(), StagingError> {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).map_err(|source| {
-        StagingError {
-            path: path.to_path_buf(),
-            source,
-        }
-    })
-}
-
 /// A staging directory that deletes itself on drop unless kept.
 ///
 /// Hand-rolled rather than using `tempfile::TempDir` because the directory has
@@ -66,18 +49,28 @@ impl StagingDir {
     /// staging always shares a filesystem with its destination and the rename
     /// is atomic rather than failing with `EXDEV`.
     pub(crate) fn create_under(parent: &Path) -> Result<Self, StagingError> {
+        // Both levels go through `directory`, which is what puts them at
+        // 0o755 rather than at whatever the umask allows. It matters most for
+        // the staging directory itself: the store renames it into place as the
+        // entry root, so a world-writable one there is a package every project
+        // on the machine imports that another user can add files to.
+        // `archive::extract` normalises what it writes *into* the directory
+        // but never the directory itself, which the caller owns; this is that
+        // caller.
         let staging_root = parent.join(STAGING_DIR);
-        std::fs::create_dir_all(&staging_root).map_err(|source| StagingError {
+        directory::create_all(&staging_root).map_err(|source| StagingError {
             path: staging_root.clone(),
             source,
         })?;
 
+        // `create` rather than `create_all`, so a name that somehow collided
+        // with another process's is an error rather than two half-built trees
+        // sharing a directory.
         let path = staging_root.join(unique_suffix());
-        std::fs::create_dir(&path).map_err(|source| StagingError {
+        directory::create(&path).map_err(|source| StagingError {
             path: path.clone(),
             source,
         })?;
-        set_traversable(&path)?;
 
         Ok(Self { path, keep: false })
     }

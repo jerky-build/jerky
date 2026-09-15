@@ -61,7 +61,7 @@ fn run(cli: Cli) -> Result<(), JerkyError> {
 
             let store = jerky::store::Store::new(store_root()?);
             let registry = jerky::metadata_cache::CachedRegistry::new(
-                jerky::registry::HttpRegistry::new(),
+                registry_client(),
                 jerky::metadata_cache::MetadataCache::new(
                     cache_root()?,
                     jerky::metadata_cache::DEFAULT_WINDOW,
@@ -168,6 +168,34 @@ fn importer_for(workspace: &Workspace, dir: &Path) -> Result<ImporterPath, Jerky
     }
 
     Ok(member.importer.clone())
+}
+
+/// Which registry to talk to, from `JERKY_REGISTRY_URL` or npm's.
+///
+/// `HttpRegistry` has taken a base URL since it was written and the
+/// integration tests drive it that way, but the binary hardcoded the default
+/// here, so nothing built out of `main` could be pointed anywhere else. The
+/// benchmark is what noticed: a default run made ~22,600 requests at the live
+/// registry, which is both a rate limit and the reason its medians could not
+/// be reproduced. It now replays from a local mirror through this variable.
+///
+/// Read here rather than in `registry.rs` for the same reason `$HOME` is:
+/// `main` is the only place allowed to read the environment, and everything
+/// below it takes what it needs as a parameter.
+///
+/// An empty value means the same as an unset one. `JERKY_REGISTRY_URL=`
+/// is how a shell says "not this one" when a parent exported it, and the
+/// alternative — failing to resolve every package against the empty string —
+/// is no reading of that intent at all. This is deliberately *not* the offline
+/// mode of #80: pointing jerky at a different HTTP registry is still a
+/// registry, and nothing here makes a missing one survivable.
+fn registry_client() -> jerky::registry::HttpRegistry {
+    match std::env::var("JERKY_REGISTRY_URL") {
+        Ok(url) if !url.trim().is_empty() => {
+            jerky::registry::HttpRegistry::with_base_url(url.trim())
+        }
+        _ => jerky::registry::HttpRegistry::new(),
+    }
 }
 
 /// `main` is the only place allowed to read `$HOME`; everything below it takes

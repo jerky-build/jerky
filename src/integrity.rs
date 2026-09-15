@@ -23,7 +23,9 @@ pub enum Algo {
 }
 
 impl Algo {
-    fn name(self) -> &'static str {
+    /// The SSRI name of this algorithm. Crate-visible because the store
+    /// namespaces its entry keys by algorithm and this is the one spelling.
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Algo::Sha512 => "sha512",
             Algo::Sha1 => "sha1",
@@ -49,14 +51,6 @@ impl Algo {
 pub struct Integrity {
     pub algo: Algo,
     pub digest: Vec<u8>,
-}
-
-fn to_hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    bytes.iter().fold(String::new(), |mut out, b| {
-        let _ = write!(out, "{b:02x}");
-        out
-    })
 }
 
 impl Integrity {
@@ -102,15 +96,6 @@ impl Integrity {
         })
     }
 
-    /// The store directory name for this digest.
-    ///
-    /// Lowercase hex rather than base64: macOS filesystems are
-    /// case-insensitive by default, so base64 keys can collide. The algorithm
-    /// prefix keeps sha1 and sha512 entries in separate namespaces.
-    pub fn store_key(&self) -> String {
-        format!("{}-{}", self.algo.name(), to_hex(&self.digest))
-    }
-
     pub fn to_ssri(&self) -> String {
         format!("{}-{}", self.algo.name(), BASE64.encode(&self.digest))
     }
@@ -153,20 +138,6 @@ mod tests {
             integrity.verify(b"abd"),
             Err(IntegrityError::Mismatch { .. })
         ));
-    }
-
-    #[test]
-    fn store_keys_are_lowercase_and_algo_prefixed() {
-        let integrity = Integrity::parse(ABC_SHA512_SSRI).unwrap();
-        let key = integrity.store_key();
-        assert!(key.starts_with("sha512-"));
-        assert_eq!(
-            key,
-            key.to_lowercase(),
-            "store keys must be case-safe on macOS"
-        );
-        // "sha512-" plus 64 bytes rendered as two hex chars each.
-        assert_eq!(key.len(), 7 + 128);
     }
 
     #[test]

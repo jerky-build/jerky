@@ -1,6 +1,8 @@
 # Helpers for benches/bench.sh, in a file of their own so benches/lib-test.sh
 # can source them without starting a benchmark run. Nothing here shells out to
-# a package manager or touches the network.
+# a package manager, and the only thing that opens a socket is the replay
+# mirror at the bottom, which listens on loopback and talks to the live
+# registry only when it is asked to record.
 #
 # Written for bash 3.2, which is what macOS still ships: no `mapfile`, no
 # associative arrays, no `EPOCHREALTIME` assumed. jerky supports macOS, so a
@@ -44,8 +46,10 @@ now_ms() {
 
 # The middle value of a sorted list, or the lower of the two middles for an
 # even count. Medians rather than means because one run that lost a TCP
-# connection and retried moves a mean and does not move a median, and a
-# benchmark against a live registry gets one of those regularly.
+# connection and retried moves a mean and does not move a median. The replay
+# mirror has removed that particular outlier rather than the reason to be
+# robust to one: the machine taking the measurement is still doing other
+# things.
 median() {
     local sorted=() value
     while IFS= read -r value; do
@@ -88,6 +92,119 @@ count_links() {
     [[ -d $dir/node_modules ]] || { printf '0\n'; return; }
     find "$dir/node_modules" -type l | wc -l | tr -d '[:space:]'
     printf '\n'
+}
+
+# The replay mirror.
+#
+# A default benchmark run used to make roughly 22,600 anonymous requests at
+# registry.npmjs.org — the cold scenario wipes the store before every trial, so
+# 2,238 packuments and 2,910 tarballs are fetched again each time. That is a
+# rate limit waiting to happen, and it is also why the medians could not be
+# reproduced: retry noise from live weather was folded into every number. These
+# start and stop `benches/mirror.py`, which replays a recording from disk.
+
+JERKY_BENCH_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+JERKY_BENCH_MIRROR_PY=$JERKY_BENCH_DIR/mirror.py
+
+# Where a recording lives. Gitignored, and overridable, because it is hundreds
+# of megabytes of tarballs — far too much to commit, and a thing an operator
+# may want on another disk.
+mirror_dir() {
+    printf '%s\n' "${JERKY_BENCH_MIRROR_DIR:-$JERKY_BENCH_DIR/.mirror}"
+}
+
+# Is there a recording to replay? Non-zero when there is not, which is what
+# lets bench.sh say so before it starts timing anything.
+mirror_seeded() {
+    python3 "$JERKY_BENCH_MIRROR_PY" check "$1" >/dev/null 2>&1
+}
+
+# What a recording holds, as `N packuments, M tarballs, S`.
+mirror_summary() {
+    python3 "$JERKY_BENCH_MIRROR_PY" check "$1" 2>/dev/null
+}
+
+MIRROR_PID=
+MIRROR_URL=
+MIRROR_SCRATCH=
+
+# Start a mirror over `dir`, logging to `log`. Any further arguments go to
+# `mirror.py serve` — `--record` is the one that matters. Sets `MIRROR_URL` and
+# `MIRROR_PID`.
+#
+# The port is chosen by the kernel rather than fixed, so two benchmarks on one
+# machine cannot collide and a recording is not tied to a port number. That is
+# also why the URL has to be read back out of the process rather than assumed:
+# `mirror.py` writes the bound port to a file through a rename, so a port that
+# can be read is a port that is already accepting connections.
+mirror_start() {
+    local dir=$1 log=$2
+    shift 2
+    local port_file waited=0
+
+    MIRROR_SCRATCH=$(mktemp -d)
+    port_file=$MIRROR_SCRATCH/port
+
+    python3 "$JERKY_BENCH_MIRROR_PY" serve "$dir" --port-file "$port_file" "$@" \
+        >>"$log" 2>&1 &
+    MIRROR_PID=$!
+
+    # Fifteen seconds: starting is opening a socket, so anything that has not
+    # happened by now is a mirror that died, and the log says why.
+    while ((waited < 150)); do
+        if [[ -s $port_file ]]; then break; fi
+        kill -0 "$MIRROR_PID" 2>/dev/null || break
+        sleep 0.1
+        waited=$((waited + 1))
+    done
+
+    if [[ ! -s $port_file ]]; then
+        printf 'the replay mirror did not start:\n' >&2
+        cat "$log" >&2
+        mirror_stop
+        return 1
+    fi
+
+    MIRROR_URL=http://127.0.0.1:$(cat "$port_file")
+}
+
+# Copy a file, pointing every URL at one registry at another one.
+#
+# For a `jerky-lock.json`. A lockfile records `resolved` as an **absolute** URL
+# at the registry that answered, and the two lockfile-bearing scenarios install
+# straight from it without ever fetching a packument — so the mirror's
+# serve-time rewrite never sees those URLs, and an install from an unrewritten
+# pin goes to npm for every single tarball. That is not a hypothetical: it is
+# what the first run against the mirror did, under a network namespace with no
+# route off the machine, and the error named `registry.npmjs.org`.
+#
+# A copy rather than an edit in place. The committed pin records what the
+# registry actually said, which is the whole point of a pin; only the throwaway
+# copy a measuring run installs from names the mirror.
+#
+# `to` empty, or equal to `from`, is a plain copy — which is what `--pin` and
+# the npm columns want, since neither goes through the mirror.
+rewrite_registry() {
+    local src=$1 dest=$2 from=$3 to=$4
+    if [[ -z $to || $from == "$to" ]]; then
+        cp "$src" "$dest"
+        return
+    fi
+    # `|` as the delimiter because a URL is full of `/` and has no `|`.
+    sed "s|$from|$to|g" "$src" >"$dest"
+}
+
+# Stop the mirror, if one is running. Safe to call twice, and safe to call
+# when `mirror_start` failed — a trap handler has no way to know which.
+mirror_stop() {
+    if [[ -n $MIRROR_PID ]]; then
+        kill "$MIRROR_PID" 2>/dev/null || true
+        wait "$MIRROR_PID" 2>/dev/null || true
+    fi
+    if [[ -n $MIRROR_SCRATCH ]]; then rm -rf "$MIRROR_SCRATCH"; fi
+    MIRROR_PID=
+    MIRROR_URL=
+    MIRROR_SCRATCH=
 }
 
 # Symlinks whose target does not resolve.

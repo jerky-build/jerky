@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -220,6 +221,32 @@ pub const DEFAULT_REGISTRY: &str = "https://registry.npmjs.org";
 
 const MAX_ATTEMPTS: u32 = 3;
 
+/// The first sleep after a transport failure or a 5xx, doubled each attempt:
+/// 100ms, then 200ms. Short because the registry has not asked for anything —
+/// a 503 is a fault, and faults at this layer are usually over in a moment.
+const TRANSIENT_BACKOFF: Duration = Duration::from_millis(100);
+
+/// The first sleep after a 429 that carried no `Retry-After`, doubled each
+/// attempt: 1s, then 2s.
+///
+/// Ten times the transient step, because a 429 is not a fault but an
+/// instruction, and the instruction is to send less. Registries that do
+/// advertise a delay measure it in seconds, so a client guessing in their
+/// absence should guess on that scale rather than on the scale of a hiccup.
+///
+/// Bounded deliberately at three attempts, which makes the worst case three
+/// seconds of sleeping rather than a client that sits on a thread for minutes:
+/// a rate limit that is not over in three seconds is a condition to report to
+/// the user, not one to outwait.
+const RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(1);
+
+/// The longest `Retry-After` jerky honours before giving up on waiting.
+///
+/// A registry asking for half an hour is asking for more than a command-line
+/// tool can give it while someone watches; past this the wait would cost more
+/// than the failure it is avoiding, and the honest answer is the error.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
+
 /// ureq's `read_to_vec`/`read_to_string` default to a 10 MB cap, which many
 /// real tarballs exceed, so both limits are raised explicitly. A version
 /// manifest is a few KB; the generous ceiling is for pathological ones.
@@ -248,9 +275,33 @@ impl Default for HttpRegistry {
     }
 }
 
+/// What jerky should do about a failed attempt, and how long to wait first.
 enum Retry {
-    Yes,
+    /// A definite answer, or a wait longer than it is worth: stop.
     No,
+    /// A transport failure or a 5xx. Nobody asked for anything, so retry
+    /// promptly.
+    Transient,
+    /// The registry answered 429. `Some` carries the `Retry-After` it
+    /// advertised; `None` means it asked for less traffic without saying how
+    /// much less.
+    RateLimited(Option<Duration>),
+}
+
+impl Retry {
+    /// How long to sleep before attempt `n + 1`, counting from zero.
+    fn backoff(&self, n: u32) -> Duration {
+        match self {
+            // Never reached: `No` returns before anything sleeps.
+            Retry::No => Duration::ZERO,
+            Retry::Transient => TRANSIENT_BACKOFF * 2_u32.pow(n),
+            // An advertised delay is not doubled. The registry named a time to
+            // come back at, and coming back later than asked is not politer,
+            // only slower.
+            Retry::RateLimited(Some(advertised)) => *advertised,
+            Retry::RateLimited(None) => RATE_LIMIT_BACKOFF * 2_u32.pow(n),
+        }
+    }
 }
 
 impl HttpRegistry {
@@ -259,8 +310,28 @@ impl HttpRegistry {
     }
 
     pub fn with_base_url(base_url: impl Into<String>) -> Self {
+        // The idle pool is sized from the fan-out rather than left at ureq's
+        // default of three per host, because jerky points all sixteen workers
+        // at one host. A pool narrower than the fan-out means a worker that
+        // finishes a request finds the pool full, drops its connection, and
+        // pays a fresh TCP and TLS handshake for its next one — around 2,900
+        // handshakes for a cold install of a large tree, which is both slow
+        // and the connection-churn pattern registries rate-limit on.
+        //
+        // The two limits are the same number on purpose. Only one pool of
+        // `MAX_CONCURRENT_FETCHES` workers runs at a time, so sixteen is every
+        // connection jerky can have open at once however many hosts they are
+        // spread over: an overall cap below the per-host one would evict
+        // connections the per-host limit had just agreed to keep.
+        //
+        // Statuses are left on the response rather than raised as errors
+        // because a 429 is only actionable with its headers in hand, and
+        // ureq's conversion into `Error::StatusCode` drops them.
         let config = ureq::Agent::config_builder()
             .user_agent(concat!("jerky/", env!("CARGO_PKG_VERSION")))
+            .max_idle_connections(MAX_CONCURRENT_FETCHES)
+            .max_idle_connections_per_host(MAX_CONCURRENT_FETCHES)
+            .http_status_as_error(false)
             .build();
 
         Self {
@@ -275,10 +346,12 @@ impl HttpRegistry {
         name.replace('/', "%2f")
     }
 
-    /// Run an idempotent read, retrying transport failures and 5xx responses.
+    /// Run an idempotent read, retrying on the schedule the failure earns.
     ///
     /// `Retry::No` results short-circuit: a 404 is a definite answer, and
-    /// retrying it only makes the tool slow at being wrong.
+    /// retrying it only makes the tool slow at being wrong. The sleep between
+    /// the rest parks this thread; a worker blocked on a rate limit is a
+    /// worker not adding to it, which is the point.
     fn with_retries<T>(
         mut attempt: impl FnMut() -> Result<T, (RegistryError, Retry)>,
     ) -> Result<T, RegistryError> {
@@ -287,15 +360,59 @@ impl HttpRegistry {
             match attempt() {
                 Ok(value) => return Ok(value),
                 Err((err, Retry::No)) => return Err(err),
-                Err((err, Retry::Yes)) => {
+                Err((err, retry)) => {
                     last = Some(err);
                     if n + 1 < MAX_ATTEMPTS {
-                        std::thread::sleep(std::time::Duration::from_millis(100 * 2_u64.pow(n)));
+                        std::thread::sleep(retry.backoff(n));
                     }
                 }
             }
         }
         Err(last.expect("at least one attempt ran"))
+    }
+
+    /// Turn a response jerky did not want into an error and a retry policy.
+    ///
+    /// The one distinction that matters is 429 from everything else: a 5xx is
+    /// a fault the registry would rather not have had, and a 429 is the
+    /// registry telling this client what to do next.
+    fn from_status(
+        url: &str,
+        response: &ureq::http::Response<ureq::Body>,
+    ) -> (RegistryError, Retry) {
+        let status = response.status();
+        let err = RegistryError::Network {
+            url: url.to_string(),
+            source: Box::new(ureq::Error::StatusCode(status.as_u16())),
+        };
+
+        if status != 429 {
+            return (err, Retry::Transient);
+        }
+
+        match Self::retry_after(response) {
+            Some(delay) if delay > MAX_RETRY_AFTER => (err, Retry::No),
+            advertised => (err, Retry::RateLimited(advertised)),
+        }
+    }
+
+    /// The `Retry-After` delay, in seconds.
+    ///
+    /// The header may also carry an HTTP date. jerky does not read one: it
+    /// would need a date parser and a clock it trusts to agree with the
+    /// registry's, and the fallback — the rate-limit backoff — is the same
+    /// scale as the delays registries send. An unparseable header is simply
+    /// one that was not sent.
+    fn retry_after(response: &ureq::http::Response<ureq::Body>) -> Option<Duration> {
+        let seconds: u64 = response
+            .headers()
+            .get("retry-after")?
+            .to_str()
+            .ok()?
+            .trim()
+            .parse()
+            .ok()?;
+        Some(Duration::from_secs(seconds))
     }
 
     /// Fetch a JSON body, applying the retry policy and the size limit.
@@ -319,6 +436,10 @@ impl HttpRegistry {
             }
 
             match request.call() {
+                Ok(response) if response.status() == 404 => Err((not_found(), Retry::No)),
+                Ok(response) if !response.status().is_success() => {
+                    Err(Self::from_status(url, &response))
+                }
                 Ok(mut response) => response
                     .body_mut()
                     .with_config()
@@ -330,16 +451,15 @@ impl HttpRegistry {
                                 url: url.to_string(),
                                 source: Box::new(source),
                             },
-                            Retry::Yes,
+                            Retry::Transient,
                         )
                     }),
-                Err(ureq::Error::StatusCode(404)) => Err((not_found(), Retry::No)),
                 Err(source) => Err((
                     RegistryError::Network {
                         url: url.to_string(),
                         source: Box::new(source),
                     },
-                    Retry::Yes,
+                    Retry::Transient,
                 )),
             }
         })
@@ -347,10 +467,17 @@ impl HttpRegistry {
 
     /// Fetch a packument, sending `If-None-Match` when the caller has an ETag.
     ///
-    /// `Ok(None)` is a `304`. ureq surfaces it as a successful response rather
-    /// than an error — it is not a 4xx and carries no `Location` to follow —
-    /// so the status is read rather than matched on an error variant, which is
-    /// the detail that makes revalidation work at all.
+    /// `Ok(None)` is a `304`, and it is checked before anything else. A 304 is
+    /// not a success status, so a client that asked `is_success()` first would
+    /// classify every confirmed-current entry as a failure and retry it —
+    /// turning the cheapest answer the registry can give into three requests
+    /// and an error, and making the cache re-download exactly what it had just
+    /// revalidated.
+    ///
+    /// Every other status is classified rather than read. This endpoint is the
+    /// one the cache revalidates through, so it is the one that meets a 429
+    /// most often, and a rate-limit body parsed as metadata would hand the
+    /// resolver a packument the registry never sent.
     ///
     /// Separate from `get_json` rather than another flag on it: this one needs
     /// a response header and a status code back, and threading two more
@@ -375,10 +502,12 @@ impl HttpRegistry {
             }
 
             match request.call() {
+                Ok(response) if response.status() == 304 => Ok(None),
+                Ok(response) if response.status() == 404 => Err((not_found(), Retry::No)),
+                Ok(response) if !response.status().is_success() => {
+                    Err(Self::from_status(url, &response))
+                }
                 Ok(mut response) => {
-                    if response.status().as_u16() == 304 {
-                        return Ok(None);
-                    }
                     let etag = response
                         .headers()
                         .get("etag")
@@ -396,17 +525,16 @@ impl HttpRegistry {
                                     url: url.to_string(),
                                     source: Box::new(source),
                                 },
-                                Retry::Yes,
+                                Retry::Transient,
                             )
                         })
                 }
-                Err(ureq::Error::StatusCode(404)) => Err((not_found(), Retry::No)),
                 Err(source) => Err((
                     RegistryError::Network {
                         url: url.to_string(),
                         source: Box::new(source),
                     },
-                    Retry::Yes,
+                    Retry::Transient,
                 )),
             }
         })
@@ -416,7 +544,10 @@ impl HttpRegistry {
     /// 404 into either `PackageNotFound` or `VersionNotFound`.
     fn package_exists(&self, name: &str) -> bool {
         let url = format!("{}/{}", self.base_url, Self::encode_name(name));
-        self.agent.get(&url).call().is_ok()
+        self.agent
+            .get(&url)
+            .call()
+            .is_ok_and(|response| response.status().is_success())
     }
 }
 
@@ -474,6 +605,12 @@ impl RegistryClient for HttpRegistry {
 
     fn fetch_tarball(&self, url: &str) -> Result<Vec<u8>, RegistryError> {
         Self::with_retries(|| match self.agent.get(url).call() {
+            Ok(response) if response.status() == 404 => {
+                Err((RegistryError::PackageNotFound(url.to_string()), Retry::No))
+            }
+            Ok(response) if !response.status().is_success() => {
+                Err(Self::from_status(url, &response))
+            }
             Ok(mut response) => response
                 .body_mut()
                 .with_config()
@@ -485,18 +622,15 @@ impl RegistryClient for HttpRegistry {
                             url: url.to_string(),
                             source: Box::new(source),
                         },
-                        Retry::Yes,
+                        Retry::Transient,
                     )
                 }),
-            Err(ureq::Error::StatusCode(404)) => {
-                Err((RegistryError::PackageNotFound(url.to_string()), Retry::No))
-            }
             Err(source) => Err((
                 RegistryError::Network {
                     url: url.to_string(),
                     source: Box::new(source),
                 },
-                Retry::Yes,
+                Retry::Transient,
             )),
         })
     }

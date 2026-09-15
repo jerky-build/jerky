@@ -22,6 +22,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::directory;
 use crate::registry::{
     Fetched, Freshness, Packument, RegistryClient, RegistryError, VersionMetadata,
 };
@@ -193,7 +194,12 @@ impl MetadataCache {
             source,
         };
 
-        create_dirs_at_0o755(&self.versioned_root()).map_err(failed)?;
+        // `~/.jerky` and `~/.jerky/cache` are created here too, not merely
+        // the versioned leaf, and this cache is `$HOME`-wide exactly as the
+        // store is — a directory another user can write into is one they can
+        // put a packument in, which every project on the box then resolves
+        // from. `directory` owns that rule.
+        directory::create_all(&self.versioned_root()).map_err(failed)?;
 
         let final_path = self.entry_path(name);
         let temp_path = final_path.with_extension(format!(
@@ -218,37 +224,6 @@ impl MetadataCache {
 /// property of the input this sees.
 fn encode(name: &str) -> String {
     name.replace('%', "%25").replace('/', "%2f")
-}
-
-/// `create_dir_all` takes its mode from the process umask, so under a
-/// permissive one every level it creates is world-writable — including
-/// `~/.jerky` and `~/.jerky/cache`, not merely the versioned leaf. This cache
-/// is `$HOME`-wide and shared by every project on the machine exactly as the
-/// store is, so a directory another user can write into is one they can put a
-/// packument in, and every project on the box resolves from it.
-///
-/// Only what was actually missing is touched. A level that already existed
-/// belongs to whoever made it, and rewriting its mode would be this function
-/// deciding something about a directory it did not create.
-///
-/// This is the fourth copy of this rule — `archive::normalise_created_dirs`,
-/// `staging`, and `linker::create_dirs_at_0o755` are the others. Worth hoisting
-/// into one place; not done here because the three of them return three
-/// different error types and this change has no other business in those
-/// modules.
-fn create_dirs_at_0o755(dir: &Path) -> std::io::Result<()> {
-    let missing: Vec<PathBuf> = dir
-        .ancestors()
-        .take_while(|level| !level.exists())
-        .map(Path::to_path_buf)
-        .collect();
-
-    std::fs::create_dir_all(dir)?;
-
-    for level in missing {
-        set_mode(&level, 0o755)?;
-    }
-    Ok(())
 }
 
 fn set_mode(path: &Path, mode: u32) -> std::io::Result<()> {

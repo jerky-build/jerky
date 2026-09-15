@@ -3,6 +3,7 @@ use std::path::{Component, Path, PathBuf};
 
 use thiserror::Error;
 
+use crate::directory;
 use crate::staging::{STAGING_DIR, StagingDir};
 
 /// `EXDEV`, "cross-device link". Both Linux and macOS use 18.
@@ -87,10 +88,12 @@ fn walk_tree(
     dst: &Path,
     place: &dyn Fn(&Path, &Path) -> Result<(), LinkError>,
 ) -> Result<(), LinkError> {
-    std::fs::create_dir_all(dst).map_err(|source| LinkError::Access {
-        path: dst.to_path_buf(),
-        source,
-    })?;
+    // `reproduce_dir_mode` settles `dst` itself, but the first call in a tree
+    // also fills in the levels above it — the `node_modules` inside a virtual
+    // store entry, and an `@scope` below that — which have no counterpart
+    // under `src` to copy a mode from. Creating through `directory` is what
+    // gives those the store's 0o755 rather than the umask's answer.
+    create_dirs_at_0o755(dst)?;
     reproduce_dir_mode(src, dst)?;
 
     let entries = std::fs::read_dir(src).map_err(|source| LinkError::Access {
@@ -245,43 +248,18 @@ fn relative_path(from: &Path, to: &Path) -> PathBuf {
     relative
 }
 
-/// Create `dir` and every level of it that did not exist, at `0o755`.
+/// Create `dir` and every level of it that did not exist, as a `LinkError`.
 ///
-/// `create_dir_all` takes its mode from the process umask, so under a
-/// permissive one every level it creates is world-writable. That is the rule
-/// `archive::normalise_created_dirs` exists for on the store side, and it
-/// applies here for the same reason: the directories this creates are scope
-/// levels — `node_modules/@types` and `.jerky/@types` — which hold every
-/// package in that scope, and one another user can write into is one they can
-/// add a package to.
-///
-/// Only what was actually missing is touched. A level that already existed
-/// belongs to whoever made it, and rewriting its mode would be this function
-/// deciding something about a directory it did not create.
+/// The rule lives in [`crate::directory`]; this is the seam that gives its I/O
+/// errors this module's type. What it creates here are scope levels —
+/// `node_modules/@types` and `.jerky/@types` — which hold every package in
+/// that scope, so one another user can write into is one they can add a
+/// package to.
 fn create_dirs_at_0o755(dir: &Path) -> Result<(), LinkError> {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    let missing: Vec<PathBuf> = dir
-        .ancestors()
-        .take_while(|level| !level.exists())
-        .map(Path::to_path_buf)
-        .collect();
-
-    std::fs::create_dir_all(dir).map_err(|source| LinkError::Access {
+    directory::create_all(dir).map_err(|source| LinkError::Access {
         path: dir.to_path_buf(),
         source,
-    })?;
-
-    for level in missing {
-        std::fs::set_permissions(&level, std::fs::Permissions::from_mode(0o755)).map_err(
-            |source| LinkError::Access {
-                path: level.clone(),
-                source,
-            },
-        )?;
-    }
-
-    Ok(())
+    })
 }
 
 /// Create `link` pointing at `target`, replacing a link jerky already wrote.
