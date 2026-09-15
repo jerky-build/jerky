@@ -1,7 +1,12 @@
+use std::io::{BufRead, BufReader, Cursor, Write};
+use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
-use jerky::registry::{Freshness, HttpRegistry, RegistryClient, RegistryError};
+use jerky::registry::{
+    Freshness, HttpRegistry, MAX_CONCURRENT_FETCHES, RegistryClient, RegistryError,
+};
 
 /// A canned response for one request path.
 struct Route {
@@ -9,44 +14,134 @@ struct Route {
     body: &'static str,
 }
 
-/// Spin up a throwaway HTTP server that answers from a routing table, counts
-/// requests, and records each request's `Accept` header. Returns the base URL,
-/// the counter, and the recorded headers.
+/// What every fixture server answers with. One concrete type so a handler can
+/// decide between a canned body and a 429 without boxing.
+type Reply = tiny_http::Response<Cursor<Vec<u8>>>;
+
+/// Spin up a throwaway HTTP server that answers with `respond`. Returns its
+/// base URL.
+///
+/// `respond` is a closure rather than a routing table so a test can answer the
+/// same path differently on the second call — a 429 that succeeds on the retry
+/// is exactly that shape.
+fn serve_with(mut respond: impl FnMut(&tiny_http::Request) -> Reply + Send + 'static) -> String {
+    let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+    let port = server.server_addr().to_ip().unwrap().port();
+
+    std::thread::spawn(move || {
+        for request in server.incoming_requests() {
+            let response = respond(&request);
+            let _ = request.respond(response);
+        }
+    });
+
+    format!("http://127.0.0.1:{port}")
+}
+
+/// Spin up a server that counts the connections it accepts, answers every
+/// request with `body`, and calls `on_request` as each one arrives.
+///
+/// It speaks HTTP by hand rather than through tiny_http because tiny_http
+/// dispatches connections through a task pool that gives each keep-alive
+/// connection a thread for its whole life, and a burst of sixteen arriving at
+/// once can leave some of them queued behind a thread that never finishes —
+/// which is exactly the shape of the fan-out under test. Counting accepts is
+/// also the measurement itself, rather than something inferred from the
+/// requests.
+fn serve_counting_connections(
+    body: &'static str,
+    on_request: impl Fn() + Send + Sync + 'static,
+) -> (String, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let connections = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&connections);
+    let on_request = Arc::new(on_request);
+
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            counter.fetch_add(1, Ordering::Relaxed);
+            let on_request = Arc::clone(&on_request);
+            std::thread::spawn(move || serve_one_connection(stream, body, &*on_request));
+        }
+    });
+
+    (format!("http://127.0.0.1:{port}"), connections)
+}
+
+/// Answer every request on one connection until the client hangs up.
+///
+/// Only GETs arrive, so a request is its head and nothing else: lines up to
+/// the blank one. The response carries a `Content-Length` and no `Connection`
+/// header, which under HTTP/1.1 is the invitation to send another request on
+/// the same socket — without it the client could not reuse a connection even
+/// if it wanted to, and the test would measure the fixture.
+fn serve_one_connection(mut stream: TcpStream, body: &'static str, on_request: &dyn Fn()) {
+    let Ok(peer) = stream.try_clone() else { return };
+    let mut head = BufReader::new(peer);
+
+    loop {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match head.read_line(&mut line) {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+            if line == "\r\n" || line == "\n" {
+                break;
+            }
+        }
+
+        on_request();
+
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        if stream.write_all(response.as_bytes()).is_err() {
+            return;
+        }
+    }
+}
+
+/// One response header, for the fixtures that answer with `ETag` or
+/// `Retry-After`.
+fn header(field: &str, value: &str) -> tiny_http::Header {
+    tiny_http::Header::from_bytes(field.as_bytes(), value.as_bytes()).unwrap()
+}
+
+/// Answer from a routing table, counting requests and recording each request's
+/// `Accept` header. Returns the base URL, the counter, and the headers.
 fn serve_capturing(
     routes: Vec<(&'static str, Route)>,
 ) -> (String, Arc<AtomicUsize>, Arc<Mutex<Vec<String>>>) {
-    let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-    let port = server.server_addr().to_ip().unwrap().port();
     let hits = Arc::new(AtomicUsize::new(0));
     let accepts = Arc::new(Mutex::new(Vec::new()));
     let counter = Arc::clone(&hits);
     let recorder = Arc::clone(&accepts);
 
-    std::thread::spawn(move || {
-        for request in server.incoming_requests() {
-            counter.fetch_add(1, Ordering::Relaxed);
+    let base = serve_with(move |request| {
+        counter.fetch_add(1, Ordering::Relaxed);
 
-            if let Some(header) = request.headers().iter().find(|h| h.field.equiv("Accept")) {
-                recorder
-                    .lock()
-                    .unwrap()
-                    .push(header.value.as_str().to_string());
+        if let Some(header) = request.headers().iter().find(|h| h.field.equiv("Accept")) {
+            recorder
+                .lock()
+                .unwrap()
+                .push(header.value.as_str().to_string());
+        }
+
+        let url = request.url().to_string();
+        match routes.iter().find(|(path, _)| *path == url) {
+            Some((_, route)) => {
+                tiny_http::Response::from_string(route.body).with_status_code(route.status)
             }
-
-            let url = request.url().to_string();
-            let matched = routes.iter().find(|(path, _)| *path == url);
-
-            let response = match matched {
-                Some((_, route)) => {
-                    tiny_http::Response::from_string(route.body).with_status_code(route.status)
-                }
-                None => tiny_http::Response::from_string("not found").with_status_code(404),
-            };
-            let _ = request.respond(response);
+            None => tiny_http::Response::from_string("not found").with_status_code(404),
         }
     });
 
-    (format!("http://127.0.0.1:{port}"), hits, accepts)
+    (base, hits, accepts)
 }
 
 /// The common case, for tests that do not care about headers.
@@ -342,34 +437,27 @@ fn serve_conditional(
     etag: &'static str,
     body: &'static str,
 ) -> (String, Arc<Mutex<Vec<Option<String>>>>) {
-    let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-    let port = server.server_addr().to_ip().unwrap().port();
     let seen = Arc::new(Mutex::new(Vec::new()));
     let recorder = Arc::clone(&seen);
 
-    std::thread::spawn(move || {
-        for request in server.incoming_requests() {
-            let sent = request
-                .headers()
-                .iter()
-                .find(|h| h.field.equiv("If-None-Match"))
-                .map(|h| h.value.as_str().to_string());
-            recorder.lock().unwrap().push(sent.clone());
+    let base = serve_with(move |request| {
+        let sent = request
+            .headers()
+            .iter()
+            .find(|h| h.field.equiv("If-None-Match"))
+            .map(|h| h.value.as_str().to_string());
+        recorder.lock().unwrap().push(sent.clone());
 
-            let response = if sent.as_deref() == Some(etag) {
-                tiny_http::Response::from_string("").with_status_code(304)
-            } else {
-                tiny_http::Response::from_string(body)
-                    .with_status_code(200)
-                    .with_header(
-                        tiny_http::Header::from_bytes(&b"ETag"[..], etag.as_bytes()).unwrap(),
-                    )
-            };
-            let _ = request.respond(response);
+        if sent.as_deref() == Some(etag) {
+            tiny_http::Response::from_string("").with_status_code(304)
+        } else {
+            tiny_http::Response::from_string(body)
+                .with_status_code(200)
+                .with_header(header("ETag", etag))
         }
     });
 
-    (format!("http://127.0.0.1:{port}"), seen)
+    (base, seen)
 }
 
 const LODASH_PACKUMENT: &str = r#"{
@@ -449,5 +537,206 @@ fn a_scoped_name_is_escaped_in_a_conditional_request_too() {
     assert!(
         fetched.is_ok(),
         "a scoped name should reach the server, got {fetched:?}"
+    );
+}
+
+/// How many requests each worker makes in the fan-out test. Several apiece is
+/// the point: a pool sized to the fan-out serves all of them on the
+/// connections the workers opened first, so the connection count tracks the
+/// worker count rather than the request count.
+const REQUESTS_PER_WORKER: usize = 8;
+
+/// Holds each request at the fixture server until a full round of them has
+/// arrived, so the fan-out really is in flight at once rather than sixteen
+/// workers taking turns at a server fast enough to serve them one at a time.
+///
+/// A round that never fills — one worker retried, so the requests no longer
+/// divide evenly — is released by the settle window instead, which is why this
+/// is a window and not a `Barrier`: a fixture that can wedge the suite is worse
+/// than one that occasionally lets a round through half-full. Nothing is
+/// asserted on the timing either way; the window only buys overlap.
+struct Rendezvous {
+    width: usize,
+    /// How many have arrived this round, and which round it is.
+    state: Mutex<(usize, u64)>,
+    released: Condvar,
+}
+
+/// Long enough to cover the scheduling of sixteen threads on a loaded machine,
+/// short enough that eight misaligned rounds still cost under half a second.
+const SETTLE: std::time::Duration = std::time::Duration::from_millis(50);
+
+impl Rendezvous {
+    fn new(width: usize) -> Self {
+        Self {
+            width,
+            state: Mutex::new((0, 0)),
+            released: Condvar::new(),
+        }
+    }
+
+    fn meet(&self) {
+        let mut state = self.state.lock().unwrap();
+        let round = state.1;
+        state.0 += 1;
+        if state.0 == self.width {
+            *state = (0, round + 1);
+            self.released.notify_all();
+            return;
+        }
+        let _ = self
+            .released
+            .wait_timeout_while(state, SETTLE, |state| state.1 == round);
+    }
+}
+
+#[test]
+fn a_full_fan_out_reuses_its_connections() {
+    // The client advertises a 16-way fan-out at one host, so it must keep 16
+    // connections to that host. Keeping fewer means most requests pay a fresh
+    // TCP handshake — slow, and the connection-churn signature a registry
+    // rate-limits on.
+    let served = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&served);
+    let rendezvous = Rendezvous::new(MAX_CONCURRENT_FETCHES);
+    // Every request is answered with a packument, tarball fetches included:
+    // `fetch_tarball` hands back whatever bytes arrive, and one canned body
+    // keeps the fixture to the one thing it is measuring.
+    let (base, connections) = serve_counting_connections(PACKUMENT, move || {
+        counter.fetch_add(1, Ordering::Relaxed);
+        rendezvous.meet();
+    });
+    let registry = HttpRegistry::with_base_url(&base);
+
+    // One client shared by every worker, as install and resolution share one.
+    std::thread::scope(|scope| {
+        for worker in 0..MAX_CONCURRENT_FETCHES {
+            let registry = &registry;
+            let base = &base;
+            scope.spawn(move || {
+                for n in 0..REQUESTS_PER_WORKER {
+                    // Both endpoints, because both fan out and both share the
+                    // pool.
+                    if (worker + n) % 2 == 0 {
+                        registry
+                            .packument("lodash", Freshness::MustBeCurrent)
+                            .unwrap();
+                    } else {
+                        registry
+                            .fetch_tarball(&format!("{base}/lodash-4.17.21.tgz"))
+                            .unwrap();
+                    }
+                }
+            });
+        }
+    });
+
+    let requests = MAX_CONCURRENT_FETCHES * REQUESTS_PER_WORKER;
+    let accepted = connections.load(Ordering::Relaxed);
+    assert_eq!(
+        served.load(Ordering::Relaxed),
+        requests,
+        "every request ran"
+    );
+    assert!(
+        accepted <= 2 * MAX_CONCURRENT_FETCHES,
+        "{requests} requests from {MAX_CONCURRENT_FETCHES} workers opened {accepted} \
+         connections; the count should track the workers, not the requests",
+    );
+}
+
+/// The delay the rate-limited fixture advertises. One second is the shortest a
+/// registry can ask for — `Retry-After` counts whole seconds — so it is both
+/// realistic and the cheapest honest test of the policy.
+const ADVERTISED_DELAY: Duration = Duration::from_secs(1);
+
+#[test]
+fn a_429_waits_for_as_long_as_it_was_asked_to() {
+    // A 429 is an instruction, not a transient fault: the registry has said
+    // when to come back, and coming back sooner is what gets an IP blocked.
+    let served = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&served);
+    let base = serve_with(move |_| {
+        if counter.fetch_add(1, Ordering::Relaxed) == 0 {
+            tiny_http::Response::from_string("slow down")
+                .with_status_code(429)
+                .with_header(header("Retry-After", "1"))
+        } else {
+            tiny_http::Response::from_string(LODASH)
+        }
+    });
+    let registry = HttpRegistry::with_base_url(base);
+
+    let started = Instant::now();
+    let metadata = registry.version_metadata("lodash", "4.17.21").unwrap();
+    let waited = started.elapsed();
+
+    assert_eq!(metadata.version, "4.17.21", "the retry succeeded");
+    assert_eq!(served.load(Ordering::Relaxed), 2, "one 429, then one retry");
+    // A lower bound only: how much longer than the advertised delay the retry
+    // took is the machine's business, not the policy's.
+    assert!(
+        waited >= ADVERTISED_DELAY,
+        "retried after {waited:?}, sooner than the {ADVERTISED_DELAY:?} the registry asked for",
+    );
+}
+
+/// Every sleep a 5xx earns, added up: 100ms before the second attempt and
+/// 200ms before the third. A 429 that arrived with no delay attached has to
+/// wait longer than all of it before its *first* retry, or the distinction
+/// between a fault and an instruction is decorative.
+const FIVE_XX_SCHEDULE: Duration = Duration::from_millis(300);
+
+#[test]
+fn a_429_without_a_delay_backs_off_further_than_a_5xx() {
+    let served = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&served);
+    let base = serve_with(move |_| {
+        if counter.fetch_add(1, Ordering::Relaxed) == 0 {
+            tiny_http::Response::from_string("slow down").with_status_code(429)
+        } else {
+            tiny_http::Response::from_string(LODASH)
+        }
+    });
+    let registry = HttpRegistry::with_base_url(base);
+
+    let started = Instant::now();
+    let metadata = registry.version_metadata("lodash", "4.17.21").unwrap();
+    let waited = started.elapsed();
+
+    assert_eq!(metadata.version, "4.17.21", "the retry succeeded");
+    assert_eq!(served.load(Ordering::Relaxed), 2, "one 429, then one retry");
+    assert!(
+        waited > FIVE_XX_SCHEDULE,
+        "retried after {waited:?}; a 429 without a delay must wait longer than \
+         the whole {FIVE_XX_SCHEDULE:?} a 5xx is given",
+    );
+}
+
+#[test]
+fn a_delay_longer_than_jerky_will_wait_is_reported_rather_than_slept_off() {
+    // An hour is longer than a command-line tool can sit there for, and
+    // sleeping on it would cost more than the failure it avoids. The whole
+    // point of honouring the header is not to retry sooner than asked, so the
+    // only honest alternative to waiting is to stop.
+    let served = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&served);
+    let base = serve_with(move |_| {
+        counter.fetch_add(1, Ordering::Relaxed);
+        tiny_http::Response::from_string("come back later")
+            .with_status_code(429)
+            .with_header(header("Retry-After", "3600"))
+    });
+    let registry = HttpRegistry::with_base_url(base);
+
+    let result = registry.version_metadata("lodash", "4.17.21");
+
+    assert!(matches!(result, Err(RegistryError::Network { .. })));
+    // Counted rather than timed: one attempt is the whole claim, and a clock
+    // would only add a way for a loaded machine to disagree.
+    assert_eq!(
+        served.load(Ordering::Relaxed),
+        1,
+        "the client tried again instead of reporting",
     );
 }

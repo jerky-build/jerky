@@ -258,6 +258,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   agreement is deliberately not forced.
 - A missing package is now reported through resolution rather than directly
   from the registry, since version selection is what asks.
+- The registry client keeps a connection per worker rather than the HTTP
+  library's three per host, so jerky's sixteen-way fan-out at a single registry
+  stops paying a fresh TCP and TLS handshake for roughly thirteen of every
+  sixteen requests. A cold install of a large tree made some 2,900 handshakes
+  where it now makes tens. The churn that removes is also the pattern a
+  registry rate-limits on, so the fix and the next entry are the same fix from
+  two directions ([#82](https://github.com/jerky-build/jerky/issues/82)).
+- A `429 Too Many Requests` is now an instruction rather than a transient
+  fault. jerky waits the `Retry-After` the registry advertised, or a second and
+  then two seconds when it advertised none, where before it retried after 100ms
+  and 200ms exactly as it does for a 5xx — tripling traffic at the endpoint
+  that had just asked for less. Still three attempts, so a rate limit that
+  outlasts three seconds is reported rather than outwaited, and a `Retry-After`
+  longer than a minute is reported straight away rather than slept off: it is
+  more time than a command-line tool can sit on. This covers the revalidation
+  the metadata cache does for a stale entry as much as a first fetch: a
+  rate-limited revalidation is reported as one, where the only status that path
+  reads as an answer is the `304` it asked for
+  ([#82](https://github.com/jerky-build/jerky/issues/82)).
 
 ### Removed
 
