@@ -212,6 +212,25 @@ class Server(ThreadingHTTPServer):
 
 
 class Handler(BaseHTTPRequestHandler):
+    # Nagle off, and this is not a micro-optimisation — it is the difference
+    # between measuring jerky and measuring a TCP stall.
+    #
+    # `BaseHTTPRequestHandler` leaves Nagle's algorithm on, and a response goes
+    # out as a header write followed by a body write. Nagle holds the second
+    # write until the first is acknowledged, the client has nothing to say
+    # until it has the body, and its delayed-ACK timer holds the
+    # acknowledgement back — so the two wait for each other, tens of
+    # milliseconds at a time, several hundred times a run.
+    #
+    # Measured on the `alotta-packages` cold row: 13.1s with Nagle on, 2.7s
+    # with it off, on the same recording and the same binary. It was also
+    # bimodal, landing at 13.1s or ~5s depending on whether a run's write
+    # pattern happened to trip the stall, which is what made the cold row
+    # unusable for comparing two binaries. Neither side was busy — jerky spent
+    # ~4.9s of CPU either way and the mirror ~0.9s, the rest was two processes
+    # waiting on each other.
+    disable_nagle_algorithm = True
+
     # Keep-alive, because jerky holds sixteen connections open and a mirror
     # that closed each one would have the benchmark measuring TCP setup.
     protocol_version = "HTTP/1.1"

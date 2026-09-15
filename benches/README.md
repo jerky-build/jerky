@@ -172,10 +172,12 @@ manifest alone, one from the pin.
 It resumes. An interrupted recording is finished by running it again, since
 anything already on disk is a hit.
 
-**Do not commit it.** A full recording is roughly **470MB**. `alotta-files`
-alone measures 1,097 packuments and 1,291 tarballs at **129MB**, and
-`alotta-packages` is 2.2x its packages; that is not a thing to put in a git
-history that also has to be cloned. It lands in `benches/.mirror/`, which
+**Do not commit it.** A full recording is roughly **770MB**, measured rather
+than estimated: `alotta-files` is 1,097 packuments and 1,291 tarballs at
+**129MB**, and `alotta-packages` is 2,238 packuments and 2,916 tarballs at
+**643MB** — five times `alotta-files`, not the 2.2x its package count
+suggests, because its packages are larger as well as more numerous. That is
+not a thing to put in a git history that also has to be cloned. It lands in `benches/.mirror/`, which
 is gitignored; `JERKY_BENCH_MIRROR_DIR` moves it elsewhere. A measuring run
 with no recording to replay stops before it times anything and says which
 command to run.
@@ -192,7 +194,7 @@ and this takes the second: **the mirror rewrites packuments as it serves
 them**, replacing the upstream origin with its own.
 
 The alternative to rewriting at serve time is rewriting at record time, which
-bakes a host and a port into 470MB of data — a recording that could not be
+bakes a host and a port into 770MB of data — a recording that could not be
 replayed on a different port, let alone moved between machines. The mirror
 binds a kernel-chosen port precisely so two benchmarks on one machine cannot
 collide. The other alternative, teaching the client to resolve `dist.tarball`
