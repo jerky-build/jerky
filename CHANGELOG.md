@@ -24,17 +24,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   a `"latest"` in a `package.json` reaches the registry however warm the cache
   is, because only the registry can say what a tag points at today — the
   promise below, kept. The request is conditional, so it is usually a `304`
-  rather than a download. A range or an exact version is answered from the
-  window, which is sound because a version that satisfied `^4.0.0` a few hours
-  ago satisfies it still.
+  rather than a download.
+
+  **A range is answered from the window, and that means it can miss a new
+  release for up to a day.** `^4.0.0` resolved against a cached packument
+  selects the newest version *that packument knew about*, so a version
+  published an hour ago is invisible until the entry lapses. This is a
+  deliberate trade and the reason it is acceptable is narrow: jerky pins exact
+  by default and the lockfile records what was chosen, so a resolution taken
+  from a stale entry is reproducible and shows up in a diff rather than
+  drifting silently. If you need the newest release the moment it lands, ask
+  for it by tag or by version — both reach the registry.
 
   **If the registry cannot be reached and the entry is past its window, the
   install stops** rather than resolving from it. The window is what bounds how
   stale an answer may be, and quietly serving a lapsed entry because the
   network happened to be down would remove that bound exactly when nobody is
   watching. The error says how old the cached copy is so you can decide what to
-  do about it. Inside the window there is no request to fail, so a fresh cache
-  resolves offline as a matter of course
+  do about it. A range inside the window makes no request at all, so that much
+  resolves with no network; a dist-tag does not, because it always asks
   ([#70](https://github.com/jerky-build/jerky/issues/70)).
 
 - Scoped packages install. `@types/node` and every `@babel/*`, `@eslint/*` and

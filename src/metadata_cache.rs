@@ -16,6 +16,7 @@
 //! are ignored rather than misread.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -28,6 +29,10 @@ use crate::registry::{
 /// Bumped when the stored shape changes. Entries under an older version are
 /// ignored, never reinterpreted.
 const CACHE_VERSION: &str = "v1";
+
+/// Distinguishes temporary files written by threads of one process. Paired
+/// with the process id, which distinguishes processes.
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// How long an entry answers without asking the registry.
 ///
@@ -172,35 +177,30 @@ impl MetadataCache {
         self.write(name, &body)
     }
 
-    /// Re-stamp an existing entry as current, after a `304 Not Modified`.
-    ///
-    /// Rewrites the whole entry rather than touching the timestamp in place:
-    /// the file is small, the write is atomic, and a partial rewrite of a
-    /// length-changing field is the kind of corruption that is only ever found
-    /// much later.
-    pub fn refresh(
-        &self,
-        name: &str,
-        packument: &Packument,
-        etag: Option<&str>,
-    ) -> Result<(), CacheError> {
-        self.put(name, packument, etag)
-    }
-
     /// Write via a temporary file and rename, so a killed process leaves
     /// either the old entry or the new one and never half of either.
+    ///
+    /// The temporary name carries the process id and a counter, so two jerky
+    /// processes installing at once — two terminals, or two CI jobs sharing a
+    /// home — cannot write the same temporary file. Sharing it would let their
+    /// bytes interleave into something that then gets renamed over the live
+    /// entry. `get` would treat the result as a miss rather than misread it,
+    /// so the cost is a wasted fetch rather than a wrong resolution, but a
+    /// unique name is cheaper than relying on that.
     fn write(&self, name: &str, body: &[u8]) -> Result<(), CacheError> {
         let failed = |source: std::io::Error| CacheError::Write {
             name: name.to_string(),
             source,
         };
 
-        let dir = self.versioned_root();
-        std::fs::create_dir_all(&dir).map_err(failed)?;
-        set_mode(&dir, 0o755).map_err(failed)?;
+        create_dirs_at_0o755(&self.versioned_root()).map_err(failed)?;
 
         let final_path = self.entry_path(name);
-        let temp_path = final_path.with_extension("json.tmp");
+        let temp_path = final_path.with_extension(format!(
+            "json.{}.{}.tmp",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
         std::fs::write(&temp_path, body).map_err(failed)?;
         set_mode(&temp_path, 0o644).map_err(failed)?;
         std::fs::rename(&temp_path, &final_path).map_err(failed)?;
@@ -208,15 +208,49 @@ impl MetadataCache {
     }
 }
 
-/// The `/` of a scoped name, escaped the same way the registry URL escapes it.
+/// A package name as one filename.
+///
+/// `%` is escaped before `/` so the mapping is injective: escaping only the
+/// separator would give `@a/b` and the literal name `@a%2fb` the same entry,
+/// and one package's packument would answer for the other. npm rejects `%` in
+/// a name, so this is unreachable through the registry — but names also arrive
+/// from a hand-edited manifest, and "the registry would not allow it" is not a
+/// property of the input this sees.
 fn encode(name: &str) -> String {
-    name.replace('/', "%2f")
+    name.replace('%', "%25").replace('/', "%2f")
 }
 
-/// `create_dir_all` and `write` both take their mode from the process umask,
-/// so a permissive umask would leave a world-writable cache in `$HOME`. The
-/// store normalises modes for the same reason; this is the same rule applied
-/// to the directory beside it.
+/// `create_dir_all` takes its mode from the process umask, so under a
+/// permissive one every level it creates is world-writable — including
+/// `~/.jerky` and `~/.jerky/cache`, not merely the versioned leaf. This cache
+/// is `$HOME`-wide and shared by every project on the machine exactly as the
+/// store is, so a directory another user can write into is one they can put a
+/// packument in, and every project on the box resolves from it.
+///
+/// Only what was actually missing is touched. A level that already existed
+/// belongs to whoever made it, and rewriting its mode would be this function
+/// deciding something about a directory it did not create.
+///
+/// This is the fourth copy of this rule — `archive::normalise_created_dirs`,
+/// `staging`, and `linker::create_dirs_at_0o755` are the others. Worth hoisting
+/// into one place; not done here because the three of them return three
+/// different error types and this change has no other business in those
+/// modules.
+fn create_dirs_at_0o755(dir: &Path) -> std::io::Result<()> {
+    let missing: Vec<PathBuf> = dir
+        .ancestors()
+        .take_while(|level| !level.exists())
+        .map(Path::to_path_buf)
+        .collect();
+
+    std::fs::create_dir_all(dir)?;
+
+    for level in missing {
+        set_mode(&level, 0o755)?;
+    }
+    Ok(())
+}
+
 fn set_mode(path: &Path, mode: u32) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
@@ -296,11 +330,21 @@ impl<R: RegistryClient> RegistryClient for CachedRegistry<R> {
             }
             // The registry confirmed the stored copy just now. Re-stamping it
             // buys a whole new window without moving a byte of body.
-            Ok(Fetched::NotModified) => {
-                let packument = stored.expect("a 304 answers a request that sent an ETag");
-                self.store(name, &packument, etag.as_deref());
-                Ok(*packument)
-            }
+            // A `304` is only a valid answer to a request that carried an
+            // ETag, and one is sent only when something was on disk. A
+            // registry answering it anyway is misbehaving, which is reported
+            // rather than panicked — the same call this trait's default
+            // `packument` makes for the same situation.
+            Ok(Fetched::NotModified) => match stored {
+                Some(packument) => {
+                    self.store(name, &packument, etag.as_deref());
+                    Ok(*packument)
+                }
+                None => Err(RegistryError::MalformedResponse {
+                    url: name.to_string(),
+                    source: "the registry answered 304 to a request with no ETag".into(),
+                }),
+            },
             // Unreachable, with something usable on disk that is past its
             // window. Refused rather than served: the window is what bounds
             // how stale an answer may be, and serving a lapsed entry because
@@ -309,8 +353,7 @@ impl<R: RegistryClient> RegistryClient for CachedRegistry<R> {
             Err(err) => Err(match age {
                 Some(age) => RegistryError::StaleCacheOnly {
                     name: name.to_string(),
-                    days: age.as_secs() / 86_400,
-                    hours: (age.as_secs() % 86_400) / 3600,
+                    age,
                     source: Box::new(err),
                 },
                 None => err,
@@ -448,7 +491,7 @@ mod tests {
         );
         assert!(matches!(cache.get("lodash"), Lookup::Stale { .. }));
 
-        cache.refresh("lodash", &p, Some("\"abc\"")).unwrap();
+        cache.put("lodash", &p, Some("\"abc\"")).unwrap();
 
         assert!(matches!(cache.get("lodash"), Lookup::Fresh { .. }));
     }
@@ -530,13 +573,81 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = TempDir::new().unwrap();
-        let cache = MetadataCache::new(dir.path(), DEFAULT_WINDOW);
+        // A root several levels below one that exists, so this exercises what
+        // the real `~/.jerky/cache/v1` does: `create_dir_all` makes every
+        // level, and under a permissive umask each would be 0o777. Rooting the
+        // cache directly at the `TempDir` would create only the leaf and prove
+        // almost nothing — and the `TempDir` itself is deliberately excluded
+        // below, being a directory jerky did not create.
+        let existing = dir.path();
+        let root = existing.join("nested").join("cache");
+        let cache = MetadataCache::new(&root, DEFAULT_WINDOW);
         cache.put("a", &packument("a", "1.0.0"), None).unwrap();
 
         let file = std::fs::metadata(cache.entry_path("a")).unwrap();
         assert_eq!(file.permissions().mode() & 0o777, 0o644);
-        let root = std::fs::metadata(cache.versioned_root()).unwrap();
-        assert_eq!(root.permissions().mode() & 0o777, 0o755);
+
+        let mut level = cache.versioned_root();
+        while level != existing {
+            let mode = std::fs::metadata(&level).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o755, "{} was {mode:o}", level.display());
+            level = level.parent().expect("stops at the temp dir").to_path_buf();
+        }
+    }
+
+    #[test]
+    fn a_directory_that_already_existed_keeps_its_own_mode() {
+        // A level jerky did not create belongs to whoever did, and rewriting
+        // its mode would be this deciding something about a directory it does
+        // not own.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("cache");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let cache = MetadataCache::new(&root, DEFAULT_WINDOW);
+        cache.put("a", &packument("a", "1.0.0"), None).unwrap();
+
+        let mode = std::fs::metadata(&root).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o700,
+            "a pre-existing directory was rewritten"
+        );
+    }
+
+    #[test]
+    fn encoding_a_name_is_injective() {
+        // Escaping only the separator would give `@a/b` and the literal name
+        // `@a%2fb` one entry between them, so one package's packument would
+        // answer for the other.
+        assert_ne!(encode("@a/b"), encode("@a%2fb"));
+    }
+
+    #[test]
+    fn concurrent_writers_do_not_share_a_temporary_file() {
+        // Two processes sharing a home, or two threads of one. Interleaving
+        // into a single temporary file and renaming the result over the live
+        // entry is the failure this guards; `get` would call the result a miss
+        // rather than misread it, but a wasted fetch is still a cost.
+        let dir = TempDir::new().unwrap();
+        let cache = MetadataCache::new(dir.path(), DEFAULT_WINDOW);
+        let p = packument("a", "1.0.0");
+
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    for _ in 0..25 {
+                        cache.put("a", &p, Some("\"e\"")).unwrap();
+                    }
+                });
+            }
+        });
+
+        // Whatever interleaving happened, the live entry is readable.
+        assert!(matches!(cache.get("a"), Lookup::Fresh { .. }));
     }
 
     #[test]
@@ -845,6 +956,51 @@ mod policy_tests {
         assert!(
             matches!(err, RegistryError::Network { .. }),
             "expected a plain network error, got {err}"
+        );
+    }
+
+    #[test]
+    fn a_304_to_a_request_that_sent_no_etag_is_reported_not_panicked() {
+        // `CachedRegistry` is generic over `RegistryClient` precisely so other
+        // clients can be wrapped, and a misbehaving one describes a peer at
+        // fault rather than a bug here.
+        let dir = TempDir::new().unwrap();
+        let fake = Fake::new(packument("a", "1.0.0"));
+        // Answers 304 to anything, including a request carrying no ETag.
+        *fake.current_etag.lock().unwrap() = None;
+        struct AlwaysNotModified;
+        impl RegistryClient for AlwaysNotModified {
+            fn packument_conditional(
+                &self,
+                _name: &str,
+                _etag: Option<&str>,
+            ) -> Result<Fetched, RegistryError> {
+                Ok(Fetched::NotModified)
+            }
+            fn version_metadata(
+                &self,
+                _n: &str,
+                _v: &str,
+            ) -> Result<VersionMetadata, RegistryError> {
+                unimplemented!()
+            }
+            fn fetch_tarball(&self, _url: &str) -> Result<Vec<u8>, RegistryError> {
+                unimplemented!()
+            }
+        }
+        drop(fake);
+
+        let registry = CachedRegistry::new(
+            AlwaysNotModified,
+            MetadataCache::new(dir.path(), DEFAULT_WINDOW),
+        );
+
+        let err = registry
+            .packument("a", Freshness::MayBeCached)
+            .expect_err("a 304 with nothing cached has no body to fall back on");
+        assert!(
+            matches!(err, RegistryError::MalformedResponse { .. }),
+            "got {err}"
         );
     }
 

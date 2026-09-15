@@ -45,13 +45,14 @@ pub enum RegistryError {
     // already has is what informs it.
     #[error(
         "could not reach the registry for `{name}`, and the cached copy is \
-         {days}d {hours}h old — past the freshness window, so jerky will not \
-         resolve from it"
+         {}d {}h old — past the freshness window, so jerky will not resolve \
+         from it",
+        .age.as_secs() / 86_400,
+        (.age.as_secs() % 86_400) / 3600
     )]
     StaleCacheOnly {
         name: String,
-        days: u64,
-        hours: u64,
+        age: std::time::Duration,
         #[source]
         source: Box<RegistryError>,
     },
