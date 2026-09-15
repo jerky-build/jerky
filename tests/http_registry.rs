@@ -5,7 +5,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use jerky::registry::{
-    Freshness, HttpRegistry, MAX_CONCURRENT_FETCHES, RegistryClient, RegistryError,
+    Fetched, Freshness, HttpRegistry, MAX_CONCURRENT_FETCHES, RegistryClient, RegistryError,
 };
 
 /// A canned response for one request path.
@@ -738,5 +738,95 @@ fn a_delay_longer_than_jerky_will_wait_is_reported_rather_than_slept_off() {
         served.load(Ordering::Relaxed),
         1,
         "the client tried again instead of reporting",
+    );
+}
+
+// Revalidation is where the two halves of this module meet: the conditional
+// request the metadata cache makes runs through the same client whose
+// statuses no longer arrive as errors. A 304 has to stay a 304, and
+// everything else the registry can answer a revalidation with has to be
+// classified rather than parsed. Neither branch could have tested this on its
+// own.
+
+/// A conditional fixture that answers one status to everything, whatever the
+/// caller presented, optionally advertising a `Retry-After`.
+fn serve_conditional_status(
+    status: u16,
+    retry_after: Option<&'static str>,
+) -> (String, Arc<AtomicUsize>) {
+    let served = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&served);
+    let base = serve_with(move |_| {
+        counter.fetch_add(1, Ordering::Relaxed);
+        // A body that would parse as a packument if anything were careless
+        // enough to read it. That is the failure being excluded.
+        let response = tiny_http::Response::from_string(LODASH_PACKUMENT).with_status_code(status);
+        match retry_after {
+            Some(delay) => response.with_header(header("Retry-After", delay)),
+            None => response,
+        }
+    });
+    (base, served)
+}
+
+#[test]
+fn a_revalidation_that_is_rate_limited_is_not_a_packument() {
+    // The dangerous one. A 429 body read as metadata would hand the resolver a
+    // packument the registry never sent, on the path the cache takes for every
+    // stale entry.
+    // `Retry-After: 0` keeps the test instant while still going through the
+    // rate-limit path: the schedule itself is pinned by the tests above, and
+    // what is at stake here is that the response is classified at all.
+    let (base, served) = serve_conditional_status(429, Some("0"));
+    let registry = HttpRegistry::with_base_url(base);
+
+    let result = registry.packument_conditional("lodash", Some("\"old\""));
+
+    assert!(
+        matches!(result, Err(RegistryError::Network { .. })),
+        "a rate-limited revalidation must be an error, got {result:?}"
+    );
+    assert_eq!(
+        served.load(Ordering::Relaxed),
+        3,
+        "a 429 is retried on the rate-limit schedule, like any other"
+    );
+}
+
+#[test]
+fn a_revalidation_of_a_package_that_is_gone_is_not_a_packument() {
+    let (base, served) = serve_conditional_status(404, None);
+    let registry = HttpRegistry::with_base_url(base);
+
+    let result = registry.packument_conditional("lodash", Some("\"old\""));
+
+    assert!(
+        matches!(result, Err(RegistryError::PackageNotFound(_))),
+        "a 404 revalidation must report the package gone, got {result:?}"
+    );
+    assert_eq!(
+        served.load(Ordering::Relaxed),
+        1,
+        "a 404 is a definite answer on this path too"
+    );
+}
+
+#[test]
+fn a_revalidation_that_matches_is_not_a_retry() {
+    // 304 is not `is_success`, so a status check that asked only that question
+    // would turn every confirmed-current entry into three requests and an
+    // error. The cache would then re-download exactly what it revalidated.
+    let (base, seen) = serve_conditional("\"abc123\"", LODASH_PACKUMENT);
+    let registry = HttpRegistry::with_base_url(base);
+
+    let fetched = registry
+        .packument_conditional("lodash", Some("\"abc123\""))
+        .unwrap();
+
+    assert!(matches!(fetched, Fetched::NotModified));
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        1,
+        "a 304 is an answer, not something to try again"
     );
 }
