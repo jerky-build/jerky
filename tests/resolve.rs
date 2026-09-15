@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use jerky::registry::MAX_CONCURRENT_FETCHES;
+use jerky::registry::RegistryError;
 use jerky::resolver::{Declared, ImporterPath, Kind, Resolution, ResolveError, resolve};
 use jerky::testing::FixtureRegistry;
 
@@ -869,4 +870,256 @@ fn a_missing_package_is_named_and_is_the_same_one_every_time() {
         only.contains("zzz-gone"),
         "the error did not name the package the walk reaches first: {only}"
     );
+}
+
+#[test]
+fn an_alias_resolves_the_package_it_names_under_the_key_it_was_given() {
+    // `@isaacs/cliui` declares `string-width-cjs: npm:string-width@^4.2.0`, so
+    // a name jerky must ask the registry about is not the name the edge is
+    // recorded under. Nothing in the registry answers to `width-cjs`.
+    let registry = FixtureRegistry::new().with_tree(&[
+        (
+            "cliui",
+            "1.0.0",
+            &[("width-cjs", "npm:string-width@^4.0.0")],
+        ),
+        ("string-width", "4.2.3", &[]),
+    ]);
+
+    let graph = resolve(&registry, &roots(&[("cliui", "^1.0.0")]), &no_members()).unwrap();
+
+    let cliui = graph
+        .packages
+        .values()
+        .find(|package| package.id.name == "cliui")
+        .expect("cliui resolved");
+    let aliased = cliui
+        .dependencies
+        .get("width-cjs")
+        .expect("the edge is recorded under the name the manifest used");
+    assert_eq!(aliased.name, "string-width");
+    assert_eq!(aliased.version, "4.2.3");
+
+    // And the node it points at is the real package, keyed by its own name —
+    // not a `width-cjs@4.2.3` that no registry could serve.
+    assert!(
+        graph.packages.contains_key(aliased),
+        "the alias target is not a node in the graph: {:?}",
+        graph.packages.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        !graph.packages.keys().any(|id| id.name == "width-cjs"),
+        "the local name became a package of its own"
+    );
+}
+
+#[test]
+fn two_names_for_one_package_resolve_to_one_node() {
+    // The point of keying selection on what was *asked for* rather than on the
+    // name it was asked under: one entry in the store, one download, however
+    // many local names reach it.
+    let registry = FixtureRegistry::new().with_tree(&[
+        (
+            "app",
+            "1.0.0",
+            &[
+                ("width-cjs", "npm:string-width@^4.0.0"),
+                ("width-legacy", "npm:string-width@^4.0.0"),
+                ("string-width", "^4.0.0"),
+            ],
+        ),
+        ("string-width", "4.2.3", &[]),
+    ]);
+
+    let graph = resolve(&registry, &roots(&[("app", "^1.0.0")]), &no_members()).unwrap();
+
+    let widths: Vec<_> = graph
+        .packages
+        .keys()
+        .filter(|id| id.name == "string-width")
+        .collect();
+    assert_eq!(widths.len(), 1, "one package became {}", widths.len());
+    assert_eq!(
+        registry.packument_calls_for("string-width"),
+        1,
+        "the same package was fetched once per name it was asked under"
+    );
+    assert_eq!(registry.packument_calls_for("width-cjs"), 0);
+}
+
+#[test]
+fn an_importers_own_alias_records_the_specifier_verbatim() {
+    // jerky pins exact, so the *resolution* is the concrete version — but the
+    // specifier recorded beside it is the whole `npm:` string, because that is
+    // what the manifest says and what staleness is measured against. A
+    // normalised `^4.0.0` would read as unchanged after an edit that changed
+    // which package is being aliased.
+    let registry = FixtureRegistry::new().with_tree(&[("string-width", "4.2.3", &[])]);
+
+    let graph = resolve(
+        &registry,
+        &roots(&[("width-cjs", "npm:string-width@^4.0.0")]),
+        &no_members(),
+    )
+    .unwrap();
+
+    let dependency = &graph.importers[&ImporterPath::root()].dependencies["width-cjs"];
+    assert_eq!(dependency.specifier, "npm:string-width@^4.0.0");
+    match &dependency.resolution {
+        Resolution::Registry(id) => {
+            assert_eq!(id.name, "string-width");
+            assert_eq!(id.version, "4.2.3");
+        }
+        other => panic!("expected a registry resolution, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_alias_without_a_version_takes_the_latest_tag() {
+    let registry = FixtureRegistry::new().with_tree(&[("string-width", "4.2.3", &[])]);
+
+    let graph = resolve(
+        &registry,
+        &roots(&[("width-cjs", "npm:string-width")]),
+        &no_members(),
+    )
+    .unwrap();
+
+    match &graph.importers[&ImporterPath::root()].dependencies["width-cjs"].resolution {
+        Resolution::Registry(id) => assert_eq!(id.to_string(), "string-width@4.2.3"),
+        other => panic!("expected a registry resolution, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_scoped_package_can_be_aliased() {
+    // The alias target splits on its *last* `@` for the same reason a lockfile
+    // key does: the first one is the scope.
+    let registry = FixtureRegistry::new()
+        .with_tree(&[("@scope/real", "2.0.0", &[]), ("caller", "1.0.0", &[])])
+        .with_tree(&[("caller", "1.0.0", &[("local", "npm:@scope/real@^2.0.0")])]);
+
+    let graph = resolve(&registry, &roots(&[("caller", "^1.0.0")]), &no_members()).unwrap();
+
+    let caller = graph
+        .packages
+        .values()
+        .find(|package| package.id.name == "caller")
+        .expect("caller resolved");
+    assert_eq!(caller.dependencies["local"].name, "@scope/real");
+    assert_eq!(caller.dependencies["local"].version, "2.0.0");
+}
+
+#[test]
+fn an_unsupported_scheme_says_so_rather_than_blaming_the_range() {
+    // `file:`, `git:` and `github:` are all real and none are supported. The
+    // failure a user sees should name the reason, not report a perfectly
+    // well-formed specifier as a bad version range — which is what jerky did
+    // for `npm:` before it understood one.
+    let registry = FixtureRegistry::new().with_tree(&[("a", "1.0.0", &[])]);
+
+    let err = resolve(
+        &registry,
+        &roots(&[("a", "github:expressjs/express")]),
+        &no_members(),
+    )
+    .unwrap_err();
+
+    match err {
+        ResolveError::UnsupportedScheme {
+            name,
+            specifier,
+            scheme,
+        } => {
+            assert_eq!(name, "a");
+            assert_eq!(specifier, "github:expressjs/express");
+            assert_eq!(scheme, "github");
+        }
+        other => panic!("expected an unsupported-scheme error, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_alias_naming_nothing_is_still_a_missing_package() {
+    let registry = FixtureRegistry::new().with_tree(&[("a", "1.0.0", &[])]);
+
+    let err = resolve(
+        &registry,
+        &roots(&[("local", "npm:not-published@^1.0.0")]),
+        &no_members(),
+    )
+    .unwrap_err();
+
+    // Matched on the variant rather than the message: the specifier itself
+    // contains "not-published", so an error that merely echoed what was
+    // declared would satisfy a substring check while proving nothing.
+    match err {
+        ResolveError::Registry(RegistryError::PackageNotFound(missing)) => {
+            assert_eq!(missing, "not-published")
+        }
+        other => panic!("expected the aliased package to be reported missing, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_alias_naming_no_package_is_malformed_rather_than_unsupported() {
+    // `npm:` is the one scheme jerky understands, so "jerky does not
+    // understand `npm:` specifiers" is the wrong complaint about every one of
+    // these. `npm:@1.0.0` is the subtle one: the leading `@` reads as a scope,
+    // so the target parses as a package named `@1.0.0` and would otherwise be
+    // sent to the registry as a name.
+    for specifier in ["npm:", "npm:@1.0.0", "npm:@scope", "npm:@/pkg"] {
+        let registry = FixtureRegistry::new().with_tree(&[("a", "1.0.0", &[])]);
+        let err = resolve(&registry, &roots(&[("local", specifier)]), &no_members()).unwrap_err();
+
+        match err {
+            ResolveError::MalformedAlias {
+                name,
+                specifier: got,
+            } => {
+                assert_eq!(name, "local");
+                assert_eq!(got, specifier);
+            }
+            other => panic!("expected `{specifier}` to be malformed, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn two_importers_aliasing_one_package_share_its_node() {
+    // The workspace form of dedup, and the one #73 asked for: two members,
+    // two different local names, one package. A resolver keyed on the name a
+    // dependency was declared under would give each its own node, its own
+    // store entry and its own download.
+    let registry = FixtureRegistry::new().with_tree(&[("string-width", "4.2.3", &[])]);
+
+    let roots = BTreeMap::from([
+        (
+            ImporterPath::new("apps/web").unwrap(),
+            section(&[("width-cjs", "npm:string-width@^4.0.0")], Kind::Prod),
+        ),
+        (
+            ImporterPath::new("packages/ui").unwrap(),
+            section(&[("width-legacy", "npm:string-width@^4.0.0")], Kind::Prod),
+        ),
+    ]);
+
+    let graph = resolve(&registry, &roots, &no_members()).unwrap();
+
+    assert_eq!(
+        graph.packages.len(),
+        1,
+        "one package resolved to {} nodes",
+        graph.packages.len()
+    );
+    assert_eq!(registry.packument_calls_for("string-width"), 1);
+
+    // Both importers point at the same node under their own chosen names.
+    for (path, local) in [("apps/web", "width-cjs"), ("packages/ui", "width-legacy")] {
+        let importer = &graph.importers[&ImporterPath::new(path).unwrap()];
+        match &importer.dependencies[local].resolution {
+            Resolution::Registry(id) => assert_eq!(id.to_string(), "string-width@4.2.3"),
+            other => panic!("expected a registry resolution, got {other:?}"),
+        }
+    }
 }

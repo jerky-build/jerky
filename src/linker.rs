@@ -295,21 +295,47 @@ pub fn symlink_local(
 /// out and back down is what keeps the target inside the store rather than
 /// reaching into an importer's `node_modules`, so a package sees exactly the
 /// dependencies it declared and nothing a sibling happens to have installed.
+///
+/// The two names are separate because an alias makes them differ: a dependent
+/// declaring `npm:string-width@^4.0.0` under `width-cjs` calls it by the local
+/// name in its own source, while the directory it must land on is the real
+/// package's — `.jerky/b@1.0.0/node_modules/width-cjs ->
+/// ../../string-width@4.2.3/node_modules/string-width`. Passing one name for
+/// both is correct for every dependency that is not an alias and silently
+/// wrong for every one that is.
 pub fn symlink_into_store(
     owner_entry: &Path,
-    pkg_name: &str,
-    dir_name: &str,
+    link_name: &str,
+    target: &StoreEntry<'_>,
 ) -> Result<(), LinkError> {
     let link_dir = owner_entry.join("node_modules");
     let virtual_store = owner_entry
         .parent()
         .expect("a store entry is a directory inside the virtual store, so it has a parent");
-    let entry = virtual_store
-        .join(dir_name)
-        .join("node_modules")
-        .join(pkg_name);
 
-    link_at(&link_dir, pkg_name, &entry)
+    link_at(&link_dir, link_name, &target.path_under(virtual_store))
+}
+
+/// Where a package sits in a virtual store: the entry directory, and the name
+/// of the package nested inside it.
+///
+/// A pair rather than two parameters because they are never useful apart and
+/// are easy to hand over in the wrong order — both are strings, and swapping
+/// them produces a link that resolves to nothing rather than a compile error.
+pub struct StoreEntry<'a> {
+    /// The entry's directory name, which is the package's `name@version`.
+    pub dir_name: &'a str,
+    /// The package's own name, which is the directory nested inside it.
+    pub pkg_name: &'a str,
+}
+
+impl StoreEntry<'_> {
+    fn path_under(&self, virtual_store: &Path) -> PathBuf {
+        virtual_store
+            .join(self.dir_name)
+            .join("node_modules")
+            .join(self.pkg_name)
+    }
 }
 
 /// Link `<importer_dir>/node_modules/<pkg_name>` at the package's directory in
@@ -324,22 +350,18 @@ pub fn symlink_into_store(
 pub fn symlink_dependency_from(
     importer_dir: &Path,
     workspace_root: &Path,
-    pkg_name: &str,
-    dir_name: &str,
+    link_name: &str,
+    target: &StoreEntry<'_>,
 ) -> Result<(), LinkError> {
     debug_assert!(
         importer_dir.starts_with(workspace_root),
         "an importer outside its own workspace would be handed a climb that escapes the root"
     );
 
-    let entry = workspace_root
-        .join("node_modules")
-        .join(VIRTUAL_STORE_DIR)
-        .join(dir_name)
-        .join("node_modules")
-        .join(pkg_name);
+    let virtual_store = workspace_root.join("node_modules").join(VIRTUAL_STORE_DIR);
+    let entry = target.path_under(&virtual_store);
 
-    link_at(&importer_dir.join("node_modules"), pkg_name, &entry)
+    link_at(&importer_dir.join("node_modules"), link_name, &entry)
 }
 
 /// An entry in a `node_modules` that convergence declined to remove, and why.
@@ -736,9 +758,21 @@ fn remove_entry(path: &Path) -> Result<(), LinkError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The overwhelmingly common case: a store entry whose package name is the
+    /// name half of its own directory. Alias cases spell out both.
     use std::os::unix::fs::MetadataExt as _;
     use std::os::unix::fs::PermissionsExt as _;
     use tempfile::TempDir;
+
+    /// A store entry, with both names spelled out.
+    ///
+    /// Deliberately not derived from `dir_name`: deriving it would mean these
+    /// tests agree with themselves about how the two relate rather than with
+    /// the caller, and that pairing is exactly what an alias breaks.
+    fn entry<'a>(dir_name: &'a str, pkg_name: &'a str) -> StoreEntry<'a> {
+        StoreEntry { dir_name, pkg_name }
+    }
 
     fn store_entry(root: &Path) -> PathBuf {
         let entry = root.join("store-entry");
@@ -856,7 +890,13 @@ mod tests {
         let node_modules = root.path().join("node_modules");
         populate_virtual_store(&src, &node_modules, "lodash@4.17.21", "lodash").unwrap();
 
-        symlink_dependency_from(root.path(), root.path(), "lodash", "lodash@4.17.21").unwrap();
+        symlink_dependency_from(
+            root.path(),
+            root.path(),
+            "lodash",
+            &entry("lodash@4.17.21", "lodash"),
+        )
+        .unwrap();
 
         let link = node_modules.join("lodash");
         let target = std::fs::read_link(&link).unwrap();
@@ -880,8 +920,20 @@ mod tests {
         populate_virtual_store(&src, &node_modules, "lodash@4.17.21", "lodash").unwrap();
         populate_virtual_store(&src, &node_modules, "lodash@3.0.0", "lodash").unwrap();
 
-        symlink_dependency_from(root.path(), root.path(), "lodash", "lodash@3.0.0").unwrap();
-        symlink_dependency_from(root.path(), root.path(), "lodash", "lodash@4.17.21").unwrap();
+        symlink_dependency_from(
+            root.path(),
+            root.path(),
+            "lodash",
+            &entry("lodash@3.0.0", "lodash"),
+        )
+        .unwrap();
+        symlink_dependency_from(
+            root.path(),
+            root.path(),
+            "lodash",
+            &entry("lodash@4.17.21", "lodash"),
+        )
+        .unwrap();
 
         let target = std::fs::read_link(node_modules.join("lodash")).unwrap();
         assert_eq!(
@@ -917,8 +969,13 @@ mod tests {
         let root = TempDir::new().unwrap();
         let (workspace_root, importer_dir) = workspace(root.path(), ".", "lodash@4.17.21");
 
-        symlink_dependency_from(&importer_dir, &workspace_root, "lodash", "lodash@4.17.21")
-            .unwrap();
+        symlink_dependency_from(
+            &importer_dir,
+            &workspace_root,
+            "lodash",
+            &entry("lodash@4.17.21", "lodash"),
+        )
+        .unwrap();
 
         let link = importer_dir.join("node_modules").join("lodash");
         assert_eq!(
@@ -957,7 +1014,13 @@ mod tests {
             let importer_dir = workspace_root.join(importer);
             std::fs::create_dir_all(&importer_dir).unwrap();
 
-            symlink_dependency_from(&importer_dir, &workspace_root, "lodash", dir_name).unwrap();
+            symlink_dependency_from(
+                &importer_dir,
+                &workspace_root,
+                "lodash",
+                &entry(dir_name, "lodash"),
+            )
+            .unwrap();
 
             let link = importer_dir.join("node_modules").join("lodash");
             assert_eq!(
@@ -977,8 +1040,13 @@ mod tests {
         let root = TempDir::new().unwrap();
         let (workspace_root, importer_dir) = workspace(root.path(), "ui", "lodash@4.17.21");
 
-        symlink_dependency_from(&importer_dir, &workspace_root, "lodash", "lodash@4.17.21")
-            .unwrap();
+        symlink_dependency_from(
+            &importer_dir,
+            &workspace_root,
+            "lodash",
+            &entry("lodash@4.17.21", "lodash"),
+        )
+        .unwrap();
 
         let link = importer_dir.join("node_modules").join("lodash");
         assert_eq!(
@@ -999,7 +1067,7 @@ mod tests {
         let owner = populate_virtual_store(&src, &node_modules, "b@1.0.0", "b").unwrap();
         populate_virtual_store(&src, &node_modules, "d@1.5.0", "d").unwrap();
 
-        symlink_into_store(&owner, "d", "d@1.5.0").unwrap();
+        symlink_into_store(&owner, "d", &entry("d@1.5.0", "d")).unwrap();
 
         let link = owner.join("node_modules").join("d");
         assert_eq!(

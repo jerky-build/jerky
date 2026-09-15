@@ -3169,3 +3169,203 @@ fn a_locked_integrity_mismatch_is_caught_before_anything_is_downloaded() {
         "tarballs were downloaded before the locked-integrity gate ran"
     );
 }
+
+/// A registry holding one real package plus a caller that reaches it under a
+/// different name — the `@isaacs/cliui` shape, reduced.
+fn aliasing_registry() -> FixtureRegistry {
+    // `with_packument` throughout: it builds each version's tarball from the
+    // name and version it is given, and unlike `with_package` it carries the
+    // dependency edges — which is the whole point here.
+    FixtureRegistry::new()
+        .with_packument("string-width", &[("4.2.3", &[])])
+        .with_packument(
+            "cliui",
+            &[("1.0.0", &[("width-cjs", "npm:string-width@^4.0.0")])],
+        )
+}
+
+#[test]
+fn an_aliased_dependency_is_linked_under_its_local_name() {
+    // The link a package sees must be the name it wrote in its own source —
+    // `require('width-cjs')` — while the directory it lands on is the real
+    // package. One name for the link, another for the target.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let store = Store::new(home.path().join("store"));
+
+    write_manifest(root, r#"{"name":"demo","dependencies":{"cliui":"1.0.0"}}"#);
+    sync(
+        &solo(root),
+        &store,
+        &aliasing_registry(),
+        None,
+        Mode::Develop,
+    )
+    .unwrap();
+
+    let owner = root.join("node_modules/.jerky/cliui@1.0.0/node_modules");
+    let link = owner.join("width-cjs");
+    assert!(
+        std::fs::symlink_metadata(&link).is_ok(),
+        "the alias was not linked under the name its dependent uses"
+    );
+
+    // Read through it: proves the link resolves and lands on the real package
+    // rather than on a directory named after the alias.
+    let raw = std::fs::read_to_string(link.join("package.json")).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(parsed["name"], "string-width");
+    assert_eq!(parsed["version"], "4.2.3");
+
+    // And the store holds it under its own name, not the alias.
+    assert!(
+        root.join("node_modules/.jerky/string-width@4.2.3").is_dir(),
+        "the store entry is not keyed by the real package"
+    );
+    assert!(
+        !root.join("node_modules/.jerky/width-cjs@4.2.3").exists(),
+        "the local name became a store entry of its own"
+    );
+}
+
+#[test]
+fn an_importer_may_alias_a_package_itself() {
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let store = Store::new(home.path().join("store"));
+
+    write_manifest(
+        root,
+        r#"{"name":"demo","dependencies":{"width-cjs":"npm:string-width@^4.0.0"}}"#,
+    );
+    sync(
+        &solo(root),
+        &store,
+        &aliasing_registry(),
+        None,
+        Mode::Develop,
+    )
+    .unwrap();
+
+    let raw = std::fs::read_to_string(root.join("node_modules/width-cjs/package.json")).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(parsed["name"], "string-width");
+    assert_eq!(parsed["version"], "4.2.3");
+}
+
+#[test]
+fn an_aliased_install_reuses_its_lockfile() {
+    // The round trip that matters in practice: resolve once, then install
+    // again from what was recorded and reach the registry not at all. A
+    // lockfile that lost the alias would re-resolve, or fail outright.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let store = Store::new(home.path().join("store"));
+    let registry = aliasing_registry();
+
+    write_manifest(root, r#"{"name":"demo","dependencies":{"cliui":"1.0.0"}}"#);
+    sync(&solo(root), &store, &registry, None, Mode::Develop).unwrap();
+
+    let before = registry.packument_calls();
+    std::fs::remove_dir_all(root.join("node_modules")).unwrap();
+    sync(&solo(root), &store, &registry, None, Mode::Develop).unwrap();
+
+    assert_eq!(
+        registry.packument_calls(),
+        before,
+        "the second install re-resolved, so the lockfile did not describe the alias"
+    );
+    let raw = std::fs::read_to_string(
+        root.join("node_modules/.jerky/cliui@1.0.0/node_modules/width-cjs/package.json"),
+    )
+    .unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(parsed["name"], "string-width");
+}
+
+#[test]
+fn installing_an_alias_records_the_scheme_not_just_the_version() {
+    // #73 asks the CLI to support this or refuse it, and specifically not to
+    // half-work. Recording the bare version is the half-working answer: the
+    // link is right, and the *next* install asks the registry for a
+    // `width-cjs@4.2.3` that does not exist.
+    //
+    // jerky pins by default, so the pin goes inside the scheme rather than
+    // replacing it.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let store = Store::new(home.path().join("store"));
+
+    write_manifest(root, r#"{"name":"demo"}"#);
+    let outcome = install(
+        &solo(root),
+        &ImporterPath::root(),
+        &store,
+        &aliasing_registry(),
+        &spec(
+            "width-cjs",
+            VersionSpec::Exact("npm:string-width@^4.0.0".to_string()),
+        ),
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(added(outcome).specifier, "npm:string-width@^4.0.0");
+
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(root.join("package.json")).unwrap()).unwrap();
+    assert_eq!(
+        manifest["dependencies"]["width-cjs"], "npm:string-width@^4.0.0",
+        "a range the user typed is theirs to keep, inside the scheme"
+    );
+}
+
+#[test]
+fn an_alias_without_a_range_is_pinned_inside_the_scheme() {
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let store = Store::new(home.path().join("store"));
+
+    write_manifest(root, r#"{"name":"demo"}"#);
+    install(
+        &solo(root),
+        &ImporterPath::root(),
+        &store,
+        &aliasing_registry(),
+        &spec(
+            "width-cjs",
+            VersionSpec::Exact("npm:string-width".to_string()),
+        ),
+        None,
+    )
+    .unwrap();
+
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(root.join("package.json")).unwrap()).unwrap();
+    assert_eq!(
+        manifest["dependencies"]["width-cjs"],
+        "npm:string-width@4.2.3"
+    );
+
+    // And what was recorded is installable on its own terms: a second install
+    // from that manifest alone resolves without the request that created it.
+    let fresh = TempDir::new().unwrap();
+    let store = Store::new(fresh.path().join("store"));
+    std::fs::remove_dir_all(root.join("node_modules")).unwrap();
+    std::fs::remove_file(root.join("jerky-lock.json")).unwrap();
+    sync(
+        &solo(root),
+        &store,
+        &aliasing_registry(),
+        None,
+        Mode::Develop,
+    )
+    .unwrap();
+
+    assert_eq!(linked_version(root, "width-cjs"), "4.2.3");
+}

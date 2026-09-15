@@ -130,6 +130,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   tar reader rather than by jerky; they are now jerky's own guarantee and a
   test fails if that stops being true
   ([#29](https://github.com/jerky-build/jerky/issues/29))
+- `npm:` alias specifiers resolve. A dependency declared as
+  `"width-cjs": "npm:string-width@^4.0.0"` installs `string-width` under the
+  name its dependent calls it by, which is what `@isaacs/cliui` does and
+  therefore what anything reaching a modern `glob` does — jerky previously
+  reported such a specifier as a malformed version range and stopped. The
+  package is stored and downloaded under its own name, so however many local
+  names reach it there is one entry and one request. The lockfile records the
+  real name beside the local one for a package's own dependencies as it
+  already did for an importer's, and `jerky install width-cjs@npm:string-
+  width@^4.0.0` records the whole `npm:` specifier in the manifest rather than
+  the bare version — with the pin *inside* the scheme, so the default is still
+  an exact version ([#73](https://github.com/jerky-build/jerky/issues/73)).
+- A specifier jerky does not understand now says so. `file:`, `git:`,
+  `github:` and anything else of the form `<scheme>:` are reported by name and
+  as unsupported, rather than as a version range that failed to parse and then
+  failed again as a dist-tag. None of them are supported; the difference is
+  that the error now says which one you wrote and that the scheme is the
+  problem.
 - Packuments are fetched concurrently during resolution, up to sixteen at a
   time. The walk now proceeds a level at a time: it takes the whole frontier,
   fetches every packument that frontier will ask for at once, and then walks it
