@@ -249,6 +249,31 @@ mod tests {
     }
 
     #[test]
+    fn an_alias_keeps_the_whole_scheme_as_its_version() {
+        // `width-cjs@npm:string-width@^4.0.0` has three `@` in it and must
+        // split at the *first*: everything after it is the specifier, which
+        // the resolver then splits at its own last `@`. Splitting anywhere
+        // else here yields a name of `width-cjs@npm:string-width` or a
+        // specifier of `^4.0.0` with the aliased package silently dropped.
+        let spec = parse_package_spec("width-cjs@npm:string-width@^4.0.0").unwrap();
+        assert_eq!(spec.name, "width-cjs");
+        assert_eq!(
+            spec.version,
+            VersionSpec::Exact("npm:string-width@^4.0.0".into())
+        );
+    }
+
+    #[test]
+    fn a_scoped_package_can_be_aliased_from_the_command_line() {
+        let spec = parse_package_spec("local@npm:@scope/real@^2.0.0").unwrap();
+        assert_eq!(spec.name, "local");
+        assert_eq!(
+            spec.version,
+            VersionSpec::Exact("npm:@scope/real@^2.0.0".into())
+        );
+    }
+
+    #[test]
     fn dist_tag_is_treated_as_an_exact_request() {
         let spec = parse_package_spec("react@next").unwrap();
         assert_eq!(spec.version, VersionSpec::Exact("next".into()));

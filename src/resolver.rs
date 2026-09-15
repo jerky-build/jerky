@@ -22,6 +22,20 @@ use crate::registry::{MAX_CONCURRENT_FETCHES, Packument, RegistryClient, Registr
 /// which matters only once a member is published.
 const WORKSPACE_PROTOCOL: &str = "workspace:";
 
+/// The scheme that renames a package: `npm:<name>@<range>` asks for one
+/// package under a different local name.
+pub const ALIAS_PROTOCOL: &str = "npm:";
+
+/// The package an `npm:` specifier names, and the range it asks of it — or
+/// `None` for every specifier that is not an alias.
+///
+/// Public because the resolver is not the only place that has to understand
+/// one: recording a request in a manifest has to keep the scheme, or the pin
+/// it writes names a package no registry serves.
+pub fn alias_target(specifier: &str) -> Option<(&str, &str)> {
+    specifier.strip_prefix(ALIAS_PROTOCOL).map(split_target)
+}
+
 #[derive(Debug, Error)]
 pub enum ResolveError {
     #[error(transparent)]
@@ -48,6 +62,16 @@ pub enum ResolveError {
         spec: String,
         tags: Vec<String>,
     },
+    #[error(
+        "`{name}` is declared as `{specifier}`, and jerky does not understand `{scheme}:` specifiers"
+    )]
+    UnsupportedScheme {
+        name: String,
+        specifier: String,
+        scheme: String,
+    },
+    #[error("`{name}` is declared as `{specifier}`, which names no package to alias")]
+    MalformedAlias { name: String, specifier: String },
     #[error("`{specifier}` names `{name}`, which is not a workspace member (members: {})", members.join(", "))]
     NoSuchMember {
         name: String,
@@ -353,8 +377,129 @@ impl ResolvedGraph {
 /// One edge waiting to be resolved: who asked, for what name, at what range.
 struct Pending {
     dependent: Dependent,
+    /// The name this dependency is declared *under*, which is the key its edge
+    /// is recorded at and the name its link takes. For an alias it is not the
+    /// name of the package it resolves to.
+    name: String,
+    /// What the manifest or the packument said, verbatim.
+    ///
+    /// Recorded in the lockfile, so it is never normalised: `width-cjs`
+    /// declared as `npm:string-width@^4.0.0` keeps the whole string, because
+    /// staleness is measured against it and an edit that changed *which*
+    /// package is aliased would otherwise read as no change at all.
+    specifier: String,
+    /// What to ask the registry, once the scheme has been read off. Equal to
+    /// `(name, specifier)` for every specifier that is not an alias.
+    asked: Asked,
+}
+
+/// The package a specifier asks for, and the range it asks of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Asked {
     name: String,
     range: String,
+}
+
+impl Asked {
+    /// Read a specifier for the package it names.
+    ///
+    /// Three cases, in the order they must be tried. `npm:` first, because the
+    /// generic scheme check below would otherwise swallow the one scheme jerky
+    /// understands. Then any other `<scheme>:`, refused by name — `file:`,
+    /// `git:` and `github:` are all real, none are supported, and reporting
+    /// one as a malformed version range says nothing a user can act on, which
+    /// is exactly what jerky did with `npm:` before it understood one. And
+    /// last the common case, a range or dist-tag for the package it is
+    /// declared under.
+    fn read(name: &str, specifier: &str) -> Result<Self, ResolveError> {
+        if let Some((aliased, range)) = alias_target(specifier) {
+            // A malformed alias is not an unsupported one, and must not be
+            // reported as "jerky does not understand `npm:`" — the scheme is
+            // the one thing here that is right.
+            if !is_plausible_name(aliased) {
+                return Err(ResolveError::MalformedAlias {
+                    name: name.to_string(),
+                    specifier: specifier.to_string(),
+                });
+            }
+            return Ok(Self {
+                name: aliased.to_string(),
+                range: range.to_string(),
+            });
+        }
+
+        if let Some(scheme) = scheme_of(specifier) {
+            return Err(ResolveError::UnsupportedScheme {
+                name: name.to_string(),
+                specifier: specifier.to_string(),
+                scheme: scheme.to_string(),
+            });
+        }
+
+        Ok(Self {
+            name: name.to_string(),
+            range: specifier.to_string(),
+        })
+    }
+}
+
+/// Split `name@version` into its halves, or `None` if it is not that shape.
+///
+/// The *last* `@` is the separator, so `@types/node@20.1.0` yields the scoped
+/// name and not an empty one — and `@scope/pkg` with no version yields `None`
+/// rather than a name of `` and a version of `scope/pkg`. This is the inverse
+/// of `Display for PackageId`, which is why it lives beside it; the lockfile
+/// reads its keys and its recorded aliases with the same function, because
+/// three spellings of one rule is three chances to disagree.
+pub(crate) fn split_name_and_version(key: &str) -> Option<(&str, &str)> {
+    key.rsplit_once('@')
+        .filter(|(name, version)| !name.is_empty() && !version.is_empty())
+}
+
+/// Split an alias target into the package and the range asked of it.
+///
+/// A target with no version is `latest`, which is npm's answer and which the
+/// dist-tag path already knows how to resolve.
+///
+/// Note this is *not* the rule `cli::parse_package_spec` applies. That one
+/// splits on the **first** `@` past a scope, and the difference is what makes
+/// `width-cjs@npm:string-width@^4.0.0` work at all: the command line takes the
+/// first `@` to separate the local name from everything else, and this takes
+/// the last to separate the aliased package from its range.
+fn split_target(target: &str) -> (&str, &str) {
+    split_name_and_version(target).unwrap_or((target, "latest"))
+}
+
+/// Is this a name the registry could conceivably answer to?
+///
+/// Only the shape a scope imposes, which is the part an alias can get wrong
+/// without looking wrong: `npm:@1.0.0` splits into a "package" of `@1.0.0`
+/// because the leading `@` reads as a scope, and would otherwise be sent to
+/// the registry as a name. Everything else — a name the registry simply does
+/// not have — is the registry's answer to give, not this function's.
+fn is_plausible_name(name: &str) -> bool {
+    match name.strip_prefix('@') {
+        Some(scoped) => match scoped.split_once('/') {
+            Some((scope, package)) => !scope.is_empty() && !package.is_empty(),
+            None => false,
+        },
+        None => !name.is_empty(),
+    }
+}
+
+/// The `<scheme>` of a `<scheme>:...` specifier, if it has one.
+///
+/// Deliberately lexical and deliberately narrow: a version range never
+/// contains a colon, so anything that looks like a scheme is one. The shape is
+/// the URI rule — a letter, then letters, digits, `+`, `.` or `-` — which is
+/// what keeps `>=1.0.0` and `1.x` out of it while catching `git+ssh:`.
+fn scheme_of(specifier: &str) -> Option<&str> {
+    let (scheme, _) = specifier.split_once(':')?;
+    let mut characters = scheme.chars();
+    let first = characters.next()?;
+    (first.is_ascii_alphabetic()
+        && characters.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-')))
+    .then_some(scheme)
 }
 
 /// Walk the dependency graph from every importer's declared ranges.
@@ -444,7 +589,8 @@ impl<'a> Walk<'a> {
                             kind: *kind,
                         },
                         name: name.clone(),
-                        range: specifier.clone(),
+                        specifier: specifier.clone(),
+                        asked: Asked::read(name, specifier)?,
                     });
                     continue;
                 }
@@ -511,9 +657,13 @@ impl<'a> Walk<'a> {
         let Pending {
             dependent,
             name,
-            range,
+            specifier,
+            asked,
         } = pending;
-        let id = self.select(&name, &range)?;
+        // Selection is keyed on the package asked for, not on the name it was
+        // asked under, so two local names for one package share a node, a
+        // packument and a store entry rather than each getting their own.
+        let id = self.select(&asked.name, &asked.range)?;
 
         // Record the edge on whoever asked for it. An importer's own
         // dependency is recorded against the importer rather than against a
@@ -528,7 +678,7 @@ impl<'a> Walk<'a> {
                 self.importers.entry(path).or_default().dependencies.insert(
                     name.clone(),
                     Dependency {
-                        specifier: range.clone(),
+                        specifier: specifier.clone(),
                         kind,
                         resolution: Resolution::Registry(id.clone()),
                     },
@@ -568,11 +718,12 @@ impl<'a> Walk<'a> {
         // `dependencies` only. A dependency's `devDependencies` must never be
         // followed — doing so pulls in most of the registry — which is why
         // `VersionMetadata` has no field for them to be read from.
-        for (dep_name, dep_range) in &metadata.dependencies {
+        for (dep_name, dep_specifier) in &metadata.dependencies {
             self.work.push_back(Pending {
                 dependent: Dependent::Package(id.clone()),
                 name: dep_name.clone(),
-                range: dep_range.clone(),
+                specifier: dep_specifier.clone(),
+                asked: Asked::read(dep_name, dep_specifier)?,
             });
         }
 
@@ -607,7 +758,7 @@ impl<'a> Walk<'a> {
     fn warm(&mut self, level: &[Pending]) {
         let wanted: Vec<&str> = level
             .iter()
-            .map(|pending| pending.name.as_str())
+            .map(|pending| pending.asked.name.as_str())
             .filter(|name| !self.packuments.contains_key(*name))
             .collect::<BTreeSet<&str>>()
             .into_iter()

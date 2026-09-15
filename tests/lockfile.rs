@@ -811,3 +811,73 @@ fn one_stale_importer_does_not_invalidate_the_others() {
         "apps/web should be detected as stale"
     );
 }
+
+#[test]
+fn a_transitive_alias_survives_the_round_trip() {
+    // The gap this test was written for: an importer's alias round-tripped
+    // correctly long before one could be produced, but a *package's* alias was
+    // written as a bare version and read back under the local name — turning
+    // `width-cjs -> string-width@4.2.3` into `width-cjs@4.2.3`, which is not a
+    // package any registry serves.
+    let registry = FixtureRegistry::new().with_tree(&[
+        (
+            "cliui",
+            "1.0.0",
+            &[("width-cjs", "npm:string-width@^4.0.0")],
+        ),
+        ("string-width", "4.2.3", &[]),
+    ]);
+    let dir = TempDir::new().unwrap();
+
+    let graph = resolve(&registry, &roots(&[("cliui", "^1.0.0")]), &no_members()).unwrap();
+    lockfile::save(&graph, dir.path()).unwrap();
+
+    // The real name is on disk, not inferred. Without it the entry is
+    // unidentifiable, since the key is the name the dependent chose.
+    let written = read(&dir);
+    assert!(
+        written.contains("string-width@4.2.3"),
+        "the alias target's name was not recorded: {written}"
+    );
+
+    let back = lockfile::load(dir.path()).unwrap().unwrap();
+    let cliui = back
+        .packages
+        .values()
+        .find(|package| package.id.name == "cliui")
+        .expect("cliui was recorded");
+    let aliased = &cliui.dependencies["width-cjs"];
+    assert_eq!(aliased.name, "string-width");
+    assert_eq!(aliased.version, "4.2.3");
+    assert!(
+        back.packages.contains_key(aliased),
+        "the edge read back points at no recorded package"
+    );
+}
+
+#[test]
+fn an_importers_alias_survives_the_round_trip() {
+    let registry = FixtureRegistry::new().with_tree(&[("string-width", "4.2.3", &[])]);
+    let dir = TempDir::new().unwrap();
+
+    let graph = resolve(
+        &registry,
+        &roots(&[("width-cjs", "npm:string-width@^4.0.0")]),
+        &no_members(),
+    )
+    .unwrap();
+    lockfile::save(&graph, dir.path()).unwrap();
+    let back = lockfile::load(dir.path()).unwrap().unwrap();
+
+    let dependency = &back.importers[&ImporterPath::root()].dependencies["width-cjs"];
+    assert_eq!(
+        dependency.specifier, "npm:string-width@^4.0.0",
+        "the specifier was normalised, so an edit to it would read as no change"
+    );
+    match &dependency.resolution {
+        jerky::resolver::Resolution::Registry(id) => {
+            assert_eq!(id.to_string(), "string-width@4.2.3")
+        }
+        other => panic!("expected a registry resolution, got {other:?}"),
+    }
+}

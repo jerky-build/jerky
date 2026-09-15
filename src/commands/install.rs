@@ -13,8 +13,8 @@ use crate::pool;
 use crate::range::{Range, Version};
 use crate::registry::{MAX_CONCURRENT_FETCHES, RegistryClient, RegistryError};
 use crate::resolver::{
-    self, Declared, Importer, ImporterPath, Kind, PackageId, Resolution, ResolveError,
-    ResolvedGraph, ResolvedPackage,
+    self, ALIAS_PROTOCOL, Declared, Importer, ImporterPath, Kind, PackageId, Resolution,
+    ResolveError, ResolvedGraph, ResolvedPackage,
 };
 use crate::store::{Store, StoreError};
 use crate::workspace::Workspace;
@@ -442,7 +442,8 @@ pub fn sync(
     for (id, package) in &graph.packages {
         let owner = &entries[id];
         for (dep_name, dep_id) in &package.dependencies {
-            linker::symlink_into_store(owner, dep_name, &dep_id.to_string())?;
+            let dir_name = dep_id.to_string();
+            linker::symlink_into_store(owner, dep_name, &store_entry(&dir_name, dep_id))?;
         }
     }
 
@@ -456,12 +457,15 @@ pub fn sync(
 
         for (name, dependency) in &resolved.dependencies {
             match &dependency.resolution {
-                Resolution::Registry(id) => linker::symlink_dependency_from(
-                    &member.path,
-                    workspace.root(),
-                    name,
-                    &id.to_string(),
-                )?,
+                Resolution::Registry(id) => {
+                    let dir_name = id.to_string();
+                    linker::symlink_dependency_from(
+                        &member.path,
+                        workspace.root(),
+                        name,
+                        &store_entry(&dir_name, id),
+                    )?
+                }
                 // The graph records a path relative to the declaring importer,
                 // which is what the lockfile wants. Linking uses the member's
                 // own absolute directory instead: joining a relative target
@@ -774,6 +778,23 @@ fn fetch_one(
 ///
 /// The two differ more often than they look like they should, which is why
 /// this is one named function rather than an expression at the call site.
+/// Where a resolved package sits in the virtual store.
+///
+/// The one place that pairs the two, so a caller cannot get the order wrong:
+/// the entry's directory is the package's `name@version`, and the package
+/// nested inside it is named for the package itself — which for an alias is
+/// not the name the link takes.
+///
+/// `dir_name` is passed in rather than returned because it is a fresh
+/// `String` and [`linker::StoreEntry`] borrows; the caller owns it for as long
+/// as the link takes to write.
+fn store_entry<'a>(dir_name: &'a str, id: &'a PackageId) -> linker::StoreEntry<'a> {
+    linker::StoreEntry {
+        dir_name,
+        pkg_name: &id.name,
+    }
+}
+
 fn record_for(request: &Request, graph: &ResolvedGraph, workspace: &Workspace) -> Recorded {
     let resolved = &graph.importers[&request.importer].dependencies[&request.name];
 
@@ -788,12 +809,21 @@ fn record_for(request: &Request, graph: &ResolvedGraph, workspace: &Workspace) -
         // than supplying a missing one. `jerky install lodash@^4.0.0` records
         // `^4.0.0`; a dist-tag still pins, because `latest` in a manifest is a
         // moving pointer rather than a constraint.
-        Resolution::Registry(id) => (
-            declared_range(request.seed.as_request())
-                .unwrap_or(&id.version)
-                .to_string(),
-            id.version.clone(),
-        ),
+        // An alias keeps its scheme, with the pin or the range *inside* it.
+        // Recording the bare version would leave a manifest naming a
+        // `width-cjs@4.2.3` no registry serves, which is #73's "must not
+        // half-work": the link would be right and the next install wrong.
+        Resolution::Registry(id) => {
+            let seed = request.seed.as_request();
+            let specifier = match resolver::alias_target(seed) {
+                Some((aliased, range)) => format!(
+                    "{ALIAS_PROTOCOL}{aliased}@{}",
+                    declared_range(range).unwrap_or(&id.version)
+                ),
+                None => declared_range(seed).unwrap_or(&id.version).to_string(),
+            };
+            (specifier, id.version.clone())
+        }
         // `jerky install ui@workspace:*` names a member on purpose. The link
         // is already written by the loop above; what differs is what gets
         // recorded — the protocol as asked for, never a version, because the

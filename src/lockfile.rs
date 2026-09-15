@@ -13,7 +13,8 @@ use thiserror::Error;
 
 use crate::integrity::Integrity;
 use crate::resolver::{
-    Dependency, Importer, ImporterPath, Kind, PackageId, Resolution, ResolvedGraph, ResolvedPackage,
+    Dependency, Importer, ImporterPath, Kind, PackageId, Resolution, ResolvedGraph,
+    ResolvedPackage, split_name_and_version,
 };
 
 pub const LOCKFILE_NAME: &str = "jerky-lock.json";
@@ -174,17 +175,6 @@ struct Entry {
     dependencies: BTreeMap<String, String>,
 }
 
-/// Split a `name@version` key.
-///
-/// Splits on the *last* `@` so that `@types/node@20.1.0` yields the name
-/// `@types/node`. Scoped installs are spec 3, but the key format has to
-/// survive them or the lockfile needs a migration the day they land — the same
-/// reasoning spec 1 applied to `parse_package_spec`.
-fn split_key(key: &str) -> Option<(&str, &str)> {
-    key.rsplit_once('@')
-        .filter(|(name, version)| !name.is_empty() && !version.is_empty())
-}
-
 /// Does a `link:` target, read relative to its importer, stay inside the
 /// workspace?
 ///
@@ -227,7 +217,20 @@ pub fn save(graph: &ResolvedGraph, project_dir: &Path) -> Result<(), LockfileErr
                     dependencies: package
                         .dependencies
                         .iter()
-                        .map(|(name, id)| (name.clone(), id.version.clone()))
+                        // The same two spellings the importer block uses, and
+                        // for the same reason: the key is the name the
+                        // dependent declared this under, which for an alias is
+                        // not the package's own. Recording the bare version
+                        // there would leave the edge pointing at a
+                        // `width-cjs@4.2.3` no registry serves.
+                        .map(|(name, id)| {
+                            let recorded = if &id.name == name {
+                                id.version.clone()
+                            } else {
+                                id.to_string()
+                            };
+                            (name.clone(), recorded)
+                        })
                         .collect(),
                 },
             )
@@ -321,10 +324,11 @@ pub fn load(project_dir: &Path) -> Result<Option<ResolvedGraph>, LockfileError> 
 
     let mut packages = BTreeMap::new();
     for (key, entry) in on_disk.packages {
-        let (name, keyed_version) = split_key(&key).ok_or_else(|| LockfileError::BadKey {
-            path: path.clone(),
-            entry: key.clone(),
-        })?;
+        let (name, keyed_version) =
+            split_name_and_version(&key).ok_or_else(|| LockfileError::BadKey {
+                path: path.clone(),
+                entry: key.clone(),
+            })?;
 
         // The key and the entry state the version twice, so they can disagree.
         // Trusting one and ignoring the other lets two keys collapse into one
@@ -353,14 +357,21 @@ pub fn load(project_dir: &Path) -> Result<Option<ResolvedGraph>, LockfileError> 
         let dependencies = entry
             .dependencies
             .iter()
-            .map(|(dep_name, dep_version)| {
-                (
-                    dep_name.clone(),
-                    PackageId {
-                        name: dep_name.clone(),
-                        version: dep_version.clone(),
+            .map(|(dep_name, recorded)| {
+                // `split_key` or nothing, exactly as the importer block reads
+                // its own value: a bare version carries no `@`, so anything
+                // that splits is an alias naming the package it resolved to.
+                let id = match split_name_and_version(recorded) {
+                    Some((aliased, version)) => PackageId {
+                        name: aliased.to_string(),
+                        version: version.to_string(),
                     },
-                )
+                    None => PackageId {
+                        name: dep_name.clone(),
+                        version: recorded.clone(),
+                    },
+                };
+                (dep_name.clone(), id)
             })
             .collect();
 
@@ -440,7 +451,7 @@ pub fn load(project_dir: &Path) -> Result<Option<ResolvedGraph>, LockfileError> 
                     // in pnpm's own lockfile — so the recorded value carries
                     // the name whenever it differs, and only falls back to the
                     // key when it does not.
-                    let id = match split_key(&dependency.version) {
+                    let id = match split_name_and_version(&dependency.version) {
                         Some((aliased_name, version)) => PackageId {
                             name: aliased_name.to_string(),
                             version: version.to_string(),
