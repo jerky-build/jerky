@@ -1,7 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use thiserror::Error;
 
@@ -11,8 +9,9 @@ use crate::integrity::{Integrity, IntegrityError};
 use crate::linker::{self, LinkError, Unowned};
 use crate::lockfile::{self, LockfileError};
 use crate::manifest::{Manifest, ManifestError};
+use crate::pool;
 use crate::range::{Range, Version};
-use crate::registry::{RegistryClient, RegistryError};
+use crate::registry::{MAX_CONCURRENT_FETCHES, RegistryClient, RegistryError};
 use crate::resolver::{
     self, Declared, Importer, ImporterPath, Kind, PackageId, Resolution, ResolveError,
     ResolvedGraph, ResolvedPackage,
@@ -93,19 +92,6 @@ pub enum InstallError {
     )]
     ProductionLockfileImporterGone { importer: String },
 }
-
-/// How many tarballs are in flight at once.
-///
-/// This is latency-bound fan-out, not a CPU workload, so the cap is not tied
-/// to core count: a thread waiting on a socket is not competing for anything.
-/// Sixteen is where the measured gain on a real tree flattens: installing
-/// express's 69 packages into a cold store from a matching lockfile — the CI
-/// and fresh-clone case, where every tarball is fetched and no metadata is —
-/// went from 3.36s serially to 0.40s at this width. It stays far below the
-/// point where a registry starts treating one client as abusive. A cap exists
-/// at all because a resolved graph can hold thousands of packages, and one
-/// thread per package is how an install gets an IP rate-limited.
-pub const MAX_CONCURRENT_FETCHES: usize = 16;
 
 /// What a sync is for.
 ///
@@ -737,53 +723,19 @@ fn fetch_missing(
         return Ok(());
     }
 
-    let next = AtomicUsize::new(0);
-    let failed = AtomicBool::new(false);
-    // Keyed by position in `missing`, which is `graph.packages` order, so the
-    // error a user sees is chosen by where the package sits in the graph and
-    // not by which worker happened to lose. An install that blamed a different
-    // package on each run would be untriageable.
+    // `missing` is in `graph.packages` order, so the failure `drain` reports —
+    // the lowest-indexed one — is chosen by where the package sits in the
+    // graph rather than by which worker happened to lose. An install that
+    // blamed a different package on each run would be untriageable.
     //
-    // What makes that hold: every claim below is a `fetch_add`, so the claimed
-    // indices are a contiguous prefix however the workers interleave, and
-    // `failed` decides only how far that prefix extends. The lowest index that
-    // fails is always inside it — the prefix stopped growing *because*
-    // something in it failed — so taking the first entry of this map is taking
-    // the same package every time.
-    let failures: Mutex<BTreeMap<usize, InstallError>> = Mutex::new(BTreeMap::new());
-
-    // No more threads than there is work: a two-package install should not
-    // start sixteen of them.
-    let workers = MAX_CONCURRENT_FETCHES.min(missing.len());
-
-    std::thread::scope(|scope| {
-        for _ in 0..workers {
-            scope.spawn(|| {
-                while !failed.load(Ordering::Relaxed) {
-                    let index = next.fetch_add(1, Ordering::Relaxed);
-                    let Some((id, package)) = missing.get(index) else {
-                        break;
-                    };
-
-                    if let Err(err) = fetch_one(id, package, store, registry) {
-                        // Stops the pool taking *new* work. Fetches already in
-                        // flight still finish and may commit, which is correct:
-                        // the store is a machine-global cache of verified
-                        // bytes, and an entry landing there is not a claim that
-                        // any project depends on it. What must not happen is a
-                        // link or a manifest edit, and neither is reached.
-                        failed.store(true, Ordering::Relaxed);
-                        failures.lock().unwrap().insert(index, err);
-                    }
-                }
-            });
-        }
-    });
-
-    match failures.into_inner().unwrap().into_values().next() {
-        Some(err) => Err(err),
-        None => Ok(()),
-    }
+    // A fetch already in flight when another fails still finishes and may
+    // commit, which is correct here: the store is a machine-global cache of
+    // verified bytes, and an entry landing in it is not a claim that any
+    // project depends on it. What must not happen is a link or a manifest
+    // edit, and this function reaches neither.
+    pool::drain(&missing, MAX_CONCURRENT_FETCHES, |(id, package)| {
+        fetch_one(id, package, store, registry)
+    })
 }
 
 /// One package: fetch, verify, extract into the store.

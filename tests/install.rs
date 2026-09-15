@@ -3003,9 +3003,9 @@ fn concurrency_is_bounded() {
     // Comfortably more packages than the cap, so an unbounded implementation —
     // one thread per package — is visible as a peak above it. Unbounded fan-out
     // at the registry is what gets an IP rate-limited.
-    let count = jerky::commands::install::MAX_CONCURRENT_FETCHES * 2;
-    let registry = wide_registry(count)
-        .with_tarball_rendezvous(jerky::commands::install::MAX_CONCURRENT_FETCHES);
+    let count = jerky::registry::MAX_CONCURRENT_FETCHES * 2;
+    let registry =
+        wide_registry(count).with_tarball_rendezvous(jerky::registry::MAX_CONCURRENT_FETCHES);
     write_manifest(root, &wide_manifest(count));
 
     sync(&solo(root), &store, &registry, None, Mode::Develop).unwrap();
@@ -3014,11 +3014,18 @@ fn concurrency_is_bounded() {
         registry.tarballs_met_rendezvous(),
         "the pool never reached its own cap, so the cap is not the limit in force"
     );
+    // Necessary but not sufficient, and deliberately so. `peak_concurrent_
+    // tarballs` is an exact peak, so a peak above the cap is a real failure —
+    // but an unbounded pool is not *guaranteed* to be caught, since it would
+    // have to be observed above the cap rather than merely be capable of it.
+    // Proving the upper bound outright means a rendezvous one wider than the
+    // cap, asserted to time out, and that costs `RENDEZVOUS_TIMEOUT` on every
+    // run of a suite that finishes in well under a second.
     assert!(
-        registry.peak_concurrent_tarballs() <= jerky::commands::install::MAX_CONCURRENT_FETCHES,
+        registry.peak_concurrent_tarballs() <= jerky::registry::MAX_CONCURRENT_FETCHES,
         "fetched {} at once, above the cap of {}",
         registry.peak_concurrent_tarballs(),
-        jerky::commands::install::MAX_CONCURRENT_FETCHES
+        jerky::registry::MAX_CONCURRENT_FETCHES
     );
     assert_eq!(
         registry.tarball_calls(),

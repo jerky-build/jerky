@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use jerky::registry::MAX_CONCURRENT_FETCHES;
 use jerky::resolver::{Declared, ImporterPath, Kind, Resolution, ResolveError, resolve};
 use jerky::testing::FixtureRegistry;
 
@@ -639,4 +640,233 @@ fn a_registry_packages_dev_dependencies_are_still_not_followed() {
     // is not passing because nothing happened at all.
     let dependency = &graph.importers[&ImporterPath::new("packages/ui").unwrap()].dependencies["a"];
     assert_eq!(dependency.kind, Kind::Dev);
+}
+
+/// `count` leaves with no dependencies of their own, plus the declaration that
+/// asks for all of them.
+///
+/// They are declared by the *importer* rather than by a package, so the whole
+/// fan-out is the walk's first level. A root package above them would put a
+/// level of exactly one ahead of it, and a rendezvous cannot be met by one
+/// caller.
+fn fan_out(count: usize) -> (FixtureRegistry, Vec<(String, String)>) {
+    let mut registry = FixtureRegistry::new();
+    let mut declared = Vec::new();
+    for i in 0..count {
+        let name = format!("leaf{i:02}");
+        registry = registry.with_tree(&[(name.as_str(), "1.0.0", &[])]);
+        declared.push((name, "^1.0.0".to_string()));
+    }
+    (registry, declared)
+}
+
+/// The borrowed view of `fan_out`'s declarations that `roots` takes.
+fn as_roots(declared: &[(String, String)]) -> BTreeMap<ImporterPath, BTreeMap<String, Declared>> {
+    let list: Vec<(&str, &str)> = declared
+        .iter()
+        .map(|(name, range)| (name.as_str(), range.as_str()))
+        .collect();
+    roots(&list)
+}
+
+#[test]
+fn packuments_on_one_level_are_fetched_concurrently() {
+    // Four siblings, and a rendezvous four wide. A resolver that asks the
+    // registry for one packument at a time can never have four in flight, so
+    // it blocks until the rendezvous gives up and reports itself broken.
+    let (registry, declared) = fan_out(4);
+    let registry = registry.with_packument_rendezvous(4);
+
+    resolve(&registry, &as_roots(&declared), &no_members()).unwrap();
+
+    assert!(
+        registry.packuments_met_rendezvous(),
+        "four sibling packuments never overlapped, so resolution is still serial"
+    );
+}
+
+#[test]
+fn a_level_wider_than_the_cap_still_reaches_it() {
+    // Twice the cap of work in one level. The rendezvous proves the pool
+    // reaches its own width, which is the half of "bounded at sixteen" that
+    // can be proven without waiting for a timeout.
+    let (registry, declared) = fan_out(MAX_CONCURRENT_FETCHES * 2);
+    let registry = registry.with_packument_rendezvous(MAX_CONCURRENT_FETCHES);
+
+    resolve(&registry, &as_roots(&declared), &no_members()).unwrap();
+
+    assert!(
+        registry.packuments_met_rendezvous(),
+        "the pool never reached its own cap, so the cap is not the limit in force"
+    );
+
+    // Necessary but not sufficient, and deliberately so. `peak_concurrent_
+    // packuments` is exact, so a peak above the cap is a real failure — but an
+    // unbounded implementation is not *guaranteed* to be caught here, since it
+    // would have to be observed above the cap rather than merely be capable of
+    // it. Proving the upper bound outright means a rendezvous one wider than
+    // the cap, asserted to time out, and that costs `RENDEZVOUS_TIMEOUT` on
+    // every run.
+    assert!(
+        registry.peak_concurrent_packuments() <= MAX_CONCURRENT_FETCHES,
+        "fetched {} packuments at once, above the cap of {}",
+        registry.peak_concurrent_packuments(),
+        MAX_CONCURRENT_FETCHES
+    );
+}
+
+#[test]
+fn a_package_two_dependents_share_is_still_fetched_once() {
+    // The memo that stops a diamond being fetched twice is the thing
+    // concurrency most easily breaks: two workers both miss, both fetch, both
+    // insert. `d` is named by `b` and `c`, which sit on the same level.
+    let registry = FixtureRegistry::new().with_tree(&[
+        ("a", "1.0.0", &[("b", "^1.0.0"), ("c", "^1.0.0")]),
+        ("b", "1.0.0", &[("d", "^1.0.0")]),
+        ("c", "1.0.0", &[("d", "^1.0.0")]),
+        ("d", "1.0.0", &[]),
+    ]);
+
+    resolve(&registry, &roots(&[("a", "^1.0.0")]), &no_members()).unwrap();
+
+    assert_eq!(
+        registry.packument_calls_for("d"),
+        1,
+        "the shared dependency was fetched once per dependent"
+    );
+}
+
+/// A tree with depth, diamonds, two versions of one name and two importers —
+/// so every level is discovered from the one above rather than handed over
+/// whole, which is the only situation in which completion order could leak
+/// anywhere.
+fn tangled() -> FixtureRegistry {
+    FixtureRegistry::new().with_tree(&[
+        ("app", "1.0.0", &[("left", "^1.0.0"), ("right", "^1.0.0")]),
+        (
+            "left",
+            "1.0.0",
+            &[("shared", "^1.0.0"), ("l1", "^1.0.0"), ("l2", "^1.0.0")],
+        ),
+        (
+            "right",
+            "1.0.0",
+            &[("shared", "^1.0.0"), ("r1", "^1.0.0"), ("r2", "^2.0.0")],
+        ),
+        ("shared", "1.0.0", &[("deep", "^1.0.0")]),
+        ("l1", "1.0.0", &[("deep", "^1.0.0")]),
+        ("l2", "1.0.0", &[]),
+        ("r1", "1.0.0", &[("deep", "^1.0.0")]),
+        ("r2", "1.0.0", &[]),
+        ("r2", "2.0.0", &[]),
+        ("deep", "1.0.0", &[("leaf", "^1.0.0")]),
+        ("leaf", "1.0.0", &[]),
+    ])
+}
+
+/// Everything the lockfile would be written from, as one comparable string.
+fn shape(graph: &jerky::resolver::ResolvedGraph) -> String {
+    let mut out = String::new();
+    for (path, importer) in &graph.importers {
+        for (name, dependency) in &importer.dependencies {
+            let resolution = match &dependency.resolution {
+                Resolution::Registry(id) => id.to_string(),
+                Resolution::Local(target) => format!("link:{}", target.display()),
+            };
+            out.push_str(&format!(
+                "{}|{name}|{}|{resolution}\n",
+                path.as_str(),
+                dependency.specifier
+            ));
+        }
+    }
+    for (id, package) in &graph.packages {
+        out.push_str(&format!("{id}|{}|", package.resolved));
+        for (name, to) in &package.dependencies {
+            out.push_str(&format!("{name}->{to},"));
+        }
+        out.push('\n');
+    }
+    out
+}
+
+#[test]
+fn the_same_tree_resolves_identically_every_time() {
+    // Determinism is what `BTreeMap` everywhere that reaches disk exists to
+    // guarantee, and the property concurrency threatens by letting the order
+    // fetches happen to complete in decide anything. The comparison is over
+    // everything the lockfile is written from — importer edges, the specifier
+    // recorded beside each, every package, its tarball URL and its own edges —
+    // rather than over the package set, which a `BTreeMap` would hold steady
+    // on its own and which would make this pass against anything.
+    let roots = BTreeMap::from([
+        (
+            ImporterPath::root(),
+            section(&[("app", "^1.0.0")], Kind::Prod),
+        ),
+        (
+            ImporterPath::new("packages/ui").unwrap(),
+            section(&[("left", "^1.0.0")], Kind::Dev),
+        ),
+    ]);
+
+    let first = shape(&resolve(&tangled(), &roots, &no_members()).unwrap());
+    for _ in 0..20 {
+        let again = shape(&resolve(&tangled(), &roots, &no_members()).unwrap());
+        assert_eq!(again, first, "the resolved graph varied between runs");
+    }
+
+    // And the walk really did descend, so the assertion above is not holding
+    // because resolution quietly stopped early. `leaf` sits four levels below
+    // the importers and is reachable only through them.
+    assert!(
+        first.contains("leaf@1.0.0"),
+        "the walk never reached the deepest package: {first}"
+    );
+}
+
+#[test]
+fn a_missing_package_is_named_and_is_the_same_one_every_time() {
+    // "One of four lookups failed" is not a diagnosable error, and a run that
+    // blamed a different package each time is worse than one that blames the
+    // wrong one consistently.
+    //
+    // The two missing names are ordered so that the walk's answer and the
+    // alphabetical answer differ: `alpha` is visited first and asks for
+    // `zzz-gone`, `beta` second and asks for `aaa-gone`, so the level reads
+    // [zzz-gone, aaa-gone] while sorted order reads the reverse. A pass that
+    // reported whichever failure its own ordering reached first would report
+    // `aaa-gone` and be caught here.
+    let mut reported = std::collections::BTreeSet::new();
+    for _ in 0..20 {
+        let registry = FixtureRegistry::new().with_tree(&[
+            ("alpha", "1.0.0", &[("zzz-gone", "^1.0.0")]),
+            ("beta", "1.0.0", &[("aaa-gone", "^1.0.0")]),
+        ]);
+
+        let err = resolve(
+            &registry,
+            &roots(&[("alpha", "^1.0.0"), ("beta", "^1.0.0")]),
+            &no_members(),
+        )
+        .unwrap_err();
+
+        match err {
+            ResolveError::Registry(source) => {
+                reported.insert(source.to_string());
+            }
+            other => panic!("expected a registry failure naming the package, got {other:?}"),
+        }
+    }
+
+    assert_eq!(
+        reported.len(),
+        1,
+        "the reported failure varied between runs: {reported:?}"
+    );
+    let only = reported.iter().next().unwrap();
+    assert!(
+        only.contains("zzz-gone"),
+        "the error did not name the package the walk reaches first: {only}"
+    );
 }

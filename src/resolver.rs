@@ -7,12 +7,14 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Mutex;
 
 use thiserror::Error;
 
 use crate::integrity::{Integrity, IntegrityError};
+use crate::pool;
 use crate::range::{Range, RangeError};
-use crate::registry::{Packument, RegistryClient, RegistryError};
+use crate::registry::{MAX_CONCURRENT_FETCHES, Packument, RegistryClient, RegistryError};
 
 /// The protocol marking a dependency as a workspace member rather than a
 /// registry package. `workspace:*` and `workspace:^1.0.0` both select the
@@ -373,83 +375,157 @@ pub fn resolve(
     roots: &BTreeMap<ImporterPath, BTreeMap<String, Declared>>,
     members: &BTreeMap<String, ImporterPath>,
 ) -> Result<ResolvedGraph, ResolveError> {
-    let mut packages: BTreeMap<PackageId, ResolvedPackage> = BTreeMap::new();
-    // Seeded from the input rather than filled in as edges arrive, so an
-    // importer that declares nothing still appears in the graph — it has a
-    // `node_modules` to own, and the lockfile records it as resolved.
-    let mut importers: BTreeMap<ImporterPath, Importer> = roots
-        .keys()
-        .map(|importer| (importer.clone(), Importer::default()))
-        .collect();
+    let mut walk = Walk::seeded(registry, roots, members)?;
+    walk.run()?;
+    Ok(walk.into_graph())
+}
 
-    // One request per package, however many dependents ask for it.
-    let mut packuments: HashMap<String, Packument> = HashMap::new();
-    // Identical (name, range) pairs select once.
-    let mut selections: HashMap<(String, String), PackageId> = HashMap::new();
+/// One dependency walk: everything it accumulates, and the steps that move it.
+///
+/// These five collections are a set rather than five things that happen to sit
+/// together — every step of the walk reads or writes several of them, and a
+/// free function performing one step would take all five as `&mut` parameters.
+/// They are private because nothing outside a walk has any business holding a
+/// half-built graph: [`resolve`] is the only way to start one and
+/// [`Walk::into_graph`] the only way to get anything out.
+struct Walk<'a> {
+    registry: &'a dyn RegistryClient,
+    packages: BTreeMap<PackageId, ResolvedPackage>,
+    importers: BTreeMap<ImporterPath, Importer>,
+    /// One request per package, however many dependents ask for it.
+    ///
+    /// A `HashMap` rather than a `BTreeMap` deliberately: it is a memo that
+    /// never reaches disk, so nothing about the result depends on the order it
+    /// is filled in, which is what lets [`Walk::warm`] fill it from several
+    /// threads at once.
+    packuments: HashMap<String, Packument>,
+    /// Identical `(name, range)` pairs select once.
+    selections: HashMap<(String, String), PackageId>,
+    /// Edges discovered but not yet visited. Drained a level at a time.
+    work: VecDeque<Pending>,
+}
 
-    // Local dependencies are settled before the walk starts rather than
-    // inside it: there is no tarball, no integrity hash and no version to
-    // select, so a `workspace:` specifier has nothing the walk could do with
-    // it. Only an importer may declare one — a registry package's
-    // dependencies are whatever it published, and `VersionMetadata` has no
-    // way to name a directory in this repo.
-    let mut work: VecDeque<Pending> = VecDeque::new();
-    for (importer, declared) in roots {
-        for (name, Declared { specifier, kind }) in declared {
-            if !specifier.starts_with(WORKSPACE_PROTOCOL) {
-                work.push_back(Pending {
-                    dependent: Dependent::Importer {
-                        path: importer.clone(),
-                        kind: *kind,
-                    },
-                    name: name.clone(),
-                    range: specifier.clone(),
-                });
-                continue;
-            }
+impl<'a> Walk<'a> {
+    /// Start a walk from every importer's declared ranges.
+    ///
+    /// Local dependencies are settled here rather than in the walk: there is
+    /// no tarball, no integrity hash and no version to select, so a
+    /// `workspace:` specifier has nothing the walk could do with it. Only an
+    /// importer may declare one — a registry package's dependencies are
+    /// whatever it published, and `VersionMetadata` has no way to name a
+    /// directory in this repo.
+    fn seeded(
+        registry: &'a dyn RegistryClient,
+        roots: &BTreeMap<ImporterPath, BTreeMap<String, Declared>>,
+        members: &BTreeMap<String, ImporterPath>,
+    ) -> Result<Self, ResolveError> {
+        let mut walk = Self {
+            registry,
+            packages: BTreeMap::new(),
+            // Seeded from the input rather than filled in as edges arrive, so
+            // an importer that declares nothing still appears in the graph —
+            // it has a `node_modules` to own, and the lockfile records it as
+            // resolved.
+            importers: roots
+                .keys()
+                .map(|importer| (importer.clone(), Importer::default()))
+                .collect(),
+            packuments: HashMap::new(),
+            selections: HashMap::new(),
+            work: VecDeque::new(),
+        };
 
-            let member = members
-                .get(name)
-                .ok_or_else(|| ResolveError::NoSuchMember {
-                    name: name.clone(),
-                    specifier: specifier.clone(),
-                    members: members.keys().cloned().collect(),
-                })?;
+        for (importer, declared) in roots {
+            for (name, Declared { specifier, kind }) in declared {
+                if !specifier.starts_with(WORKSPACE_PROTOCOL) {
+                    walk.work.push_back(Pending {
+                        dependent: Dependent::Importer {
+                            path: importer.clone(),
+                            kind: *kind,
+                        },
+                        name: name.clone(),
+                        range: specifier.clone(),
+                    });
+                    continue;
+                }
 
-            importers
-                .entry(importer.clone())
-                .or_default()
-                .dependencies
-                .insert(
-                    name.clone(),
-                    Dependency {
+                let member = members
+                    .get(name)
+                    .ok_or_else(|| ResolveError::NoSuchMember {
+                        name: name.clone(),
                         specifier: specifier.clone(),
-                        kind: *kind,
-                        resolution: Resolution::Local(local_path(importer, member)),
-                    },
-                );
+                        members: members.keys().cloned().collect(),
+                    })?;
+
+                walk.importers
+                    .entry(importer.clone())
+                    .or_default()
+                    .dependencies
+                    .insert(
+                        name.clone(),
+                        Dependency {
+                            specifier: specifier.clone(),
+                            kind: *kind,
+                            resolution: Resolution::Local(local_path(importer, member)),
+                        },
+                    );
+            }
         }
+
+        Ok(walk)
     }
 
-    while let Some(Pending {
-        dependent,
-        name,
-        range,
-    }) = work.pop_front()
-    {
-        let id = select(registry, &mut packuments, &mut selections, &name, &range)?;
+    /// Walk until nothing is left to visit.
+    ///
+    /// A level at a time rather than an edge at a time: the whole frontier is
+    /// taken, every packument it will ask for is fetched concurrently, and
+    /// then the frontier is visited exactly as it was when each edge fetched
+    /// its own. Draining the queue and refilling it preserves the FIFO order
+    /// the single-edge loop had, so the walk visits the same edges in the same
+    /// sequence — the concurrency is confined to the fetching.
+    ///
+    /// The cost of that confinement is a barrier per level: the slowest
+    /// packument on one level holds up the next. A worklist drained by N
+    /// workers would not have it, but it would also make `packuments` and
+    /// `selections` shared mutable state, and with them the questions of which
+    /// failure gets reported and whether discovery order can reach the
+    /// lockfile. A tree's levels are few and wide — express is 69 packages in
+    /// 7 levels — so the barrier costs a handful of round trips and buys back
+    /// the entire design.
+    fn run(&mut self) -> Result<(), ResolveError> {
+        while !self.work.is_empty() {
+            let level: Vec<Pending> = self.work.drain(..).collect();
+            self.warm(&level);
+
+            for pending in level {
+                self.visit(pending)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Resolve one edge: select a version, record the edge, and if the node is
+    /// new, queue what it depends on.
+    fn visit(&mut self, pending: Pending) -> Result<(), ResolveError> {
+        let Pending {
+            dependent,
+            name,
+            range,
+        } = pending;
+        let id = self.select(&name, &range)?;
 
         // Record the edge on whoever asked for it. An importer's own
         // dependency is recorded against the importer rather than against a
         // package, because that is what its `node_modules` is built from.
         match dependent {
             Dependent::Package(parent) => {
-                if let Some(package) = packages.get_mut(&parent) {
+                if let Some(package) = self.packages.get_mut(&parent) {
                     package.dependencies.insert(name.clone(), id.clone());
                 }
             }
             Dependent::Importer { path, kind } => {
-                importers.entry(path).or_default().dependencies.insert(
+                self.importers.entry(path).or_default().dependencies.insert(
                     name.clone(),
                     Dependency {
                         specifier: range.clone(),
@@ -463,11 +539,12 @@ pub fn resolve(
         // Recursion is gated on node novelty, not on path. That is what makes
         // a cycle terminate: the second visit finds the node present, records
         // the edge above, and stops here without needing a visited-path stack.
-        if packages.contains_key(&id) {
-            continue;
+        if self.packages.contains_key(&id) {
+            return Ok(());
         }
 
-        let packument = packuments
+        let packument = self
+            .packuments
             .get(&id.name)
             .expect("select fetched this packument");
         // Both paths in `select` check membership before returning: the range
@@ -486,33 +563,154 @@ pub fn resolve(
                 version: id.version.clone(),
                 source,
             })?;
+        let resolved = metadata.dist.tarball.clone();
 
         // `dependencies` only. A dependency's `devDependencies` must never be
         // followed — doing so pulls in most of the registry — which is why
         // `VersionMetadata` has no field for them to be read from.
         for (dep_name, dep_range) in &metadata.dependencies {
-            work.push_back(Pending {
+            self.work.push_back(Pending {
                 dependent: Dependent::Package(id.clone()),
                 name: dep_name.clone(),
                 range: dep_range.clone(),
             });
         }
 
-        packages.insert(
+        self.packages.insert(
             id.clone(),
             ResolvedPackage {
                 id,
-                resolved: metadata.dist.tarball.clone(),
+                resolved,
                 integrity,
                 dependencies: BTreeMap::new(),
             },
         );
+
+        Ok(())
     }
 
-    Ok(ResolvedGraph {
-        importers,
-        packages,
-    })
+    /// Fetch every packument this level will ask for, concurrently, into the
+    /// memo.
+    ///
+    /// Purely a warming pass: it decides nothing and records nothing but the
+    /// memo, so [`Walk::visit`] behaves exactly as it did when it made these
+    /// requests one at a time. That is what keeps the awkward questions from
+    /// arriving with the concurrency. Which failure is reported stays the
+    /// serial walk's answer, because a failure here is simply *not* a warm
+    /// entry — the walk reaches that name in its own order, makes the request
+    /// itself, and reports it there.
+    ///
+    /// Names are deduplicated, so the diamond that made the memo worth having
+    /// is still fetched once even when both dependents sit on this level.
+    /// Below two distinct names there is nothing to overlap and no pool is
+    /// started.
+    fn warm(&mut self, level: &[Pending]) {
+        let wanted: Vec<&str> = level
+            .iter()
+            .map(|pending| pending.name.as_str())
+            .filter(|name| !self.packuments.contains_key(*name))
+            .collect::<BTreeSet<&str>>()
+            .into_iter()
+            .collect();
+
+        if wanted.len() < 2 {
+            return;
+        }
+
+        let registry = self.registry;
+        let fetched: Mutex<Vec<(String, Packument)>> = Mutex::new(Vec::new());
+
+        // The error is discarded rather than propagated, and that is the whole
+        // trick: see the note above on which failure a user sees. `drain`
+        // stopping on the first failure is what keeps the wasted requests to
+        // the names already claimed rather than the whole level.
+        let _: Result<(), RegistryError> = pool::drain(&wanted, MAX_CONCURRENT_FETCHES, |name| {
+            let packument = registry.packument(name)?;
+            fetched
+                .lock()
+                .unwrap()
+                .push(((*name).to_string(), packument));
+            Ok(())
+        });
+
+        // Insertion order cannot matter — the keys are distinct names and the
+        // memo never reaches disk — which is why it is allowed to be a
+        // `HashMap` at all.
+        for (name, packument) in fetched.into_inner().unwrap() {
+            self.packuments.insert(name, packument);
+        }
+    }
+
+    /// Choose the concrete version satisfying one `(name, range)` pair,
+    /// fetching and caching the packument as needed.
+    fn select(&mut self, name: &str, range: &str) -> Result<PackageId, ResolveError> {
+        let key = (name.to_string(), range.to_string());
+        if let Some(id) = self.selections.get(&key) {
+            return Ok(id.clone());
+        }
+
+        if !self.packuments.contains_key(name) {
+            self.packuments
+                .insert(name.to_string(), self.registry.packument(name)?);
+        }
+        let packument = &self.packuments[name];
+
+        // Range syntax is tried first, and a dist-tag is only the fallback for a
+        // spec that is not a range at all. npm resolves in this order for a
+        // reason: were tags consulted first, a registry could publish a tag named
+        // `^1.0.0` and silently override what that range means.
+        let version = match Range::parse(range) {
+            Ok(parsed) => {
+                let available = packument.versions_sorted();
+                match parsed.max_satisfying(&available) {
+                    Some(chosen) => chosen.as_str().to_string(),
+                    None => {
+                        return Err(ResolveError::Unsatisfiable {
+                            name: name.to_string(),
+                            range: range.to_string(),
+                            available: available.iter().map(|v| v.as_str().to_string()).collect(),
+                        });
+                    }
+                }
+            }
+            Err(_) => match packument.resolve_tag(range) {
+                Some(tagged) => {
+                    // A tag is a pointer the registry maintains, and it can dangle:
+                    // unpublishing a version leaves the tag behind. Trusting it
+                    // blindly would panic on the lookup further down.
+                    if !packument.versions.contains_key(tagged) {
+                        return Err(ResolveError::DanglingTag {
+                            name: name.to_string(),
+                            tag: range.to_string(),
+                            version: tagged.to_string(),
+                        });
+                    }
+                    tagged.to_string()
+                }
+                None => {
+                    return Err(ResolveError::UnresolvableSpec {
+                        name: name.to_string(),
+                        spec: range.to_string(),
+                        tags: packument.dist_tags.keys().cloned().collect(),
+                    });
+                }
+            },
+        };
+
+        let id = PackageId {
+            name: name.to_string(),
+            version,
+        };
+        self.selections.insert(key, id.clone());
+        Ok(id)
+    }
+
+    fn into_graph(self) -> ResolvedGraph {
+        ResolvedGraph {
+            importers: self.importers,
+            packages: self.packages,
+        }
+    }
 }
 
 /// Where `member` sits, as seen from `importer`.
@@ -540,75 +738,6 @@ fn local_path(importer: &ImporterPath, member: &ImporterPath) -> PathBuf {
         path.push(Component::CurDir);
     }
     path
-}
-
-/// Choose the concrete version satisfying one `(name, range)` pair, fetching
-/// and caching the packument as needed.
-fn select(
-    registry: &dyn RegistryClient,
-    packuments: &mut HashMap<String, Packument>,
-    selections: &mut HashMap<(String, String), PackageId>,
-    name: &str,
-    range: &str,
-) -> Result<PackageId, ResolveError> {
-    let key = (name.to_string(), range.to_string());
-    if let Some(id) = selections.get(&key) {
-        return Ok(id.clone());
-    }
-
-    if !packuments.contains_key(name) {
-        packuments.insert(name.to_string(), registry.packument(name)?);
-    }
-    let packument = &packuments[name];
-
-    // Range syntax is tried first, and a dist-tag is only the fallback for a
-    // spec that is not a range at all. npm resolves in this order for a
-    // reason: were tags consulted first, a registry could publish a tag named
-    // `^1.0.0` and silently override what that range means.
-    let version = match Range::parse(range) {
-        Ok(parsed) => {
-            let available = packument.versions_sorted();
-            match parsed.max_satisfying(&available) {
-                Some(chosen) => chosen.as_str().to_string(),
-                None => {
-                    return Err(ResolveError::Unsatisfiable {
-                        name: name.to_string(),
-                        range: range.to_string(),
-                        available: available.iter().map(|v| v.as_str().to_string()).collect(),
-                    });
-                }
-            }
-        }
-        Err(_) => match packument.resolve_tag(range) {
-            Some(tagged) => {
-                // A tag is a pointer the registry maintains, and it can dangle:
-                // unpublishing a version leaves the tag behind. Trusting it
-                // blindly would panic on the lookup further down.
-                if !packument.versions.contains_key(tagged) {
-                    return Err(ResolveError::DanglingTag {
-                        name: name.to_string(),
-                        tag: range.to_string(),
-                        version: tagged.to_string(),
-                    });
-                }
-                tagged.to_string()
-            }
-            None => {
-                return Err(ResolveError::UnresolvableSpec {
-                    name: name.to_string(),
-                    spec: range.to_string(),
-                    tags: packument.dist_tags.keys().cloned().collect(),
-                });
-            }
-        },
-    };
-
-    let id = PackageId {
-        name: name.to_string(),
-        version,
-    };
-    selections.insert(key, id.clone());
-    Ok(id)
 }
 
 #[cfg(test)]

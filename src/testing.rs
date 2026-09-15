@@ -305,6 +305,36 @@ pub struct FixtureRegistry {
     /// `None` until a test asks for one, so every existing fixture is
     /// unaffected.
     tarball_rendezvous: Option<Rendezvous>,
+    packument_rendezvous: Option<Rendezvous>,
+    tarballs_in_flight: Mutex<InFlight>,
+    packuments_in_flight: Mutex<InFlight>,
+}
+
+/// Calls currently inside one registry method, and the most there have ever
+/// been.
+///
+/// Separate from [`Rendezvous`], which also counts arrivals but only across
+/// the window a caller spends *at the gate*: a caller that has passed through
+/// and is building its response is no longer counted there while still being
+/// in flight. This wraps the whole call instead, so its peak is exact, and a
+/// peak above a cap is a real failure rather than a coincidence that happened
+/// to be observed.
+#[derive(Debug, Default)]
+struct InFlight {
+    current: usize,
+    peak: usize,
+}
+
+impl InFlight {
+    fn enter(counter: &Mutex<Self>) {
+        let mut state = counter.lock().unwrap();
+        state.current += 1;
+        state.peak = state.peak.max(state.current);
+    }
+
+    fn leave(counter: &Mutex<Self>) {
+        counter.lock().unwrap().current -= 1;
+    }
 }
 
 impl FixtureRegistry {
@@ -527,16 +557,33 @@ impl FixtureRegistry {
             .is_some_and(|r| !r.state.lock().unwrap().broken)
     }
 
-    /// The most callers ever inside the rendezvous at once.
-    ///
-    /// A lower bound on concurrent `fetch_tarball` calls rather than an exact
-    /// count of them: the rendezvous sits at the top of the call, so a caller
-    /// that has passed through it and is building its response is no longer
-    /// counted here while still being in flight.
+    /// The most `fetch_tarball` calls ever in flight at once, exactly.
     pub fn peak_concurrent_tarballs(&self) -> usize {
-        self.tarball_rendezvous
+        self.tarballs_in_flight.lock().unwrap().peak
+    }
+
+    /// Make every `packument` wait until `width` of them are in flight.
+    ///
+    /// The resolver's counterpart to [`Self::with_tarball_rendezvous`], and
+    /// necessary for the same reason: a fixture answers from memory, so
+    /// overlap is invisible unless the calls are given somewhere to stand
+    /// still. A resolver that walks one packument at a time cannot satisfy it
+    /// at any speed.
+    pub fn with_packument_rendezvous(mut self, width: usize) -> Self {
+        self.packument_rendezvous = Some(Rendezvous::new(width));
+        self
+    }
+
+    /// Whether the packument rendezvous was satisfied rather than timed out.
+    pub fn packuments_met_rendezvous(&self) -> bool {
+        self.packument_rendezvous
             .as_ref()
-            .map_or(0, |r| r.state.lock().unwrap().high_water)
+            .is_some_and(|r| !r.state.lock().unwrap().broken)
+    }
+
+    /// The most `packument` calls ever in flight at once, exactly.
+    pub fn peak_concurrent_packuments(&self) -> usize {
+        self.packuments_in_flight.lock().unwrap().peak
     }
 
     pub fn packument_calls(&self) -> usize {
@@ -584,21 +631,34 @@ impl RegistryClient for FixtureRegistry {
             .entry(name.to_string())
             .or_insert(0) += 1;
 
-        self.packuments
+        InFlight::enter(&self.packuments_in_flight);
+        if let Some(rendezvous) = &self.packument_rendezvous {
+            rendezvous.meet();
+        }
+        let answer = self
+            .packuments
             .get(name)
             .cloned()
-            .ok_or_else(|| RegistryError::PackageNotFound(name.to_string()))
+            .ok_or_else(|| RegistryError::PackageNotFound(name.to_string()));
+        InFlight::leave(&self.packuments_in_flight);
+
+        answer
     }
 
     fn fetch_tarball(&self, url: &str) -> Result<Vec<u8>, RegistryError> {
         self.tarball_calls.fetch_add(1, Ordering::Relaxed);
+        InFlight::enter(&self.tarballs_in_flight);
         if let Some(rendezvous) = &self.tarball_rendezvous {
             rendezvous.meet();
         }
-        self.tarballs
+        let answer = self
+            .tarballs
             .get(url)
             .cloned()
-            .ok_or_else(|| RegistryError::PackageNotFound(url.to_string()))
+            .ok_or_else(|| RegistryError::PackageNotFound(url.to_string()));
+        InFlight::leave(&self.tarballs_in_flight);
+
+        answer
     }
 }
 
