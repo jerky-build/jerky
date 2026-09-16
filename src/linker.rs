@@ -4,6 +4,7 @@ use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
 
 use crate::directory;
+use crate::pool;
 use crate::staging::{STAGING_DIR, StagingDir};
 
 /// `EXDEV`, "cross-device link". Both Linux and macOS use 18.
@@ -36,9 +37,11 @@ pub enum LinkError {
 /// A caller names the three things a linked workspace is made of — the
 /// packages the virtual store holds, the edges that leave each of them, and
 /// what each importer links — and [`Plan::apply`] is the single call that makes
-/// them true. The ordering that materialisation obeys is a property of `apply`,
-/// where a test can see it, rather than of the sequence of calls a caller
-/// happened to make.
+/// them true. The order the passes run in is a property of `apply`, where a
+/// test can see it, rather than of the sequence of calls a caller happened to
+/// make. Within a pass there is no order to speak of: the entries are
+/// materialised across the worker pool, and which of them landed first is not
+/// something the finished tree records.
 ///
 /// The parts that *remove* carry no separate input. Which virtual store entries
 /// survive the prune is the set of entries the plan names, and which links
@@ -186,9 +189,9 @@ impl Plan {
     ///
     /// The order is the whole reason this is one function.
     ///
-    /// 1. **Entries**, because every link written below names one, and a
-    ///    store-internal link's target is derived from where the owner's entry
-    ///    actually landed.
+    /// 1. **Entries**, because every link written below names one: a link into
+    ///    the store points at a directory, and the directory has to be there
+    ///    for the link to mean anything.
     /// 2. **Store-internal edges**, which is what makes a package see exactly
     ///    what it declared: the siblings in its private `node_modules` are its
     ///    dependencies and nothing else.
@@ -202,11 +205,22 @@ impl Plan {
     ///    second, so nothing is ever pointed at by a link jerky still considers
     ///    live.
     ///
-    /// Laying the tree out is serial: it is local filesystem work — hard links
-    /// out of the content store — so there is no latency to hide, and one
-    /// writer means the tree is built the same way every run. Whether that is
-    /// still the right trade is #86's question, and it is now one function's to
-    /// answer rather than the caller's.
+    /// **Materialising fans out; everything after it is serial.** Hard-linking
+    /// a tree is syscall-bound rather than latency-bound, which is the case
+    /// where more threads is simply more throughput, and the entries are
+    /// independent of one another — so the populate runs on the pool. The
+    /// passes below it stay on one thread. Convergence and the prune remove
+    /// things, and their ownership proof — only what jerky can prove it wrote
+    /// — is not worth re-deriving under concurrency for their share of the
+    /// runtime; the link passes are a few syscalls each with nothing to
+    /// overlap. Determinism survives either way: the tree is a function of the
+    /// plan, and which worker laid an entry down is not observable in it.
+    ///
+    /// **Applying a plan is idempotent by inspection.** Every write here is
+    /// guarded by a read: an entry already in the virtual store is left as it
+    /// is, and so is a link that already points where the plan says. An
+    /// install that finds the tree correct therefore writes nothing at all,
+    /// rather than rewriting every edge to arrive where it started.
     ///
     /// **The order entries are laid out in did change**, and saying so is
     /// better than letting the next reader discover it. The orchestrator used
@@ -224,26 +238,45 @@ impl Plan {
     /// keeping, and the next person to compare a trace against an old one
     /// deserves to know which sort they are looking at.
     pub(crate) fn apply(&self) -> Result<Vec<Unowned>, LinkError> {
+        self.apply_across(materialise_workers())
+    }
+
+    /// [`Self::apply`], over a stated number of workers.
+    ///
+    /// Split out so the width is a parameter at one call site rather than a
+    /// machine property read from inside the pass. Ordinary callers have no
+    /// business choosing it — `apply` does — but a test asserting something
+    /// *about* the fan-out cannot assert it on a single-core runner, where
+    /// `available_parallelism` answers one and the pool runs the work list
+    /// serially. What is under test there is what the report says when several
+    /// entries fail at once, which is a question only a real fan-out asks.
+    fn apply_across(&self, workers: usize) -> Result<Vec<Unowned>, LinkError> {
         let node_modules = self.workspace_root.join("node_modules");
 
-        // Paired with the entry rather than looked up again, so there is no
-        // key that can miss. `populate_virtual_store` returns where the entry
-        // landed, and `symlink_into_store` finds the store by climbing out of
-        // it — the two halves of one fact, kept next to each other.
-        let mut materialised = Vec::with_capacity(self.entries.len());
-        for entry in self.entries.values() {
-            let owner = populate_virtual_store(
-                &entry.content_store_path,
-                &node_modules,
-                &entry.dir_name,
-                &entry.pkg_name,
-            )?;
-            materialised.push((entry, owner));
-        }
+        // Each entry is hard-linked out of the content store independently of
+        // every other — no entry's contents mention another, and the links
+        // between them are written below, after all of them exist — so this is
+        // a work list and not a sequence. The pool reports the failure of the
+        // lowest-indexed item, which here is the first entry in the plan's own
+        // order, so a broken install blames the same package on every run.
+        //
+        // Work already in flight when one fails still finishes, which is
+        // correct: what it can leave behind is a virtual store entry nothing
+        // links to, and the next apply prunes it. Nothing here writes a link
+        // or a manifest.
+        let entries: Vec<&VirtualStoreEntry> = self.entries.values().collect();
+        pool::drain(&entries, workers, |entry| {
+            populate_virtual_store(entry, &node_modules)
+        })?;
 
-        for (entry, owner) in &materialised {
+        // `entry_dir` rather than a path carried out of the call that laid the
+        // entry down, which a pool worker cannot do. It is the one definition
+        // of where an entry lives, and `symlink_into_store` finds the store by
+        // climbing out of it.
+        for entry in &entries {
+            let owner = entry_dir(&node_modules, &entry.dir_name);
             for (link_name, target) in &entry.edges {
-                symlink_into_store(owner, link_name, target)?;
+                symlink_into_store(&owner, link_name, target)?;
             }
         }
 
@@ -380,8 +413,16 @@ fn hard_link_tree(src: &Path, dst: &Path) -> Result<(), LinkError> {
     walk_tree(src, dst, &link_file)
 }
 
-/// Build `node_modules/.jerky/<dir_name>/node_modules/<pkg_name>/` from a
-/// store entry, and return the `<dir_name>` directory.
+/// Build `node_modules/.jerky/<dir_name>/node_modules/<pkg_name>/` for one
+/// entry, from the content store bytes it names.
+///
+/// Takes the whole entry rather than the three strings inside it. Two of them
+/// are `dir_name` and `pkg_name`, which [`VirtualStoreRef`] exists to keep
+/// from being handed over in the wrong order, and an argument list is exactly
+/// where they would be. Where the entry lands is [`entry_dir`] and is not
+/// returned: a pool worker reports success or failure and nothing else, so a
+/// path travelling out of here would be a second answer to a question that
+/// already has one.
 ///
 /// The doubled `node_modules` is the mechanism, not an accident: Node resolves
 /// a package's dependencies by walking up from its directory looking for a
@@ -390,16 +431,11 @@ fn hard_link_tree(src: &Path, dst: &Path) -> Result<(), LinkError> {
 ///
 /// Uses the same stage-and-rename discipline as the store, for the same
 /// reason: a half-linked tree looks present.
-fn populate_virtual_store(
-    store_entry: &Path,
-    node_modules: &Path,
-    dir_name: &str,
-    pkg_name: &str,
-) -> Result<PathBuf, LinkError> {
+fn populate_virtual_store(entry: &VirtualStoreEntry, node_modules: &Path) -> Result<(), LinkError> {
     let virtual_root = node_modules.join(VIRTUAL_STORE_DIR);
-    let target = virtual_root.join(dir_name);
+    let target = entry_dir(node_modules, &entry.dir_name);
     if target.is_dir() {
-        return Ok(target);
+        return Ok(());
     }
 
     // A scoped package's `dir_name` carries a `/` — `@types/node@20.0.0` — so
@@ -426,17 +462,17 @@ fn populate_virtual_store(
     })?;
 
     hard_link_tree(
-        store_entry,
-        &staging.path().join("node_modules").join(pkg_name),
+        &entry.content_store_path,
+        &staging.path().join("node_modules").join(&entry.pkg_name),
     )?;
 
     let staged = staging.keep();
     match std::fs::rename(&staged, &target) {
-        Ok(()) => Ok(target),
+        Ok(()) => Ok(()),
         Err(source) => {
             let _ = std::fs::remove_dir_all(&staged);
             if target.is_dir() {
-                Ok(target)
+                Ok(())
             } else {
                 Err(LinkError::Io {
                     from: staged,
@@ -446,6 +482,33 @@ fn populate_virtual_store(
             }
         }
     }
+}
+
+/// Where the virtual store holds one entry.
+///
+/// A function rather than a fact each caller derives, because two callers now
+/// need it: `populate_virtual_store` creates the directory, and [`Plan::apply`]
+/// pairs an entry with it afterwards. Materialising runs on the pool, whose
+/// workers report only success or failure, so the path cannot travel back out
+/// of the call that made it — and a second spelling here would be a second
+/// answer to where an entry lives, which is a link into a directory nothing
+/// unpacked.
+fn entry_dir(node_modules: &Path, dir_name: &str) -> PathBuf {
+    node_modules.join(VIRTUAL_STORE_DIR).join(dir_name)
+}
+
+/// How many entries are materialised at once.
+///
+/// The machine's parallelism, not the registry's sixteen-in-flight: this is
+/// syscall-bound local work — hard links out of the content store — where
+/// there is no latency to hide and the useful number is how many cores can
+/// issue system calls at once. `available_parallelism` reads the cgroup quota
+/// on Linux, so a container gets its share rather than the host's core count.
+///
+/// One worker when it cannot be determined, which is the old behaviour rather
+/// than a guess.
+fn materialise_workers() -> usize {
+    std::thread::available_parallelism().map_or(1, |cpus| cpus.get())
 }
 
 /// The relative path from the directory `from` to `to`.
@@ -495,7 +558,10 @@ fn create_dirs_at_0o755(dir: &Path) -> Result<(), LinkError> {
     })
 }
 
-/// Create `link` pointing at `target`, replacing a link jerky already wrote.
+/// Make `link` point at `target`, leaving it alone if it already does.
+///
+/// A link jerky already wrote that points somewhere else is replaced; one that
+/// points where this was going to make it point is not touched at all.
 fn place_symlink(link: PathBuf, target: PathBuf) -> Result<(), LinkError> {
     // Reachable only for a scoped name, which puts the link one level down and
     // so needs an `@scope` directory that may not exist. An unscoped name finds
@@ -508,6 +574,23 @@ fn place_symlink(link: PathBuf, target: PathBuf) -> Result<(), LinkError> {
     // detected and replaced rather than reported as missing.
     match std::fs::symlink_metadata(&link) {
         Ok(meta) if meta.file_type().is_symlink() => {
+            // Read before writing. A link that already says what this was
+            // about to make it say is left alone — not as an optimisation of
+            // the write but as the answer to it, since removing and recreating
+            // it produces a different inode and mtime for a link nothing asked
+            // to change. An install that finds the tree already correct is the
+            // most common one there is, and it used to pay one unlink and one
+            // symlink per edge in the graph to arrive where it started.
+            //
+            // The comparison is on the recorded target and is deliberately
+            // textual: every target here comes from `relative_path`, so two
+            // spellings of one destination is not a state this can be in, and
+            // resolving instead would follow a dangling link to nothing and
+            // rewrite a link that was already right.
+            if std::fs::read_link(&link).is_ok_and(|current| current == target) {
+                return Ok(());
+            }
+
             std::fs::remove_file(&link).map_err(|source| LinkError::Access {
                 path: link.clone(),
                 source,
@@ -529,8 +612,9 @@ fn place_symlink(link: PathBuf, target: PathBuf) -> Result<(), LinkError> {
 ///
 /// The three public link functions differ only in which absolute path they
 /// name as `entry`. Everything after that — deriving the climb, creating the
-/// directory, replacing a link jerky already wrote — is the same work, so it
-/// lives here rather than being repeated with one line changed.
+/// directory, leaving a link that is already right and replacing one that is
+/// not — is the same work, so it lives here rather than being repeated with
+/// one line changed.
 ///
 /// The climb is measured from the directory the link ends up *in*, which is
 /// not `link_dir` when `pkg_name` is scoped: `@types/node` puts the link one
@@ -563,9 +647,9 @@ fn symlink_local(importer_dir: &Path, pkg_name: &str, target_dir: &Path) -> Resu
 
 /// Link one store entry at another's private `node_modules`.
 ///
-/// `owner_entry` is what [`populate_virtual_store`] returned for the depending
-/// package, so the link lands inside that package's own `node_modules` and
-/// points at a sibling in the same store:
+/// `owner_entry` is the depending package's own [`entry_dir`], so the link
+/// lands inside that package's own `node_modules` and points at a sibling in
+/// the same store:
 /// `.jerky/b@1.0.0/node_modules/d -> ../../d@1.5.0/node_modules/d`. Climbing
 /// out and back down is what keeps the target inside the store rather than
 /// reaching into an importer's `node_modules`, so a package sees exactly the
@@ -1078,6 +1162,20 @@ mod tests {
         })
     }
 
+    /// One entry over a store tree the test built itself, with no edges.
+    ///
+    /// `leaf` is the same thing where the tree's contents do not matter and
+    /// `store_tree` may write them; this is for the tests that care what is in
+    /// the tree they are linking.
+    fn entry_over(store: &Path, dir_name: &str, pkg_name: &str) -> VirtualStoreEntry {
+        VirtualStoreEntry {
+            dir_name: dir_name.to_string(),
+            pkg_name: pkg_name.to_string(),
+            content_store_path: store.to_path_buf(),
+            edges: BTreeMap::new(),
+        }
+    }
+
     fn store_entry(root: &Path) -> PathBuf {
         let entry = root.join("store-entry");
         std::fs::create_dir_all(entry.join("lib")).unwrap();
@@ -1167,8 +1265,10 @@ mod tests {
         let src = store_entry(root.path());
         let node_modules = root.path().join("node_modules");
 
-        let dir = populate_virtual_store(&src, &node_modules, "lodash@4.17.21", "lodash").unwrap();
+        populate_virtual_store(&entry_over(&src, "lodash@4.17.21", "lodash"), &node_modules)
+            .unwrap();
 
+        let dir = entry_dir(&node_modules, "lodash@4.17.21");
         assert_eq!(dir, node_modules.join(".jerky").join("lodash@4.17.21"));
         assert!(dir.join("node_modules/lodash/package.json").is_file());
     }
@@ -1183,9 +1283,13 @@ mod tests {
         let src = store_entry(root.path());
         let node_modules = root.path().join("node_modules");
 
-        let dir = populate_virtual_store(&src, &node_modules, "@types/node@20.0.0", "@types/node")
-            .unwrap();
+        populate_virtual_store(
+            &entry_over(&src, "@types/node@20.0.0", "@types/node"),
+            &node_modules,
+        )
+        .unwrap();
 
+        let dir = entry_dir(&node_modules, "@types/node@20.0.0");
         assert_eq!(
             dir,
             node_modules
@@ -1204,8 +1308,16 @@ mod tests {
         let src = store_entry(root.path());
         let node_modules = root.path().join("node_modules");
 
-        populate_virtual_store(&src, &node_modules, "@types/node@20.0.0", "@types/node").unwrap();
-        populate_virtual_store(&src, &node_modules, "@types/react@18.0.0", "@types/react").unwrap();
+        populate_virtual_store(
+            &entry_over(&src, "@types/node@20.0.0", "@types/node"),
+            &node_modules,
+        )
+        .unwrap();
+        populate_virtual_store(
+            &entry_over(&src, "@types/react@18.0.0", "@types/react"),
+            &node_modules,
+        )
+        .unwrap();
 
         let scope = node_modules.join(".jerky").join("@types");
         assert!(scope.join("node@20.0.0").is_dir());
@@ -1218,7 +1330,8 @@ mod tests {
         let src = store_entry(root.path());
         let node_modules = root.path().join("node_modules");
 
-        populate_virtual_store(&src, &node_modules, "lodash@4.17.21", "lodash").unwrap();
+        populate_virtual_store(&entry_over(&src, "lodash@4.17.21", "lodash"), &node_modules)
+            .unwrap();
 
         let staging = node_modules.join(".jerky").join(".staging");
         if staging.exists() {
@@ -1231,7 +1344,8 @@ mod tests {
         let root = TempDir::new().unwrap();
         let src = store_entry(root.path());
         let node_modules = root.path().join("node_modules");
-        populate_virtual_store(&src, &node_modules, "lodash@4.17.21", "lodash").unwrap();
+        populate_virtual_store(&entry_over(&src, "lodash@4.17.21", "lodash"), &node_modules)
+            .unwrap();
 
         symlink_dependency_from(
             root.path(),
@@ -1260,8 +1374,9 @@ mod tests {
         let root = TempDir::new().unwrap();
         let src = store_entry(root.path());
         let node_modules = root.path().join("node_modules");
-        populate_virtual_store(&src, &node_modules, "lodash@4.17.21", "lodash").unwrap();
-        populate_virtual_store(&src, &node_modules, "lodash@3.0.0", "lodash").unwrap();
+        populate_virtual_store(&entry_over(&src, "lodash@4.17.21", "lodash"), &node_modules)
+            .unwrap();
+        populate_virtual_store(&entry_over(&src, "lodash@3.0.0", "lodash"), &node_modules).unwrap();
 
         symlink_dependency_from(
             root.path(),
@@ -1291,10 +1406,8 @@ mod tests {
         let src = store_entry(root);
         let workspace_root = root.join("ws");
         populate_virtual_store(
-            &src,
+            &entry_over(&src, dir_name, "lodash"),
             &workspace_root.join("node_modules"),
-            dir_name,
-            "lodash",
         )
         .unwrap();
 
@@ -1337,8 +1450,8 @@ mod tests {
         let src = store_entry(root.path());
         let workspace_root = root.path().join("ws");
         let store = workspace_root.join("node_modules");
-        populate_virtual_store(&src, &store, "lodash@4.17.21", "lodash").unwrap();
-        populate_virtual_store(&src, &store, "lodash@4.18.0", "lodash").unwrap();
+        populate_virtual_store(&entry_over(&src, "lodash@4.17.21", "lodash"), &store).unwrap();
+        populate_virtual_store(&entry_over(&src, "lodash@4.18.0", "lodash"), &store).unwrap();
 
         // The same package, linked from importers at two different depths,
         // must get two different targets and both must resolve.
@@ -1407,8 +1520,9 @@ mod tests {
         let root = TempDir::new().unwrap();
         let src = store_entry(root.path());
         let node_modules = root.path().join("ws").join("node_modules");
-        let owner = populate_virtual_store(&src, &node_modules, "b@1.0.0", "b").unwrap();
-        populate_virtual_store(&src, &node_modules, "d@1.5.0", "d").unwrap();
+        populate_virtual_store(&entry_over(&src, "b@1.0.0", "b"), &node_modules).unwrap();
+        populate_virtual_store(&entry_over(&src, "d@1.5.0", "d"), &node_modules).unwrap();
+        let owner = entry_dir(&node_modules, "b@1.0.0");
 
         symlink_into_store(&owner, "d", &entry("d@1.5.0", "d")).unwrap();
 
@@ -1433,14 +1547,13 @@ mod tests {
         let root = TempDir::new().unwrap();
         let src = store_entry(root.path());
         let node_modules = root.path().join("ws").join("node_modules");
-        let owner = populate_virtual_store(
-            &src,
+        populate_virtual_store(
+            &entry_over(&src, "@nodelib/fs.walk@1.2.8", "@nodelib/fs.walk"),
             &node_modules,
-            "@nodelib/fs.walk@1.2.8",
-            "@nodelib/fs.walk",
         )
         .unwrap();
-        populate_virtual_store(&src, &node_modules, "fastq@1.0.0", "fastq").unwrap();
+        let owner = entry_dir(&node_modules, "@nodelib/fs.walk@1.2.8");
+        populate_virtual_store(&entry_over(&src, "fastq@1.0.0", "fastq"), &node_modules).unwrap();
 
         symlink_into_store(&owner, "fastq", &entry("fastq@1.0.0", "fastq")).unwrap();
 
@@ -1460,14 +1573,17 @@ mod tests {
         let root = TempDir::new().unwrap();
         let src = store_entry(root.path());
         let node_modules = root.path().join("ws").join("node_modules");
-        let owner = populate_virtual_store(
-            &src,
+        populate_virtual_store(
+            &entry_over(&src, "@nodelib/fs.walk@1.2.8", "@nodelib/fs.walk"),
             &node_modules,
-            "@nodelib/fs.walk@1.2.8",
-            "@nodelib/fs.walk",
         )
         .unwrap();
-        populate_virtual_store(&src, &node_modules, "@types/node@20.0.0", "@types/node").unwrap();
+        let owner = entry_dir(&node_modules, "@nodelib/fs.walk@1.2.8");
+        populate_virtual_store(
+            &entry_over(&src, "@types/node@20.0.0", "@types/node"),
+            &node_modules,
+        )
+        .unwrap();
 
         symlink_into_store(
             &owner,
@@ -1666,8 +1782,10 @@ mod tests {
         let root = TempDir::new().unwrap();
         let src = store_entry(root.path());
         let node_modules = root.path().join("ws").join("node_modules");
-        populate_virtual_store(&src, &node_modules, "lodash@4.17.21", "lodash").unwrap();
-        populate_virtual_store(&src, &node_modules, "lodash@3.10.1", "lodash").unwrap();
+        populate_virtual_store(&entry_over(&src, "lodash@4.17.21", "lodash"), &node_modules)
+            .unwrap();
+        populate_virtual_store(&entry_over(&src, "lodash@3.10.1", "lodash"), &node_modules)
+            .unwrap();
 
         prune_virtual_store(&node_modules, &names(&["lodash@4.17.21"])).unwrap();
 
@@ -1863,13 +1981,7 @@ mod tests {
 
         // Debris from an install that is no longer current: an entry nothing
         // names any more, and the importer link that used to reach it.
-        populate_virtual_store(
-            &store_tree(root.path(), "gone@0.1.0", "gone"),
-            &node_modules,
-            "gone@0.1.0",
-            "gone",
-        )
-        .unwrap();
+        populate_virtual_store(&leaf(root.path(), "gone@0.1.0", "gone"), &node_modules).unwrap();
         symlink_dependency_from(&ws, &ws, "gone", &entry("gone@0.1.0", "gone")).unwrap();
 
         let mut plan = Plan::new(&ws, BTreeSet::from([ws.clone(), ui.clone()]));
@@ -1951,13 +2063,7 @@ mod tests {
         std::fs::create_dir_all(&ws).unwrap();
         let node_modules = ws.join("node_modules");
 
-        populate_virtual_store(
-            &store_tree(root.path(), "alpha@0.9.0", "alpha"),
-            &node_modules,
-            "alpha@0.9.0",
-            "alpha",
-        )
-        .unwrap();
+        populate_virtual_store(&leaf(root.path(), "alpha@0.9.0", "alpha"), &node_modules).unwrap();
         symlink_dependency_from(&ws, &ws, "alpha", &entry("alpha@0.9.0", "alpha")).unwrap();
 
         let mut plan = Plan::new(&ws, BTreeSet::from([ws.clone()]));
@@ -1981,6 +2087,202 @@ mod tests {
             !still_there(&node_modules.join(".jerky/alpha@0.9.0")),
             "the superseded entry outlived the prune"
         );
+    }
+
+    /// Every path under `root`, with what a rewrite would change about it.
+    ///
+    /// Inode and ctime together, because either alone can miss a rewrite: a
+    /// removed and recreated symlink usually lands on a fresh inode but is not
+    /// guaranteed to, and a ctime moves for any metadata write at all. Symlinks
+    /// are recorded and not followed — the targets are inside the tree already,
+    /// and following them would count the same file twice under two names.
+    fn tree_fingerprint(root: &Path) -> BTreeMap<PathBuf, (u64, i64, i64)> {
+        let mut seen = BTreeMap::new();
+        let mut stack = vec![root.to_path_buf()];
+
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                let meta = std::fs::symlink_metadata(&path).unwrap();
+                seen.insert(path.clone(), (meta.ino(), meta.ctime(), meta.ctime_nsec()));
+                // `symlink_metadata` says a symlink is not a directory, so this
+                // descends into real directories only.
+                if meta.is_dir() {
+                    stack.push(path);
+                }
+            }
+        }
+
+        seen
+    }
+
+    #[test]
+    fn a_second_apply_of_an_unchanged_plan_writes_nothing() {
+        // The install that has nothing to do is the most common one there is,
+        // and it used to pay for every edge in the graph: a link was removed
+        // and recreated whether or not it already pointed where the plan said.
+        // Reading first is what makes applying a plan idempotent by
+        // inspection, and the evidence is that the filesystem cannot tell the
+        // second apply happened.
+        let root = TempDir::new().unwrap();
+        let ws = root.path().join("ws");
+        let ui = ws.join("packages/ui");
+        std::fs::create_dir_all(&ui).unwrap();
+
+        let mut plan = Plan::new(&ws, BTreeSet::from([ws.clone(), ui.clone()]));
+        plan.add_entry(VirtualStoreEntry {
+            dir_name: "alpha@1.0.0".to_string(),
+            pkg_name: "alpha".to_string(),
+            content_store_path: store_tree(root.path(), "alpha@1.0.0", "alpha"),
+            edges: BTreeMap::from([("beta".to_string(), entry("beta@2.0.0", "beta"))]),
+        });
+        plan.add_entry(leaf(root.path(), "beta@2.0.0", "beta"));
+        plan.add_entry(leaf(root.path(), "@types/node@20.0.0", "@types/node"));
+        plan.add_importer(
+            &ws,
+            BTreeMap::from([(
+                "alpha".to_string(),
+                ImporterTarget::Entry(entry("alpha@1.0.0", "alpha")),
+            )]),
+        );
+        plan.add_importer(
+            &ui,
+            BTreeMap::from([
+                (
+                    "@types/node".to_string(),
+                    ImporterTarget::Entry(entry("@types/node@20.0.0", "@types/node")),
+                ),
+                ("ws".to_string(), ImporterTarget::Member(ws.clone())),
+            ]),
+        );
+
+        assert!(plan.apply().unwrap().is_empty());
+        let before = tree_fingerprint(&ws);
+
+        let symlinks = before
+            .keys()
+            .filter(|path| {
+                std::fs::symlink_metadata(path)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            })
+            .count();
+        assert_eq!(
+            symlinks, 4,
+            "the tree this compares has to contain the links whose rewriting is the point"
+        );
+
+        assert!(plan.apply().unwrap().is_empty());
+
+        assert_eq!(
+            tree_fingerprint(&ws),
+            before,
+            "the second apply rewrote something the first had already made true"
+        );
+    }
+
+    #[test]
+    fn a_failure_while_materialising_names_the_same_entry_every_run() {
+        // Materialising fans out over the pool, so which worker notices a
+        // broken entry first is not something a run decides the same way
+        // twice. What the report names must be: an install that blamed a
+        // different package each time it failed would be untriageable.
+        //
+        // `pool::drain` owns the guarantee and pins it in its own tests; what
+        // is asserted here is that `apply` hands the work over in the plan's
+        // order and passes the answer back unchanged, so the entry named is
+        // the first one in the plan that could not be materialised and not the
+        // first one a worker happened to reach.
+        //
+        // Eight workers whatever the machine has, so the fan-out is exercised
+        // on a single-core runner too, and twenty rounds because a single run
+        // of a racy report passes roughly as often as it is asked to.
+        for _ in 0..20 {
+            let root = TempDir::new().unwrap();
+            let ws = root.path().join("ws");
+            std::fs::create_dir_all(&ws).unwrap();
+
+            let mut plan = Plan::new(&ws, BTreeSet::from([ws.clone()]));
+            plan.add_importer(&ws, BTreeMap::new());
+            for name in ["a", "b", "c", "d", "e", "f", "g", "h"] {
+                let dir_name = format!("{name}@1.0.0");
+                let content_store_path = match name {
+                    // Never written, so materialising it fails at the first
+                    // thing it reads.
+                    "c" | "e" | "g" => root.path().join("store").join(&dir_name),
+                    _ => store_tree(root.path(), &dir_name, name),
+                };
+                plan.add_entry(VirtualStoreEntry {
+                    dir_name,
+                    pkg_name: name.to_string(),
+                    content_store_path,
+                    edges: BTreeMap::new(),
+                });
+            }
+
+            let LinkError::Access { path, .. } = plan.apply_across(8).unwrap_err() else {
+                panic!("a missing store entry is an access failure");
+            };
+            assert!(
+                path.ends_with("c@1.0.0"),
+                "the failure reported was {}, not the first entry that could not be materialised",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn scoped_entries_materialised_at_once_share_a_scope_at_the_right_mode() {
+        // The fan-out's one shared write. Every `@types/*` entry in a plan
+        // wants the same `.jerky/@types` directory, so whichever worker gets
+        // there first is what creates it and the others have to find it there
+        // rather than fail — and the mode it lands at has to be jerky's 0o755
+        // however the race went, not the umask's answer.
+        //
+        // The mode assertion says something only under a permissive umask; the
+        // suite's `umask 0` run is what makes it say it, exactly as
+        // `archive.rs` notes about its own. Sixty-four entries in one scope so
+        // the race is actually run rather than described.
+        let root = TempDir::new().unwrap();
+        let ws = root.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+
+        let mut plan = Plan::new(&ws, BTreeSet::from([ws.clone()]));
+        let mut links = BTreeMap::new();
+        for n in 0..64 {
+            let pkg_name = format!("@types/p{n}");
+            let dir_name = format!("{pkg_name}@1.0.0");
+            plan.add_entry(leaf(root.path(), &dir_name, &pkg_name));
+            links.insert(
+                pkg_name.clone(),
+                ImporterTarget::Entry(entry(&dir_name, &pkg_name)),
+            );
+        }
+        plan.add_importer(&ws, links);
+
+        plan.apply_across(8).unwrap();
+
+        for scope in [
+            ws.join("node_modules/.jerky/@types"),
+            ws.join("node_modules/@types"),
+        ] {
+            let mode = std::fs::metadata(&scope).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode,
+                0o755,
+                "{} landed at {mode:o}, which is the umask's answer and not jerky's",
+                scope.display()
+            );
+        }
+
+        for n in 0..64 {
+            assert_eq!(
+                resolves_to(&ws.join(format!("node_modules/@types/p{n}"))),
+                format!("@types/p{n}@1.0.0"),
+                "an entry lost the race for the scope directory"
+            );
+        }
     }
 
     #[test]
