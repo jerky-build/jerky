@@ -898,8 +898,15 @@ struct Instance {
 /// What one instance resolved, before anything has been named.
 #[derive(Debug, Clone)]
 struct Copy_ {
-    /// This package's own peers, and what answered them.
-    own: BTreeMap<String, PackageId>,
+    /// This package's own peers, and the copy of each that answered.
+    ///
+    /// Instances rather than ids, for the reason `dependencies` are: a
+    /// provider is named after the whole pass has run, and the name it ends up
+    /// with need not be the one it was found under. `host` depends on `lib`
+    /// and `lib` peers back on `host`: naming `lib` gives `host` a context of
+    /// its own, at which point the plain `host@1.0.0` the walk answered with is
+    /// no longer a node at all.
+    own: BTreeMap<String, Instance>,
     /// What it depends on, as instances rather than ids.
     dependencies: BTreeMap<String, Instance>,
 }
@@ -930,15 +937,13 @@ impl PeerPass<'_> {
         // than as long as `&mut self`.
         let source = self.source;
 
+        let instance = self.instance_of(id, providers);
+
         let Some(package) = source.packages.get(id) else {
             // Nothing a walk produces, but a hand-written lockfile can name an
-            // edge it does not record. Returning a bare instance lets the
+            // edge it does not record. Recording the bare instance lets the
             // lockfile's own validation report that, rather than this pass
             // panicking on it first.
-            let instance = Instance {
-                package: id.clone(),
-                environment: BTreeMap::new(),
-            };
             self.instances.entry(instance.clone()).or_insert(Copy_ {
                 own: BTreeMap::new(),
                 dependencies: BTreeMap::new(),
@@ -948,18 +953,6 @@ impl PeerPass<'_> {
 
         let mut chain: Vec<&BTreeMap<String, PackageId>> = providers.to_vec();
         chain.push(&package.dependencies);
-
-        let environment = self
-            .needed
-            .get(id)
-            .into_iter()
-            .flatten()
-            .filter_map(|name| provider_of(name, &chain).map(|found| (name.clone(), found)))
-            .collect();
-        let instance = Instance {
-            package: id.clone(),
-            environment,
-        };
 
         if self.instances.contains_key(&instance) {
             return instance;
@@ -1009,7 +1002,20 @@ impl PeerPass<'_> {
         self.identifying.insert(instance.clone());
 
         let copy = self.instances[instance].clone();
-        let mut context = copy.own;
+
+        // A peer contributes the id its provider was *found* under, not the
+        // one the provider ends up with. The two differ exactly when the
+        // provider's own subtree carries a context, and in that case they
+        // differ circularly — a peer can point back up at an ancestor, so
+        // asking for the provider's final name here would be asking for this
+        // one. The found id is finite, and is what makes a cyclic context
+        // spellable at all. `peers` records the final id, which is the answer
+        // anything reading the graph wants; a name cannot.
+        let mut context: BTreeMap<String, PackageId> = copy
+            .own
+            .iter()
+            .map(|(name, provider)| (name.clone(), provider.package.clone()))
+            .collect();
         for (name, dependency) in &copy.dependencies {
             if let Some(id) = self.identify(dependency)
                 && !id.context.is_empty()
@@ -1058,7 +1064,22 @@ impl PeerPass<'_> {
                     integrity: source.integrity.clone(),
                     dependencies,
                     declared_peers: source.declared_peers.clone(),
-                    peers: copy.own.clone(),
+                    peers: copy
+                        .own
+                        .iter()
+                        .map(|(name, provider)| {
+                            // Named, necessarily: a provider is an ancestor's
+                            // own dependency or an importer's, so whatever
+                            // reached this node reached it too. Asserted
+                            // rather than skipped, because dropping the edge
+                            // while `id.context` still names the peer is the
+                            // silent half of the bug this field just had.
+                            let id = self.identities.get(provider).unwrap_or_else(|| {
+                                panic!("peer {name} of {} was never named", instance.package)
+                            });
+                            (name.clone(), id.clone())
+                        })
+                        .collect(),
                 },
             );
         }
@@ -1078,11 +1099,11 @@ impl PeerPass<'_> {
         &mut self,
         package: &ResolvedPackage,
         chain: &[&BTreeMap<String, PackageId>],
-    ) -> BTreeMap<String, PackageId> {
+    ) -> BTreeMap<String, Instance> {
         let mut own = BTreeMap::new();
 
         for (name, declared) in &package.declared_peers {
-            let Some(provider) = provider_of(name, chain) else {
+            let Some((frame, provider)) = provider_of(name, chain) else {
                 if !declared.optional {
                     self.report(package, name, declared, None);
                 }
@@ -1090,7 +1111,11 @@ impl PeerPass<'_> {
             };
 
             if satisfies(&provider.version, &declared.range) {
-                own.insert(name.clone(), provider);
+                // Truncated at the frame that named it, because that is what
+                // was above the provider when the walk reached it. Slicing
+                // here rather than passing the index down keeps the cut beside
+                // the chain it cuts — the two are meaningless apart.
+                own.insert(name.clone(), self.instance_of(&provider, &chain[..=frame]));
                 continue;
             }
 
@@ -1103,6 +1128,41 @@ impl PeerPass<'_> {
         }
 
         own
+    }
+
+    /// Which copy of a package sits below `providers`.
+    ///
+    /// The one definition of what an instance *is*: the package, plus a
+    /// provider for every peer name its subtree can ask about, looked up in
+    /// what is visible from where it sits — the frames above it, then its own
+    /// dependencies. [`Self::discover`] asks this of the node it is walking
+    /// into; [`Self::own_peers`] asks it of a provider it found partway up the
+    /// chain, handing over only the frames that were above *that*. A second
+    /// spelling of this would be a second answer to "are these the same copy",
+    /// which is the question the whole pass turns on.
+    fn instance_of(&self, id: &PackageId, providers: &[&BTreeMap<String, PackageId>]) -> Instance {
+        let Some(package) = self.source.packages.get(id) else {
+            return Instance {
+                package: id.clone(),
+                environment: BTreeMap::new(),
+            };
+        };
+
+        let mut visible: Vec<&BTreeMap<String, PackageId>> = providers.to_vec();
+        visible.push(&package.dependencies);
+
+        let environment = self
+            .needed
+            .get(id)
+            .into_iter()
+            .flatten()
+            .filter_map(|name| provider_of(name, &visible).map(|(_, found)| (name.clone(), found)))
+            .collect();
+
+        Instance {
+            package: id.clone(),
+            environment,
+        }
     }
 
     fn report(
@@ -1123,16 +1183,20 @@ impl PeerPass<'_> {
     }
 }
 
-/// Find who provides `name`, nearest frame first.
+/// Find who provides `name`, nearest frame first, and which frame that was.
 ///
 /// `chain` runs outermost-first — importer, then each package down the path —
 /// so walking it in reverse walks back up the tree from nearest to furthest.
-fn provider_of(name: &str, chain: &[&BTreeMap<String, PackageId>]) -> Option<PackageId> {
+///
+/// The frame is returned because the id alone does not say *which copy* of the
+/// provider answered, and a provider can exist several times over.
+/// [`PeerPass::instance_at`] is what turns the pair back into one.
+fn provider_of(name: &str, chain: &[&BTreeMap<String, PackageId>]) -> Option<(usize, PackageId)> {
     chain
         .iter()
+        .enumerate()
         .rev()
-        .find_map(|frame| frame.get(name))
-        .cloned()
+        .find_map(|(frame, provided)| provided.get(name).map(|id| (frame, id.clone())))
 }
 
 /// Every peer name each node's subtree can ask about, itself included.

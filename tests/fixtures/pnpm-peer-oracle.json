@@ -1,0 +1,777 @@
+{
+ "oracle": "pnpm 10.18.0",
+ "generator": "tests/fixtures/generate-pnpm-peer-oracle.mjs",
+ "settings": [
+  "auto-install-peers=false",
+  "dedupe-peer-dependents=false",
+  "strict-peer-dependencies=false",
+  "resolution-mode=highest"
+ ],
+ "trees": [
+  {
+   "name": "peer-from-importer",
+   "phenomenon": "importer-satisfied",
+   "importers": {
+    ".": {
+     "react": "18.3.1",
+     "react-dom": "18.3.1"
+    }
+   },
+   "members": {},
+   "packages": [
+    {
+     "name": "js-tokens",
+     "version": "4.0.0",
+     "dependencies": {},
+     "peers": {}
+    },
+    {
+     "name": "loose-envify",
+     "version": "1.4.0",
+     "dependencies": {
+      "js-tokens": "^3.0.0 || ^4.0.0"
+     },
+     "peers": {}
+    },
+    {
+     "name": "react-dom",
+     "version": "18.3.1",
+     "dependencies": {
+      "loose-envify": "^1.1.0",
+      "scheduler": "^0.23.2"
+     },
+     "peers": {
+      "react": {
+       "range": "^18.3.1",
+       "optional": false
+      }
+     }
+    },
+    {
+     "name": "react",
+     "version": "18.3.1",
+     "dependencies": {
+      "loose-envify": "^1.1.0"
+     },
+     "peers": {}
+    },
+    {
+     "name": "scheduler",
+     "version": "0.23.2",
+     "dependencies": {
+      "loose-envify": "^1.1.0"
+     },
+     "peers": {}
+    }
+   ],
+   "pnpm": {
+    "nodes": [
+     {
+      "id": 0,
+      "name": "js-tokens",
+      "version": "4.0.0",
+      "dependencies": {},
+      "peers": {}
+     },
+     {
+      "id": 1,
+      "name": "loose-envify",
+      "version": "1.4.0",
+      "dependencies": {
+       "js-tokens": 0
+      },
+      "peers": {}
+     },
+     {
+      "id": 2,
+      "name": "react-dom",
+      "version": "18.3.1",
+      "dependencies": {
+       "loose-envify": 1,
+       "scheduler": 4
+      },
+      "peers": {
+       "react": 3
+      }
+     },
+     {
+      "id": 3,
+      "name": "react",
+      "version": "18.3.1",
+      "dependencies": {
+       "loose-envify": 1
+      },
+      "peers": {}
+     },
+     {
+      "id": 4,
+      "name": "scheduler",
+      "version": "0.23.2",
+      "dependencies": {
+       "loose-envify": 1
+      },
+      "peers": {}
+     }
+    ],
+    "importers": {
+     ".": {
+      "react": 3,
+      "react-dom": 2
+     }
+    }
+   }
+  },
+  {
+   "name": "peer-from-intermediate-ancestor",
+   "phenomenon": "ancestor-satisfied",
+   "importers": {
+    ".": {
+     "@babel/helper-compilation-targets": "7.29.7"
+    }
+   },
+   "members": {},
+   "packages": [
+    {
+     "name": "@babel/compat-data",
+     "version": "7.29.7",
+     "dependencies": {},
+     "peers": {}
+    },
+    {
+     "name": "@babel/helper-compilation-targets",
+     "version": "7.29.7",
+     "dependencies": {
+      "@babel/compat-data": "^7.29.7",
+      "@babel/helper-validator-option": "^7.29.7",
+      "browserslist": "^4.24.0",
+      "lru-cache": "^5.1.1",
+      "semver": "^6.3.1"
+     },
+     "peers": {}
+    },
+    {
+     "name": "@babel/helper-validator-option",
+     "version": "7.29.7",
+     "dependencies": {},
+     "peers": {}
+    },
+    {
+     "name": "baseline-browser-mapping",
+     "version": "2.11.24",
+     "dependencies": {},
+     "peers": {}
+    },
+    {
+     "name": "browserslist",
+     "version": "4.29.0",
+     "dependencies": {
+      "baseline-browser-mapping": "^2.11.23",
+      "caniuse-lite": "^1.0.30001810",
+      "electron-to-chromium": "^1.5.427",
+      "node-releases": "^2.0.55",
+      "update-browserslist-db": "^1.3.3"
+     },
+     "peers": {}
+    },
+    {
+     "name": "caniuse-lite",
+     "version": "1.0.30001810",
+     "dependencies": {},
+     "peers": {}
+    },
+    {
+     "name": "electron-to-chromium",
+     "version": "1.5.429",
+     "dependencies": {},
+     "peers": {}
+    },
+    {
+     "name": "escalade",
+     "version": "3.2.0",
+     "dependencies": {},
+     "peers": {}
+    },
+    {
+     "name": "lru-cache",
+     "version": "5.1.1",
+     "dependencies": {
+      "yallist": "^3.0.2"
+     },
+     "peers": {}
+    },
+    {
+     "name": "node-releases",
+     "version": "2.0.55",
+     "dependencies": {},
+     "peers": {}
+    },
+    {
+     "name": "picocolors",
+     "version": "1.1.1",
+     "dependencies": {},
+     "peers": {}
+    },
+    {
+     "name": "semver",
+     "version": "6.3.1",
+     "dependencies": {},
+     "peers": {}
+    },
+    {
+     "name": "update-browserslist-db",
+     "version": "1.3.3",
+     "dependencies": {
+      "escalade": "^3.2.0",
+      "picocolors": "^1.1.1"
+     },
+     "peers": {
+      "browserslist": {
+       "range": ">= 4.21.0",
+       "optional": false
+      }
+     }
+    },
+    {
+     "name": "yallist",
+     "version": "3.1.1",
+     "dependencies": {},
+     "peers": {}
+    }
+   ],
+   "pnpm": {
+    "nodes": [
+     {
+      "id": 0,
+      "name": "@babel/compat-data",
+      "version": "7.29.7",
+      "dependencies": {},
+      "peers": {}
+     },
+     {
+      "id": 1,
+      "name": "@babel/helper-compilation-targets",
+      "version": "7.29.7",
+      "dependencies": {
+       "@babel/compat-data": 0,
+       "@babel/helper-validator-option": 2,
+       "browserslist": 4,
+       "lru-cache": 8,
+       "semver": 11
+      },
+      "peers": {}
+     },
+     {
+      "id": 2,
+      "name": "@babel/helper-validator-option",
+      "version": "7.29.7",
+      "dependencies": {},
+      "peers": {}
+     },
+     {
+      "id": 3,
+      "name": "baseline-browser-mapping",
+      "version": "2.11.24",
+      "dependencies": {},
+      "peers": {}
+     },
+     {
+      "id": 4,
+      "name": "browserslist",
+      "version": "4.29.0",
+      "dependencies": {
+       "baseline-browser-mapping": 3,
+       "caniuse-lite": 5,
+       "electron-to-chromium": 6,
+       "node-releases": 9,
+       "update-browserslist-db": 12
+      },
+      "peers": {}
+     },
+     {
+      "id": 5,
+      "name": "caniuse-lite",
+      "version": "1.0.30001810",
+      "dependencies": {},
+      "peers": {}
+     },
+     {
+      "id": 6,
+      "name": "electron-to-chromium",
+      "version": "1.5.429",
+      "dependencies": {},
+      "peers": {}
+     },
+     {
+      "id": 7,
+      "name": "escalade",
+      "version": "3.2.0",
+      "dependencies": {},
+      "peers": {}
+     },
+     {
+      "id": 8,
+      "name": "lru-cache",
+      "version": "5.1.1",
+      "dependencies": {
+       "yallist": 13
+      },
+      "peers": {}
+     },
+     {
+      "id": 9,
+      "name": "node-releases",
+      "version": "2.0.55",
+      "dependencies": {},
+      "peers": {}
+     },
+     {
+      "id": 10,
+      "name": "picocolors",
+      "version": "1.1.1",
+      "dependencies": {},
+      "peers": {}
+     },
+     {
+      "id": 11,
+      "name": "semver",
+      "version": "6.3.1",
+      "dependencies": {},
+      "peers": {}
+     },
+     {
+      "id": 12,
+      "name": "update-browserslist-db",
+      "version": "1.3.3",
+      "dependencies": {
+       "escalade": 7,
+       "picocolors": 10
+      },
+      "peers": {
+       "browserslist": 4
+      }
+     },
+     {
+      "id": 13,
+      "name": "yallist",
+      "version": "3.1.1",
+      "dependencies": {},
+      "peers": {}
+     }
+    ],
+    "importers": {
+     ".": {
+      "@babel/helper-compilation-targets": 1
+     }
+    }
+   }
+  },
+  {
+   "name": "peer-duplication-across-importers",
+   "phenomenon": "duplicated-by-peers",
+   "importers": {
+    ".": {},
+    "packages/react17": {
+     "react": "17.0.2",
+     "use-sync-external-store": "1.2.2"
+    },
+    "packages/react18": {
+     "react": "18.3.1",
+     "use-sync-external-store": "1.2.2"
+    }
+   },
+   "members": {
+    "@oracle/react17": "packages/react17",
+    "@oracle/react18": "packages/react18"
+   },
+   "packages": [
+    {
+     "name": "js-tokens",
+     "version": "4.0.0",
+     "dependencies": {},
+     "peers": {}
+    },
+    {
+     "name": "loose-envify",
+     "version": "1.4.0",
+     "dependencies": {
+      "js-tokens": "^3.0.0 || ^4.0.0"
+     },
+     "peers": {}
+    },
+    {
+     "name": "object-assign",
+     "version": "4.1.1",
+     "dependencies": {},
+     "peers": {}
+    },
+    {
+     "name": "react",
+     "version": "17.0.2",
+     "dependencies": {
+      "loose-envify": "^1.1.0",
+      "object-assign": "^4.1.1"
+     },
+     "peers": {}
+    },
+    {
+     "name": "react",
+     "version": "18.3.1",
+     "dependencies": {
+      "loose-envify": "^1.1.0"
+     },
+     "peers": {}
+    },
+    {
+     "name": "use-sync-external-store",
+     "version": "1.2.2",
+     "dependencies": {},
+     "peers": {
+      "react": {
+       "range": "^16.8.0 || ^17.0.0 || ^18.0.0",
+       "optional": false
+      }
+     }
+    }
+   ],
+   "pnpm": {
+    "nodes": [
+     {
+      "id": 0,
+      "name": "js-tokens",
+      "version": "4.0.0",
+      "dependencies": {},
+      "peers": {}
+     },
+     {
+      "id": 1,
+      "name": "loose-envify",
+      "version": "1.4.0",
+      "dependencies": {
+       "js-tokens": 0
+      },
+      "peers": {}
+     },
+     {
+      "id": 2,
+      "name": "object-assign",
+      "version": "4.1.1",
+      "dependencies": {},
+      "peers": {}
+     },
+     {
+      "id": 3,
+      "name": "react",
+      "version": "17.0.2",
+      "dependencies": {
+       "loose-envify": 1,
+       "object-assign": 2
+      },
+      "peers": {}
+     },
+     {
+      "id": 4,
+      "name": "react",
+      "version": "18.3.1",
+      "dependencies": {
+       "loose-envify": 1
+      },
+      "peers": {}
+     },
+     {
+      "id": 5,
+      "name": "use-sync-external-store",
+      "version": "1.2.2",
+      "dependencies": {},
+      "peers": {
+       "react": 3
+      }
+     },
+     {
+      "id": 6,
+      "name": "use-sync-external-store",
+      "version": "1.2.2",
+      "dependencies": {},
+      "peers": {
+       "react": 4
+      }
+     }
+    ],
+    "importers": {
+     ".": {},
+     "packages/react17": {
+      "react": 3,
+      "use-sync-external-store": 5
+     },
+     "packages/react18": {
+      "react": 4,
+      "use-sync-external-store": 6
+     }
+    }
+   }
+  },
+  {
+   "name": "optional-peer-unsatisfied",
+   "phenomenon": "optional-unsatisfied",
+   "importers": {
+    ".": {
+     "@rollup/plugin-node-resolve": "15.3.0"
+    }
+   },
+   "members": {},
+   "packages": [
+    {
+     "name": "@rollup/plugin-node-resolve",
+     "version": "15.3.0",
+     "dependencies": {
+      "@rollup/pluginutils": "^5.0.1",
+      "@types/resolve": "1.20.2",
+      "deepmerge": "^4.2.2",
+      "is-module": "^1.0.0",
+      "resolve": "^1.22.1"
+     },
+     "peers": {
+      "rollup": {
+       "range": "^2.78.0||^3.0.0||^4.0.0",
+       "optional": true
+      }
+     }
+    },
+    {
+     "name": "@rollup/pluginutils",
+     "version": "5.4.0",
+     "dependencies": {
+      "@types/estree": "^1.0.0",
+      "estree-walker": "^2.0.2",
+      "picomatch": "^4.0.2"
+     },
+     "peers": {
+      "rollup": {
+       "range": "^1.20.0||^2.0.0||^3.0.0||^4.0.0",
+       "optional": true
+      }
+     }
+    },
+    {
+     "name": "@types/estree",
+     "version": "1.0.9",
+     "dependencies": {},
+     "peers": {}
+    },
+    {
+     "name": "@types/resolve",
+     "version": "1.20.2",
+     "dependencies": {},
+     "peers": {}
+    },
+    {
+     "name": "deepmerge",
+     "version": "4.3.1",
+     "dependencies": {},
+     "peers": {}
+    },
+    {
+     "name": "es-errors",
+     "version": "1.3.0",
+     "dependencies": {},
+     "peers": {}
+    },
+    {
+     "name": "estree-walker",
+     "version": "2.0.2",
+     "dependencies": {},
+     "peers": {}
+    },
+    {
+     "name": "function-bind",
+     "version": "1.1.2",
+     "dependencies": {},
+     "peers": {}
+    },
+    {
+     "name": "hasown",
+     "version": "2.0.4",
+     "dependencies": {
+      "function-bind": "^1.1.2"
+     },
+     "peers": {}
+    },
+    {
+     "name": "is-core-module",
+     "version": "2.16.2",
+     "dependencies": {
+      "hasown": "^2.0.3"
+     },
+     "peers": {}
+    },
+    {
+     "name": "is-module",
+     "version": "1.0.0",
+     "dependencies": {},
+     "peers": {}
+    },
+    {
+     "name": "path-parse",
+     "version": "1.0.7",
+     "dependencies": {},
+     "peers": {}
+    },
+    {
+     "name": "picomatch",
+     "version": "4.0.7",
+     "dependencies": {},
+     "peers": {}
+    },
+    {
+     "name": "resolve",
+     "version": "1.22.12",
+     "dependencies": {
+      "es-errors": "^1.3.0",
+      "is-core-module": "^2.16.1",
+      "path-parse": "^1.0.7",
+      "supports-preserve-symlinks-flag": "^1.0.0"
+     },
+     "peers": {}
+    },
+    {
+     "name": "supports-preserve-symlinks-flag",
+     "version": "1.0.0",
+     "dependencies": {},
+     "peers": {}
+    }
+   ],
+   "pnpm": {
+    "nodes": [
+     {
+      "id": 0,
+      "name": "@rollup/plugin-node-resolve",
+      "version": "15.3.0",
+      "dependencies": {
+       "@rollup/pluginutils": 1,
+       "@types/resolve": 3,
+       "deepmerge": 4,
+       "is-module": 10,
+       "resolve": 13
+      },
+      "peers": {}
+     },
+     {
+      "id": 1,
+      "name": "@rollup/pluginutils",
+      "version": "5.4.0",
+      "dependencies": {
+       "@types/estree": 2,
+       "estree-walker": 6,
+       "picomatch": 12
+      },
+      "peers": {}
+     },
+     {
+      "id": 2,
+      "name": "@types/estree",
+      "version": "1.0.9",
+      "dependencies": {},
+      "peers": {}
+     },
+     {
+      "id": 3,
+      "name": "@types/resolve",
+      "version": "1.20.2",
+      "dependencies": {},
+      "peers": {}
+     },
+     {
+      "id": 4,
+      "name": "deepmerge",
+      "version": "4.3.1",
+      "dependencies": {},
+      "peers": {}
+     },
+     {
+      "id": 5,
+      "name": "es-errors",
+      "version": "1.3.0",
+      "dependencies": {},
+      "peers": {}
+     },
+     {
+      "id": 6,
+      "name": "estree-walker",
+      "version": "2.0.2",
+      "dependencies": {},
+      "peers": {}
+     },
+     {
+      "id": 7,
+      "name": "function-bind",
+      "version": "1.1.2",
+      "dependencies": {},
+      "peers": {}
+     },
+     {
+      "id": 8,
+      "name": "hasown",
+      "version": "2.0.4",
+      "dependencies": {
+       "function-bind": 7
+      },
+      "peers": {}
+     },
+     {
+      "id": 9,
+      "name": "is-core-module",
+      "version": "2.16.2",
+      "dependencies": {
+       "hasown": 8
+      },
+      "peers": {}
+     },
+     {
+      "id": 10,
+      "name": "is-module",
+      "version": "1.0.0",
+      "dependencies": {},
+      "peers": {}
+     },
+     {
+      "id": 11,
+      "name": "path-parse",
+      "version": "1.0.7",
+      "dependencies": {},
+      "peers": {}
+     },
+     {
+      "id": 12,
+      "name": "picomatch",
+      "version": "4.0.7",
+      "dependencies": {},
+      "peers": {}
+     },
+     {
+      "id": 13,
+      "name": "resolve",
+      "version": "1.22.12",
+      "dependencies": {
+       "es-errors": 5,
+       "is-core-module": 9,
+       "path-parse": 11,
+       "supports-preserve-symlinks-flag": 14
+      },
+      "peers": {}
+     },
+     {
+      "id": 14,
+      "name": "supports-preserve-symlinks-flag",
+      "version": "1.0.0",
+      "dependencies": {},
+      "peers": {}
+     }
+    ],
+    "importers": {
+     ".": {
+      "@rollup/plugin-node-resolve": 0
+     }
+    }
+   }
+  }
+ ]
+}

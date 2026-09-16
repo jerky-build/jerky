@@ -50,6 +50,16 @@ fn assert_no_dangling_edges(graph: &ResolvedGraph) {
         }
     }
 
+    for package in graph.packages.values() {
+        for (name, target) in &package.peers {
+            assert!(
+                graph.packages.contains_key(target),
+                "{} resolved peer {name} -> {target}, which the graph does not hold",
+                package.id
+            );
+        }
+    }
+
     for (path, importer) in &graph.importers {
         for (name, dependency) in &importer.dependencies {
             if let Resolution::Registry(id) = &dependency.resolution {
@@ -388,5 +398,44 @@ fn an_importer_points_at_the_duplicated_node() {
     assert!(
         graph.packages.contains_key(id),
         "and the graph holds the node the importer names"
+    );
+}
+
+#[test]
+fn a_resolved_peer_names_the_node_the_graph_holds() {
+    // `lib` peers on `host`, and `host` depends on `lib` — so naming `lib`
+    // gives `host` a context of its own, and the plain `host@1.0.0` the peer
+    // was found under stops being a node at all.
+    //
+    // A peer answer is therefore not the id that answered it; it is whatever
+    // that provider was finally named. Recording the one the walk found leaves
+    // `peers` pointing into a graph that no longer holds it — a link into a
+    // directory the store never wrote, once the linker reads this — and it is
+    // invisible to a test that only looks at keys, because the keys are right.
+    let registry = FixtureRegistry::new()
+        .with_tree(&[
+            ("host", "1.0.0", &[("lib", "^1.0.0")]),
+            ("lib", "1.0.0", &[]),
+        ])
+        .with_declared_peers("lib", "1.0.0", &[("host", "^1.0.0", false)]);
+
+    let graph = resolve(&registry, &roots(&[("host", "^1.0.0")]), &no_members()).unwrap();
+    let (graph, unsatisfied) = resolve_peers(graph);
+
+    assert!(unsatisfied.is_empty(), "{unsatisfied:?}");
+    assert_no_dangling_edges(&graph);
+    assert_eq!(
+        keys(&graph),
+        ["host@1.0.0(lib@1.0.0(host@1.0.0))", "lib@1.0.0(host@1.0.0)"]
+    );
+
+    let lib = graph
+        .packages
+        .values()
+        .find(|package| package.id.name == "lib")
+        .expect("lib is in the graph");
+    assert_eq!(
+        lib.peers["host"].to_string(),
+        "host@1.0.0(lib@1.0.0(host@1.0.0))"
     );
 }
