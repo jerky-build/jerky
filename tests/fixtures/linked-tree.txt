@@ -1,0 +1,235 @@
+--- first sync ---
+linked @nodelib/fs.walk@1.2.8
+linked @types/node@20.0.0
+linked @types/react@18.0.0
+linked alpha@1.0.0
+linked beta@1.4.2
+linked delta@3.0.0
+linked gamma@1.0.0
+linked gamma@2.1.0
+linked string-width@4.2.3
+linked uses-types@1.0.0
+left apps/web/node_modules/elsewhere PointsOutside
+left apps/web/node_modules/legacy NotASymlink
+dir  node_modules/.jerky 40755
+dir  node_modules/.jerky/.staging 40755
+dir  node_modules/.jerky/@nodelib 40755
+dir  node_modules/.jerky/@nodelib/fs.walk@1.2.8 40755
+dir  node_modules/.jerky/@nodelib/fs.walk@1.2.8/node_modules 40755
+dir  node_modules/.jerky/@nodelib/fs.walk@1.2.8/node_modules/@nodelib 40755
+dir  node_modules/.jerky/@nodelib/fs.walk@1.2.8/node_modules/@nodelib/fs.walk 40755
+file node_modules/.jerky/@nodelib/fs.walk@1.2.8/node_modules/@nodelib/fs.walk/package.json 100644 96af3e88e95f49d3d73d642c76969625ee09ea7ec07d73396996b60a45ecc0ca
+dir  node_modules/.jerky/@nodelib/fs.walk@1.2.8/node_modules/@types 40755
+link node_modules/.jerky/@nodelib/fs.walk@1.2.8/node_modules/@types/node -> ../../../../@types/node@20.0.0/node_modules/@types/node
+     resolves=true is_dir=true
+link node_modules/.jerky/@nodelib/fs.walk@1.2.8/node_modules/alpha -> ../../../alpha@1.0.0/node_modules/alpha
+     resolves=true is_dir=true
+dir  node_modules/.jerky/@types 40755
+dir  node_modules/.jerky/@types/node@20.0.0 40755
+dir  node_modules/.jerky/@types/node@20.0.0/node_modules 40755
+dir  node_modules/.jerky/@types/node@20.0.0/node_modules/@types 40755
+dir  node_modules/.jerky/@types/node@20.0.0/node_modules/@types/node 40755
+file node_modules/.jerky/@types/node@20.0.0/node_modules/@types/node/package.json 100644 c688c36a1bb2fd82160402a1a250321c3fb51bad30176fae26ee5c928a1a9c58
+dir  node_modules/.jerky/@types/react@18.0.0 40755
+dir  node_modules/.jerky/@types/react@18.0.0/node_modules 40755
+dir  node_modules/.jerky/@types/react@18.0.0/node_modules/@types 40755
+dir  node_modules/.jerky/@types/react@18.0.0/node_modules/@types/react 40755
+file node_modules/.jerky/@types/react@18.0.0/node_modules/@types/react/package.json 100644 f648d860cb9f7890fc00012aab4635d15d4c50926e024deef33935c887eca1db
+dir  node_modules/.jerky/alpha@1.0.0 40755
+dir  node_modules/.jerky/alpha@1.0.0/node_modules 40755
+dir  node_modules/.jerky/alpha@1.0.0/node_modules/alpha 40755
+file node_modules/.jerky/alpha@1.0.0/node_modules/alpha/package.json 100644 3f01071484b5d4fed65ec1b4490ddc1a8e8b689f0670b1bed72fc1c4ea5bfd6f
+link node_modules/.jerky/alpha@1.0.0/node_modules/beta -> ../../beta@1.4.2/node_modules/beta
+     resolves=true is_dir=true
+link node_modules/.jerky/alpha@1.0.0/node_modules/gamma -> ../../gamma@2.1.0/node_modules/gamma
+     resolves=true is_dir=true
+dir  node_modules/.jerky/beta@1.4.2 40755
+dir  node_modules/.jerky/beta@1.4.2/node_modules 40755
+dir  node_modules/.jerky/beta@1.4.2/node_modules/beta 40755
+file node_modules/.jerky/beta@1.4.2/node_modules/beta/package.json 100644 4df76e96e61bb2ac9bc8950421841bcd1d192ecdac34784efecdd03b5d737130
+link node_modules/.jerky/beta@1.4.2/node_modules/gamma -> ../../gamma@2.1.0/node_modules/gamma
+     resolves=true is_dir=true
+dir  node_modules/.jerky/delta@3.0.0 40755
+dir  node_modules/.jerky/delta@3.0.0/node_modules 40755
+dir  node_modules/.jerky/delta@3.0.0/node_modules/delta 40755
+file node_modules/.jerky/delta@3.0.0/node_modules/delta/package.json 100644 8f237a3c8e0a7a28f8235ec00d37c186811f7746064d145ff18b2fc5ee6272d7
+link node_modules/.jerky/delta@3.0.0/node_modules/gamma -> ../../gamma@1.0.0/node_modules/gamma
+     resolves=true is_dir=true
+dir  node_modules/.jerky/gamma@1.0.0 40755
+dir  node_modules/.jerky/gamma@1.0.0/node_modules 40755
+dir  node_modules/.jerky/gamma@1.0.0/node_modules/gamma 40755
+file node_modules/.jerky/gamma@1.0.0/node_modules/gamma/package.json 100644 d65a86bbeb4001346b26f7592ee3446a313ff96bea195887cea600608bddbdae
+dir  node_modules/.jerky/gamma@2.1.0 40755
+dir  node_modules/.jerky/gamma@2.1.0/node_modules 40755
+dir  node_modules/.jerky/gamma@2.1.0/node_modules/gamma 40755
+file node_modules/.jerky/gamma@2.1.0/node_modules/gamma/package.json 100644 730be9f752bdf400865bf45497cb19e04d3d193f00f9bf9987c6a5f4490f471f
+dir  node_modules/.jerky/string-width@4.2.3 40755
+dir  node_modules/.jerky/string-width@4.2.3/node_modules 40755
+dir  node_modules/.jerky/string-width@4.2.3/node_modules/string-width 40755
+file node_modules/.jerky/string-width@4.2.3/node_modules/string-width/package.json 100644 bbab9a10ec0798222ff6b3bf6cb5cdfc618a6446d2d1a40fc8863d0a84f51c45
+dir  node_modules/.jerky/uses-types@1.0.0 40755
+dir  node_modules/.jerky/uses-types@1.0.0/node_modules 40755
+dir  node_modules/.jerky/uses-types@1.0.0/node_modules/@types 40755
+link node_modules/.jerky/uses-types@1.0.0/node_modules/@types/node -> ../../../@types/node@20.0.0/node_modules/@types/node
+     resolves=true is_dir=true
+dir  node_modules/.jerky/uses-types@1.0.0/node_modules/uses-types 40755
+file node_modules/.jerky/uses-types@1.0.0/node_modules/uses-types/package.json 100644 58b9739b62afb9bfb354d3e9a0a50c56a3f4422fd95e220839f333189583ae18
+dir  node_modules/@types 40755
+link node_modules/@types/react -> ../.jerky/@types/react@18.0.0/node_modules/@types/react
+     resolves=true is_dir=true
+link node_modules/alpha -> .jerky/alpha@1.0.0/node_modules/alpha
+     resolves=true is_dir=true
+link node_modules/delta -> .jerky/delta@3.0.0/node_modules/delta
+     resolves=true is_dir=true
+dir  packages/ui/node_modules/@nodelib 40755
+link packages/ui/node_modules/@nodelib/fs.walk -> ../../../../node_modules/.jerky/@nodelib/fs.walk@1.2.8/node_modules/@nodelib/fs.walk
+     resolves=true is_dir=true
+link packages/ui/node_modules/uses-types -> ../../../node_modules/.jerky/uses-types@1.0.0/node_modules/uses-types
+     resolves=true is_dir=true
+link packages/ui/node_modules/width-cjs -> ../../../node_modules/.jerky/string-width@4.2.3/node_modules/string-width
+     resolves=true is_dir=true
+packages/empty/node_modules  <absent>
+dir  apps/web/node_modules/@empty 40755
+link apps/web/node_modules/beta -> ../../../node_modules/.jerky/beta@1.4.2/node_modules/beta
+     resolves=true is_dir=true
+link apps/web/node_modules/elsewhere -> /nowhere/at/all
+     resolves=false is_dir=false
+dir  apps/web/node_modules/legacy 40755
+dir  apps/web/node_modules/legacy/lib 40755
+file apps/web/node_modules/legacy/lib/index.js 100644 cba06b5736faf67e54b07b561eae94395e774c517a7d910a54369e1263ccfbd4
+link apps/web/node_modules/ui -> ../../../packages/ui
+     resolves=true is_dir=true
+--- second sync ---
+linked @nodelib/fs.walk@1.2.8
+linked @types/node@20.0.0
+linked alpha@1.0.0
+linked beta@1.4.2
+linked gamma@2.1.0
+left apps/web/node_modules/elsewhere PointsOutside
+left apps/web/node_modules/legacy NotASymlink
+dir  node_modules/.jerky 40755
+dir  node_modules/.jerky/.staging 40755
+dir  node_modules/.jerky/@nodelib 40755
+dir  node_modules/.jerky/@nodelib/fs.walk@1.2.8 40755
+dir  node_modules/.jerky/@nodelib/fs.walk@1.2.8/node_modules 40755
+dir  node_modules/.jerky/@nodelib/fs.walk@1.2.8/node_modules/@nodelib 40755
+dir  node_modules/.jerky/@nodelib/fs.walk@1.2.8/node_modules/@nodelib/fs.walk 40755
+file node_modules/.jerky/@nodelib/fs.walk@1.2.8/node_modules/@nodelib/fs.walk/package.json 100644 96af3e88e95f49d3d73d642c76969625ee09ea7ec07d73396996b60a45ecc0ca
+dir  node_modules/.jerky/@nodelib/fs.walk@1.2.8/node_modules/@types 40755
+link node_modules/.jerky/@nodelib/fs.walk@1.2.8/node_modules/@types/node -> ../../../../@types/node@20.0.0/node_modules/@types/node
+     resolves=true is_dir=true
+link node_modules/.jerky/@nodelib/fs.walk@1.2.8/node_modules/alpha -> ../../../alpha@1.0.0/node_modules/alpha
+     resolves=true is_dir=true
+dir  node_modules/.jerky/@types 40755
+dir  node_modules/.jerky/@types/node@20.0.0 40755
+dir  node_modules/.jerky/@types/node@20.0.0/node_modules 40755
+dir  node_modules/.jerky/@types/node@20.0.0/node_modules/@types 40755
+dir  node_modules/.jerky/@types/node@20.0.0/node_modules/@types/node 40755
+file node_modules/.jerky/@types/node@20.0.0/node_modules/@types/node/package.json 100644 c688c36a1bb2fd82160402a1a250321c3fb51bad30176fae26ee5c928a1a9c58
+dir  node_modules/.jerky/alpha@1.0.0 40755
+dir  node_modules/.jerky/alpha@1.0.0/node_modules 40755
+dir  node_modules/.jerky/alpha@1.0.0/node_modules/alpha 40755
+file node_modules/.jerky/alpha@1.0.0/node_modules/alpha/package.json 100644 3f01071484b5d4fed65ec1b4490ddc1a8e8b689f0670b1bed72fc1c4ea5bfd6f
+link node_modules/.jerky/alpha@1.0.0/node_modules/beta -> ../../beta@1.4.2/node_modules/beta
+     resolves=true is_dir=true
+link node_modules/.jerky/alpha@1.0.0/node_modules/gamma -> ../../gamma@2.1.0/node_modules/gamma
+     resolves=true is_dir=true
+dir  node_modules/.jerky/beta@1.4.2 40755
+dir  node_modules/.jerky/beta@1.4.2/node_modules 40755
+dir  node_modules/.jerky/beta@1.4.2/node_modules/beta 40755
+file node_modules/.jerky/beta@1.4.2/node_modules/beta/package.json 100644 4df76e96e61bb2ac9bc8950421841bcd1d192ecdac34784efecdd03b5d737130
+link node_modules/.jerky/beta@1.4.2/node_modules/gamma -> ../../gamma@2.1.0/node_modules/gamma
+     resolves=true is_dir=true
+dir  node_modules/.jerky/gamma@2.1.0 40755
+dir  node_modules/.jerky/gamma@2.1.0/node_modules 40755
+dir  node_modules/.jerky/gamma@2.1.0/node_modules/gamma 40755
+file node_modules/.jerky/gamma@2.1.0/node_modules/gamma/package.json 100644 730be9f752bdf400865bf45497cb19e04d3d193f00f9bf9987c6a5f4490f471f
+link node_modules/alpha -> .jerky/alpha@1.0.0/node_modules/alpha
+     resolves=true is_dir=true
+dir  packages/ui/node_modules/@nodelib 40755
+link packages/ui/node_modules/@nodelib/fs.walk -> ../../../../node_modules/.jerky/@nodelib/fs.walk@1.2.8/node_modules/@nodelib/fs.walk
+     resolves=true is_dir=true
+packages/empty/node_modules  <absent>
+dir  apps/web/node_modules/@empty 40755
+link apps/web/node_modules/beta -> ../../../node_modules/.jerky/beta@1.4.2/node_modules/beta
+     resolves=true is_dir=true
+link apps/web/node_modules/elsewhere -> /nowhere/at/all
+     resolves=false is_dir=false
+dir  apps/web/node_modules/legacy 40755
+dir  apps/web/node_modules/legacy/lib 40755
+file apps/web/node_modules/legacy/lib/index.js 100644 cba06b5736faf67e54b07b561eae94395e774c517a7d910a54369e1263ccfbd4
+link apps/web/node_modules/ui -> ../../../packages/ui
+     resolves=true is_dir=true
+--- lockfile ---
+{
+  "lockfileVersion": 1,
+  "importers": {
+    ".": {
+      "dependencies": {
+        "alpha": {
+          "specifier": "1.0.0",
+          "version": "1.0.0"
+        }
+      }
+    },
+    "apps/web": {
+      "dependencies": {
+        "beta": {
+          "specifier": "1.4.2",
+          "version": "1.4.2"
+        },
+        "ui": {
+          "specifier": "workspace:*",
+          "version": "link:../../packages/ui"
+        }
+      }
+    },
+    "packages/empty": {},
+    "packages/ui": {
+      "dependencies": {
+        "@nodelib/fs.walk": {
+          "specifier": "1.2.8",
+          "version": "1.2.8"
+        }
+      }
+    }
+  },
+  "packages": {
+    "@nodelib/fs.walk@1.2.8": {
+      "version": "1.2.8",
+      "resolved": "https://fixture.test/@nodelib/fs.walk/-/@nodelib/fs.walk-1.2.8.tgz",
+      "integrity": "sha512-Ynv4oqoa0xpgIUW1ZiAKvO/MSrymsSKwnf3oRnH6HZnFMiuWSQINs2GQo1+XK2BGMMd7u3cr7fyxt6fRDtp5yw==",
+      "dependencies": {
+        "@types/node": "20.0.0",
+        "alpha": "1.0.0"
+      }
+    },
+    "@types/node@20.0.0": {
+      "version": "20.0.0",
+      "resolved": "https://fixture.test/@types/node/-/@types/node-20.0.0.tgz",
+      "integrity": "sha512-K8pzWZQXvYOBZdgy7V6zeO+cbBIw6C3nC76c93dRm9uWEur21RY9ot0ZlJIidYnKYWjjSNiZpGsgCsXM5xNKrw=="
+    },
+    "alpha@1.0.0": {
+      "version": "1.0.0",
+      "resolved": "https://fixture.test/alpha/-/alpha-1.0.0.tgz",
+      "integrity": "sha512-s94/u13/+zK1j+pwGRE1qD63qRNhnoIU9Qu2mqMp0c4d/4KGy3fO8ZfCGXAYYmeEzuu4lHj0KOsJEebr3c/Tkg==",
+      "dependencies": {
+        "beta": "1.4.2",
+        "gamma": "2.1.0"
+      }
+    },
+    "beta@1.4.2": {
+      "version": "1.4.2",
+      "resolved": "https://fixture.test/beta/-/beta-1.4.2.tgz",
+      "integrity": "sha512-Qkom5ZKAIpcykk93EYmlyK281YobtTmLgH8O5Os7yRq6FRTKBT5S+03CugtE2Egi4SVMbTqLhz4rmvyas2rl0g==",
+      "dependencies": {
+        "gamma": "2.1.0"
+      }
+    },
+    "gamma@2.1.0": {
+      "version": "2.1.0",
+      "resolved": "https://fixture.test/gamma/-/gamma-2.1.0.tgz",
+      "integrity": "sha512-cdKFPd7ZUS2DJ8IJHw01Z49rn3BC1S/j4EOciJDyzj+EzpFtJP+Eb452E02qzv87oXroaIQaEygTmSgzHB7J5Q=="
+    }
+  }
+}

@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
 use thiserror::Error;
@@ -31,12 +31,260 @@ pub enum LinkError {
     ConflictingEntry { path: PathBuf },
 }
 
+/// The tree an install means to end up with, described rather than performed.
+///
+/// A caller names the three things a linked workspace is made of — the
+/// packages the virtual store holds, the edges that leave each of them, and
+/// what each importer links — and [`Plan::apply`] is the single call that makes
+/// them true. The ordering that materialisation obeys is a property of `apply`,
+/// where a test can see it, rather than of the sequence of calls a caller
+/// happened to make.
+///
+/// The parts that *remove* carry no separate input. Which virtual store entries
+/// survive the prune is the set of entries the plan names, and which links
+/// survive convergence in one importer is the set of links the plan names for
+/// it. They were previously two more collections, gathered at the call site
+/// beside the loops that did the writing, and keeping them in agreement was
+/// something to remember rather than something the shape guaranteed. Here it is
+/// not expressible for the plan to name an entry and prune it in the same pass.
+///
+/// A workspace of one is not a special case: it is a plan with one importer at
+/// the root, applied by the same function as a plan with twenty.
+///
+/// `pub(crate)` rather than `pub`: this is the seam between the orchestrator
+/// and the linker, not part of what jerky offers a dependent. Widening it is a
+/// decision to make when something outside the crate needs one.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Plan {
+    /// The workspace root. The one virtual store hangs below it, and every
+    /// importer link's climb is measured against it.
+    workspace_root: PathBuf,
+    /// Every member's own directory, absolute.
+    ///
+    /// Deliberately not derived from the links below, though every local link
+    /// points at one. Convergence needs the full set to recognise a link at a
+    /// member that is *no longer* depended on as jerky's own — and a link the
+    /// plan no longer names is exactly the one that is missing from it.
+    members: BTreeSet<PathBuf>,
+    /// The virtual store, keyed by the entry's directory name — which is the
+    /// package's `name@version`, and its identity on disk.
+    entries: BTreeMap<String, VirtualStoreEntry>,
+    /// One `node_modules` per importer, keyed by the importer's own directory:
+    /// the name each link takes, and what it points at.
+    ///
+    /// An importer that declares nothing is still named here, with no links. It
+    /// has to be: convergence is what removes the link a dependency dropped
+    /// from its `package.json` left behind, and an importer whose last
+    /// dependency was just deleted is precisely the one with nothing to write.
+    importers: BTreeMap<PathBuf, BTreeMap<String, ImporterTarget>>,
+}
+
+/// One package the virtual store must hold, and what it sees from inside it.
+///
+/// Carries its own `dir_name` rather than being handed over beside one, for
+/// the same reason [`VirtualStoreRef`] is a pair: a name and the thing it
+/// names are never useful apart, and a `(&str, value)` argument list is
+/// exactly the shape that lets a caller pass the wrong string and get a
+/// silently misplaced entry rather than a compile error.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct VirtualStoreEntry {
+    /// The entry's directory name, which is the package's `name@version`. Its
+    /// identity in the plan and on disk both.
+    pub dir_name: String,
+    /// The package's own name, which is the directory nested inside the entry.
+    pub pkg_name: String,
+    /// Where the unpacked bytes are in the machine-global *content* store,
+    /// which the entry is hard-linked from. Every other path in a plan is in
+    /// the project's virtual store; this is the one that is not, and it is
+    /// spelled out because the two are easy to read past.
+    pub content_store_path: PathBuf,
+    /// This package's own dependencies: the name it calls each one by, and
+    /// where that one sits in the same virtual store. The two differ for an
+    /// alias — a package declaring `npm:string-width@^4.0.0` under `width-cjs`
+    /// calls it `width-cjs` and must land on `string-width`'s entry.
+    pub edges: BTreeMap<String, VirtualStoreRef>,
+}
+
+/// Which virtual store entry a link points at: the entry directory, and the
+/// name of the package nested inside it.
+///
+/// A pair rather than two parameters because they are never useful apart and
+/// are easy to hand over in the wrong order — both are strings, and swapping
+/// them produces a link that resolves to nothing rather than a compile error.
+///
+/// Named for the *virtual* store on purpose. jerky has two stores — the
+/// machine-global content store under `~/.jerky/store` that holds unpacked
+/// bytes, and the per-workspace virtual store under `node_modules/.jerky` that
+/// holds hard links into it — and a reader should not have to open the docs to
+/// tell which of them a type or a field means.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct VirtualStoreRef {
+    /// The entry's directory name, which is the package's `name@version`.
+    pub dir_name: String,
+    /// The package's own name, which is the directory nested inside it.
+    pub pkg_name: String,
+}
+
+/// What one link in an importer's `node_modules` points at.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ImporterTarget {
+    /// A registry package, in the workspace root's virtual store.
+    Entry(VirtualStoreRef),
+    /// A workspace member, at its own directory.
+    ///
+    /// A local dependency has no store entry, because there is no tarball: the
+    /// bytes are already in the repo. Edits to that member are therefore
+    /// visible to its dependents immediately.
+    Member(PathBuf),
+}
+
+impl Plan {
+    /// An empty plan for `workspace_root`, whose members are at `members`.
+    pub(crate) fn new(workspace_root: &Path, members: BTreeSet<PathBuf>) -> Self {
+        Plan {
+            workspace_root: workspace_root.to_path_buf(),
+            members,
+            entries: BTreeMap::new(),
+            importers: BTreeMap::new(),
+        }
+    }
+
+    /// Name a package the virtual store must hold.
+    ///
+    /// Panics on a second entry claiming a `dir_name` that is already taken.
+    /// Keying by that name is what makes the prune safe by construction, and it
+    /// is also a way to lose an entry that the `BTreeMap<PackageId, _>` this
+    /// replaced did not have: two `PackageId`s rendering the same
+    /// `name@version` would leave one silently absent from the plan, unpacked
+    /// by nothing and pointed at by links that resolve nowhere.
+    ///
+    /// Unreachable through the resolver, because a package name carries no `@`
+    /// past its scope prefix and a version carries none at all. It is worth a
+    /// panic rather than a silent overwrite anyway: `dir_name` *is* the
+    /// directory, so a collision here is a collision on disk, and this is the
+    /// one point that can still say so.
+    pub(crate) fn add_entry(&mut self, entry: VirtualStoreEntry) {
+        assert!(
+            !self.entries.contains_key(&entry.dir_name),
+            "two packages both claim the virtual store entry `{}`, which is one \
+             directory and cannot hold both",
+            entry.dir_name
+        );
+        self.entries.insert(entry.dir_name.clone(), entry);
+    }
+
+    /// Name an importer and everything its `node_modules` should contain.
+    ///
+    /// `dir` is the importer's own absolute directory, not its `node_modules`.
+    /// Naming an importer with no links at all is meaningful and not a no-op:
+    /// it is what converges a member that has just dropped its last dependency.
+    pub(crate) fn add_importer(&mut self, dir: &Path, links: BTreeMap<String, ImporterTarget>) {
+        self.importers.insert(dir.to_path_buf(), links);
+    }
+
+    /// Make the tree match the plan, and report what convergence left alone.
+    ///
+    /// The order is the whole reason this is one function.
+    ///
+    /// 1. **Entries**, because every link written below names one, and a
+    ///    store-internal link's target is derived from where the owner's entry
+    ///    actually landed.
+    /// 2. **Store-internal edges**, which is what makes a package see exactly
+    ///    what it declared: the siblings in its private `node_modules` are its
+    ///    dependencies and nothing else.
+    /// 3. **Importer links**, with targets shaped by how deep each importer
+    ///    sits.
+    /// 4. **Convergence**, after linking rather than before, so that what it
+    ///    judges is the finished tree: an entry that was about to be rewritten
+    ///    has already been rewritten, and the only ones left to decide are the
+    ///    ones no importer asked for.
+    /// 5. **The prune**, last. The links go first and the entries they named go
+    ///    second, so nothing is ever pointed at by a link jerky still considers
+    ///    live.
+    ///
+    /// Laying the tree out is serial: it is local filesystem work — hard links
+    /// out of the content store — so there is no latency to hide, and one
+    /// writer means the tree is built the same way every run. Whether that is
+    /// still the right trade is #86's question, and it is now one function's to
+    /// answer rather than the caller's.
+    ///
+    /// **The order entries are laid out in did change**, and saying so is
+    /// better than letting the next reader discover it. The orchestrator used
+    /// to walk `BTreeMap<PackageId, _>`, sorted by `(name, version)`; this
+    /// walks `entries`, sorted by the `name@version` string. The two disagree
+    /// wherever a name contains a character below `@`, so `a-b@1.0.0` now comes
+    /// before `a@1.0.0` and used to come after. Nothing depends on it: each
+    /// entry is hard-linked out of the content store independently of every
+    /// other, no entry's contents mention another, and the links between them
+    /// are written in the pass below, after all of them exist. The resulting
+    /// tree is byte for byte the one the old order produced, and
+    /// `tests/tree_shape.rs` is where that is checked rather than asserted —
+    /// its fixture was rendered by the linker that walked `PackageId`s. It is
+    /// written down because "the same way every run" is a property worth
+    /// keeping, and the next person to compare a trace against an old one
+    /// deserves to know which sort they are looking at.
+    pub(crate) fn apply(&self) -> Result<Vec<Unowned>, LinkError> {
+        let node_modules = self.workspace_root.join("node_modules");
+
+        // Paired with the entry rather than looked up again, so there is no
+        // key that can miss. `populate_virtual_store` returns where the entry
+        // landed, and `symlink_into_store` finds the store by climbing out of
+        // it — the two halves of one fact, kept next to each other.
+        let mut materialised = Vec::with_capacity(self.entries.len());
+        for entry in self.entries.values() {
+            let owner = populate_virtual_store(
+                &entry.content_store_path,
+                &node_modules,
+                &entry.dir_name,
+                &entry.pkg_name,
+            )?;
+            materialised.push((entry, owner));
+        }
+
+        for (entry, owner) in &materialised {
+            for (link_name, target) in &entry.edges {
+                symlink_into_store(owner, link_name, target)?;
+            }
+        }
+
+        for (importer, links) in &self.importers {
+            for (link_name, target) in links {
+                match target {
+                    ImporterTarget::Entry(entry) => {
+                        symlink_dependency_from(importer, &self.workspace_root, link_name, entry)?
+                    }
+                    ImporterTarget::Member(member) => symlink_local(importer, link_name, member)?,
+                }
+            }
+        }
+
+        let mut left_alone = Vec::new();
+        for (importer, links) in &self.importers {
+            let expected: BTreeSet<String> = links.keys().cloned().collect();
+            left_alone.extend(converge(
+                importer,
+                &self.workspace_root,
+                &self.members,
+                &expected,
+            )?);
+        }
+
+        // Derived from the entries the plan names, which is what makes "apply
+        // never prunes an entry the plan still names" true by construction
+        // rather than by the caller having built two sets that agree.
+        let named: BTreeSet<String> = self.entries.keys().cloned().collect();
+        prune_virtual_store(&node_modules, &named)?;
+
+        Ok(left_alone)
+    }
+}
+
 /// Hard-link one file, falling back to a copy across filesystems.
 ///
 /// The store and a project can legitimately live on different volumes, where
 /// `hard_link` fails with `EXDEV`. Only that specific errno falls back — any
 /// other failure is a real error, not something to paper over with a copy.
-pub fn link_file(src: &Path, dst: &Path) -> Result<(), LinkError> {
+fn link_file(src: &Path, dst: &Path) -> Result<(), LinkError> {
     match std::fs::hard_link(src, dst) {
         Ok(()) => Ok(()),
         Err(source) if source.raw_os_error() == Some(EXDEV) => std::fs::copy(src, dst)
@@ -128,23 +376,8 @@ fn walk_tree(
 ///
 /// Directories cannot be hard-linked, so they are created and only regular
 /// files are linked.
-pub fn hard_link_tree(src: &Path, dst: &Path) -> Result<(), LinkError> {
+fn hard_link_tree(src: &Path, dst: &Path) -> Result<(), LinkError> {
     walk_tree(src, dst, &link_file)
-}
-
-/// Recreate `src` at `dst` by copying. The `EXDEV` fallback path, exposed so
-/// it can be tested directly — CI cannot practically mount a second
-/// filesystem to trigger it naturally.
-pub fn copy_tree(src: &Path, dst: &Path) -> Result<(), LinkError> {
-    walk_tree(src, dst, &|from: &Path, to: &Path| {
-        std::fs::copy(from, to)
-            .map(|_| ())
-            .map_err(|source| LinkError::Io {
-                from: from.to_path_buf(),
-                to: to.to_path_buf(),
-                source,
-            })
-    })
 }
 
 /// Build `node_modules/.jerky/<dir_name>/node_modules/<pkg_name>/` from a
@@ -157,7 +390,7 @@ pub fn copy_tree(src: &Path, dst: &Path) -> Result<(), LinkError> {
 ///
 /// Uses the same stage-and-rename discipline as the store, for the same
 /// reason: a half-linked tree looks present.
-pub fn populate_virtual_store(
+fn populate_virtual_store(
     store_entry: &Path,
     node_modules: &Path,
     dir_name: &str,
@@ -324,11 +557,7 @@ fn link_at(link_dir: &Path, pkg_name: &str, entry: &Path) -> Result<(), LinkErro
 /// bytes are already in the repo and there is nothing to verify or unpack.
 /// The link therefore points at the member itself rather than into the virtual
 /// store, and edits to that member are visible to its dependents immediately.
-pub fn symlink_local(
-    importer_dir: &Path,
-    pkg_name: &str,
-    target_dir: &Path,
-) -> Result<(), LinkError> {
+fn symlink_local(importer_dir: &Path, pkg_name: &str, target_dir: &Path) -> Result<(), LinkError> {
     link_at(&importer_dir.join("node_modules"), pkg_name, target_dir)
 }
 
@@ -361,10 +590,10 @@ pub fn symlink_local(
 /// ../../string-width@4.2.3/node_modules/string-width`. Passing one name for
 /// both is correct for every dependency that is not an alias and silently
 /// wrong for every one that is.
-pub fn symlink_into_store(
+fn symlink_into_store(
     owner_entry: &Path,
     link_name: &str,
-    target: &StoreEntry<'_>,
+    target: &VirtualStoreRef,
 ) -> Result<(), LinkError> {
     let link_dir = owner_entry.join("node_modules");
     let virtual_store = virtual_store_of(owner_entry)
@@ -387,25 +616,12 @@ fn virtual_store_of(entry: &Path) -> Option<&Path> {
     })
 }
 
-/// Where a package sits in a virtual store: the entry directory, and the name
-/// of the package nested inside it.
-///
-/// A pair rather than two parameters because they are never useful apart and
-/// are easy to hand over in the wrong order — both are strings, and swapping
-/// them produces a link that resolves to nothing rather than a compile error.
-pub struct StoreEntry<'a> {
-    /// The entry's directory name, which is the package's `name@version`.
-    pub dir_name: &'a str,
-    /// The package's own name, which is the directory nested inside it.
-    pub pkg_name: &'a str,
-}
-
-impl StoreEntry<'_> {
+impl VirtualStoreRef {
     fn path_under(&self, virtual_store: &Path) -> PathBuf {
         virtual_store
-            .join(self.dir_name)
+            .join(&self.dir_name)
             .join("node_modules")
-            .join(self.pkg_name)
+            .join(&self.pkg_name)
     }
 }
 
@@ -418,11 +634,11 @@ impl StoreEntry<'_> {
 /// climbs three levels to reach the root's store. A workspace of one is not a
 /// special case here — it is an importer at depth zero, and takes this path
 /// like any other.
-pub fn symlink_dependency_from(
+fn symlink_dependency_from(
     importer_dir: &Path,
     workspace_root: &Path,
     link_name: &str,
-    target: &StoreEntry<'_>,
+    target: &VirtualStoreRef,
 ) -> Result<(), LinkError> {
     debug_assert!(
         importer_dir.starts_with(workspace_root),
@@ -498,7 +714,7 @@ enum Ownership {
 /// convergence be total over what jerky manages without ever deleting what
 /// another tool or a person put there: the first `jerky install` in a
 /// repository that has seen npm must not be a destructive surprise.
-pub fn converge(
+fn converge(
     importer_dir: &Path,
     workspace_root: &Path,
     members: &BTreeSet<PathBuf>,
@@ -747,10 +963,7 @@ fn file_name(path: &Path) -> String {
 /// touched, and is not even reachable from here: it is shared by every project
 /// on the machine, so a project-local convergence has no basis for deciding one
 /// of its entries is dead. Collecting it is a separate command (#52).
-pub fn prune_virtual_store(
-    node_modules: &Path,
-    expected: &BTreeSet<String>,
-) -> Result<(), LinkError> {
+fn prune_virtual_store(node_modules: &Path, expected: &BTreeSet<String>) -> Result<(), LinkError> {
     let virtual_root = node_modules.join(VIRTUAL_STORE_DIR);
 
     for path in entries(&virtual_root)? {
@@ -841,8 +1054,28 @@ mod tests {
     /// Deliberately not derived from `dir_name`: deriving it would mean these
     /// tests agree with themselves about how the two relate rather than with
     /// the caller, and that pairing is exactly what an alias breaks.
-    fn entry<'a>(dir_name: &'a str, pkg_name: &'a str) -> StoreEntry<'a> {
-        StoreEntry { dir_name, pkg_name }
+    fn entry(dir_name: &str, pkg_name: &str) -> VirtualStoreRef {
+        VirtualStoreRef {
+            dir_name: dir_name.to_string(),
+            pkg_name: pkg_name.to_string(),
+        }
+    }
+
+    /// Recreate `src` at `dst` by copying, exercising `walk_tree`'s other
+    /// placer — the one `link_file` falls back to on `EXDEV`. A test helper
+    /// because CI cannot practically mount a second filesystem to trigger that
+    /// fallback naturally, and because nothing in an install ever asks for a
+    /// whole tree to be copied.
+    fn copy_tree(src: &Path, dst: &Path) -> Result<(), LinkError> {
+        walk_tree(src, dst, &|from: &Path, to: &Path| {
+            std::fs::copy(from, to)
+                .map(|_| ())
+                .map_err(|source| LinkError::Io {
+                    from: from.to_path_buf(),
+                    to: to.to_path_buf(),
+                    source,
+                })
+        })
     }
 
     fn store_entry(root: &Path) -> PathBuf {
@@ -1534,5 +1767,240 @@ mod tests {
         // Not reported either: it holds no dependency, so there is nothing to
         // tell the user jerky declined to touch.
         assert!(left_alone.is_empty());
+    }
+
+    /// A store entry for one package, recording where it came from so a link
+    /// followed to it says which entry it actually landed on.
+    fn store_tree(root: &Path, dir_name: &str, pkg_name: &str) -> PathBuf {
+        let entry = root.join("store").join(dir_name);
+        std::fs::create_dir_all(&entry).unwrap();
+        std::fs::write(
+            entry.join("package.json"),
+            format!(r#"{{"name":"{pkg_name}","from":"{dir_name}"}}"#),
+        )
+        .unwrap();
+        entry
+    }
+
+    /// The `from` field of the `package.json` a path resolves to, which says
+    /// which virtual store entry a link actually landed on.
+    fn resolves_to(path: &Path) -> String {
+        let raw = std::fs::read_to_string(path.join("package.json"))
+            .unwrap_or_else(|err| panic!("{} does not resolve: {err}", path.display()));
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        parsed["from"].as_str().unwrap().to_string()
+    }
+
+    fn leaf(root: &Path, dir_name: &str, pkg_name: &str) -> VirtualStoreEntry {
+        VirtualStoreEntry {
+            dir_name: dir_name.to_string(),
+            pkg_name: pkg_name.to_string(),
+            content_store_path: store_tree(root, dir_name, pkg_name),
+            edges: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn a_plan_is_its_content_not_the_order_it_was_built_in() {
+        // Half of "regardless of construction order": the order a caller
+        // happens to name things in cannot reach the value, so it cannot
+        // reach what `apply` does with it either. The other half is the test
+        // below, which builds a plan back to front and applies it.
+        let root = TempDir::new().unwrap();
+        let ws = root.path().join("ws");
+        let ui = ws.join("packages/ui");
+
+        let mut forwards = Plan::new(&ws, BTreeSet::from([ws.clone(), ui.clone()]));
+        forwards.add_entry(leaf(root.path(), "alpha@1.0.0", "alpha"));
+        forwards.add_entry(leaf(root.path(), "beta@2.0.0", "beta"));
+        forwards.add_importer(&ws, BTreeMap::new());
+        forwards.add_importer(&ui, BTreeMap::new());
+
+        let mut backwards = Plan::new(&ws, BTreeSet::from([ws.clone(), ui.clone()]));
+        backwards.add_importer(&ui, BTreeMap::new());
+        backwards.add_importer(&ws, BTreeMap::new());
+        backwards.add_entry(leaf(root.path(), "beta@2.0.0", "beta"));
+        backwards.add_entry(leaf(root.path(), "alpha@1.0.0", "alpha"));
+
+        assert_eq!(forwards, backwards);
+    }
+
+    #[test]
+    #[should_panic(expected = "two packages both claim the virtual store entry")]
+    fn two_packages_claiming_one_entry_is_loud_rather_than_lossy() {
+        // Keying the entries by their directory name is what makes the prune
+        // safe by construction, and it costs this: a `BTreeMap` insert would
+        // drop one of a colliding pair without a word, leaving an entry the
+        // plan believes in, nothing to unpack it, and links into it that
+        // resolve nowhere. Unreachable through the resolver — a name carries
+        // no `@` past its scope prefix and a version carries none at all — and
+        // pinned anyway, because the point of choosing a panic over a silent
+        // overwrite is that someone later can see the choice was made.
+        let root = TempDir::new().unwrap();
+        let ws = root.path().join("ws");
+
+        let mut plan = Plan::new(&ws, BTreeSet::new());
+        plan.add_entry(leaf(root.path(), "alpha@1.0.0", "alpha"));
+        plan.add_entry(leaf(root.path(), "alpha@1.0.0", "alpha"));
+    }
+
+    #[test]
+    fn applying_a_plan_never_prunes_an_entry_it_still_names() {
+        // The ordering the orchestrator used to encode by writing five loops
+        // in the right sequence, now a property of one function. Built back to
+        // front on purpose — importers naming entries that have not been added
+        // yet, and the dependent added before the dependency — because what
+        // survives must not depend on the order a caller described it in.
+        //
+        // The prune's input is not a second collection handed in beside the
+        // entries; it *is* the entries, so "names it and prunes it in the same
+        // pass" is not a state this can be put into.
+        let root = TempDir::new().unwrap();
+        let ws = root.path().join("ws");
+        let ui = ws.join("packages/ui");
+        std::fs::create_dir_all(&ui).unwrap();
+        let node_modules = ws.join("node_modules");
+
+        // Debris from an install that is no longer current: an entry nothing
+        // names any more, and the importer link that used to reach it.
+        populate_virtual_store(
+            &store_tree(root.path(), "gone@0.1.0", "gone"),
+            &node_modules,
+            "gone@0.1.0",
+            "gone",
+        )
+        .unwrap();
+        symlink_dependency_from(&ws, &ws, "gone", &entry("gone@0.1.0", "gone")).unwrap();
+
+        let mut plan = Plan::new(&ws, BTreeSet::from([ws.clone(), ui.clone()]));
+
+        plan.add_importer(
+            &ws,
+            BTreeMap::from([(
+                "alpha".to_string(),
+                ImporterTarget::Entry(entry("alpha@1.0.0", "alpha")),
+            )]),
+        );
+        plan.add_importer(
+            &ui,
+            BTreeMap::from([
+                (
+                    "beta".to_string(),
+                    ImporterTarget::Entry(entry("beta@2.0.0", "beta")),
+                ),
+                ("ws".to_string(), ImporterTarget::Member(ws.clone())),
+            ]),
+        );
+
+        plan.add_entry(VirtualStoreEntry {
+            dir_name: "alpha@1.0.0".to_string(),
+            pkg_name: "alpha".to_string(),
+            content_store_path: store_tree(root.path(), "alpha@1.0.0", "alpha"),
+            edges: BTreeMap::from([("beta".to_string(), entry("beta@2.0.0", "beta"))]),
+        });
+        plan.add_entry(leaf(root.path(), "beta@2.0.0", "beta"));
+
+        let left_alone = plan.apply().unwrap();
+        assert!(left_alone.is_empty(), "{left_alone:?}");
+
+        // Every entry the plan names survived the very pass that created it.
+        for named in ["alpha@1.0.0", "beta@2.0.0"] {
+            assert!(
+                node_modules.join(".jerky").join(named).is_dir(),
+                "{named} was pruned by the same apply that named it"
+            );
+        }
+
+        // And every link the plan names resolves onto the entry it named,
+        // which is what says the entries were laid out before the links into
+        // them rather than after.
+        assert_eq!(resolves_to(&ws.join("node_modules/alpha")), "alpha@1.0.0");
+        assert_eq!(resolves_to(&ui.join("node_modules/beta")), "beta@2.0.0");
+        assert_eq!(
+            resolves_to(&node_modules.join(".jerky/alpha@1.0.0/node_modules/beta")),
+            "beta@2.0.0",
+            "a store-internal edge did not reach its sibling"
+        );
+        assert!(
+            ui.join("node_modules/ws").is_dir(),
+            "the link at a workspace member did not resolve"
+        );
+
+        // The debris is gone, which is what says convergence and the prune ran
+        // at all rather than the named entries merely surviving a pass that
+        // never came.
+        assert!(
+            !still_there(&ws.join("node_modules/gone")),
+            "a link no importer asked for outlived convergence"
+        );
+        assert!(
+            !still_there(&node_modules.join(".jerky/gone@0.1.0")),
+            "an entry the plan does not name outlived the prune"
+        );
+    }
+
+    #[test]
+    fn a_link_the_plan_names_is_rewritten_before_convergence_judges_it() {
+        // Why convergence runs after linking rather than before. The link is
+        // already there, pointing at the entry the last install chose, and
+        // what convergence must see is the rewritten one — so that the
+        // superseded entry is debris the prune takes, and the name the
+        // importer still declares keeps a link that resolves.
+        let root = TempDir::new().unwrap();
+        let ws = root.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let node_modules = ws.join("node_modules");
+
+        populate_virtual_store(
+            &store_tree(root.path(), "alpha@0.9.0", "alpha"),
+            &node_modules,
+            "alpha@0.9.0",
+            "alpha",
+        )
+        .unwrap();
+        symlink_dependency_from(&ws, &ws, "alpha", &entry("alpha@0.9.0", "alpha")).unwrap();
+
+        let mut plan = Plan::new(&ws, BTreeSet::from([ws.clone()]));
+        plan.add_entry(leaf(root.path(), "alpha@1.0.0", "alpha"));
+        plan.add_importer(
+            &ws,
+            BTreeMap::from([(
+                "alpha".to_string(),
+                ImporterTarget::Entry(entry("alpha@1.0.0", "alpha")),
+            )]),
+        );
+
+        assert!(plan.apply().unwrap().is_empty());
+
+        assert_eq!(
+            resolves_to(&ws.join("node_modules/alpha")),
+            "alpha@1.0.0",
+            "the link still names the version the previous install chose"
+        );
+        assert!(
+            !still_there(&node_modules.join(".jerky/alpha@0.9.0")),
+            "the superseded entry outlived the prune"
+        );
+    }
+
+    #[test]
+    fn apply_reports_what_convergence_left_alone() {
+        // The plan describes what jerky writes; what it finds in an importer's
+        // `node_modules` and cannot prove it wrote travels back out rather
+        // than being removed or raised.
+        let root = TempDir::new().unwrap();
+        let ws = root.path().join("ws");
+        let node_modules = ws.join("node_modules");
+        std::fs::create_dir_all(node_modules.join("from-npm")).unwrap();
+
+        let mut plan = Plan::new(&ws, BTreeSet::from([ws.clone()]));
+        plan.add_importer(&ws, BTreeMap::new());
+
+        let left_alone = plan.apply().unwrap();
+
+        assert_eq!(left_alone.len(), 1, "{left_alone:?}");
+        assert_eq!(left_alone[0].path, node_modules.join("from-npm"));
+        assert!(matches!(left_alone[0].reason, UnownedReason::NotASymlink));
+        assert!(still_there(&node_modules.join("from-npm")));
     }
 }
