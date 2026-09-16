@@ -483,13 +483,18 @@ impl HttpRegistry {
             .max_idle_connections(MAX_CONCURRENT_FETCHES)
             .max_idle_connections_per_host(MAX_CONCURRENT_FETCHES)
             .http_status_as_error(false)
-            // Bounding the name lookup costs a thread per lookup — ureq aborts
-            // a blocked `getaddrinfo` by running it on one — and that is worth
-            // paying rather than trusting the system resolver's own limits,
-            // which are a file the user is free to have set to something
-            // patient. With the pool above a lookup happens per connection
-            // rather than per request, so it is tens of threads across an
-            // install and not thousands.
+            // Bounding the name lookup costs a thread per *request*, not per
+            // connection: ureq resolves before it asks the pool for one, so a
+            // pooled connection does not skip the lookup, and the only way to
+            // abandon a blocked `getaddrinfo` is to have run it somewhere that
+            // can be abandoned. A lookup that does time out leaves its thread
+            // parked until the system resolver gives up on it.
+            //
+            // Paid anyway. The threads are short-lived and never more than
+            // `MAX_CONCURRENT_FETCHES` at a time, the alternative is trusting
+            // limits that live in a file the user is free to have set to
+            // something patient, and the phase is otherwise the one part of a
+            // request with no bound on it at all.
             .timeout_resolve(Some(deadlines.connect))
             .timeout_connect(Some(deadlines.connect))
             .timeout_send_request(Some(deadlines.response))
@@ -810,6 +815,13 @@ impl RegistryClient for HttpRegistry {
                 Ok(response) if !response.status().is_success() => {
                     Err(Self::from_status(url, &response))
                 }
+                // Deliberately not `from_metadata_body`'s rule. A tarball's
+                // bytes are not judged here — they are checked against the
+                // integrity hash the packument published, downstream of this
+                // — so there is no reading of them this layer could call
+                // malformed. Everything that can fail here is transport, bar
+                // a body past `MAX_TARBALL_BYTES`, which is rare enough and
+                // loud enough not to be worth a second rule.
                 Ok(mut response) => response
                     .body_mut()
                     .with_config()

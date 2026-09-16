@@ -882,9 +882,10 @@ fn serve_stalling(prelude: &'static str) -> (String, Arc<AtomicUsize>) {
     (format!("http://127.0.0.1:{port}"), requests)
 }
 
-/// Short enough that a stall costs the suite milliseconds rather than the
-/// thirty seconds jerky ships, long enough that a loaded machine's loopback
-/// round trip is never mistaken for one.
+/// Short enough that a stall costs the suite milliseconds rather than the tens
+/// of seconds jerky ships — or, on a tarball body, the five minutes — and long
+/// enough that a loaded machine's loopback round trip is never mistaken for
+/// one.
 const STALL_DEADLINE: Duration = Duration::from_millis(250);
 
 /// A response head promising a body that `serve_stalling` never sends.
@@ -966,6 +967,23 @@ fn a_metadata_body_that_stops_arriving_is_not_reported_as_malformed() {
     assert!(
         matches!(result, Err(RegistryError::Stalled { .. })),
         "a stalled body must say so, got {result:?}"
+    );
+}
+
+#[test]
+fn a_metadata_body_that_is_not_text_is_still_a_malformed_response() {
+    // The other arm of the same classifier, and the one the stall carve-out
+    // must not have taken with it. A body jerky cannot read is the registry
+    // sending something it cannot use, which is what `MalformedResponse` has
+    // always meant; only a stall was ever misfiled under it.
+    let base = serve_with(|_| tiny_http::Response::from_data(vec![0x7b, 0xff, 0xfe, 0x7d]));
+    let registry = HttpRegistry::with_base_url(base);
+
+    let result = registry.version_metadata("lodash", "4.17.21");
+
+    assert!(
+        matches!(result, Err(RegistryError::MalformedResponse { .. })),
+        "a body that is not text must still be a malformed response, got {result:?}"
     );
 }
 
