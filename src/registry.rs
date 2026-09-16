@@ -40,6 +40,19 @@ pub enum RegistryError {
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+    // Separate from `Network` because the registry *was* reached: it took the
+    // connection and then went quiet, which is a different next move from a
+    // host that is down. #79 is about the two being indistinguishable to
+    // whoever is watching a cursor, so this names the request that gave up and
+    // leaves the cause underneath to name the deadline that ran out —
+    // "timeout: receive response" for a registry that never answered,
+    // "timeout: receive body" for one that stopped part-way through.
+    #[error("the registry at {url} stopped responding, so jerky stopped waiting")]
+    Stalled {
+        url: String,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
     // Deliberately says what is on disk and how old it is, rather than only
     // that the network failed. The user's next decision is whether to wait for
     // a network or to change what they asked for, and the age of what jerky
@@ -295,10 +308,118 @@ const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
 const MAX_METADATA_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_TARBALL_BYTES: u64 = 512 * 1024 * 1024;
 
+/// How long jerky waits at each phase of a request before calling it stalled.
+///
+/// A set of per-phase deadlines rather than one for the whole call, because
+/// the phases are not the same question. Nothing up to the first byte of a
+/// response scales with how big that response is: a DNS lookup, a handshake, a
+/// request head and a registry's think time cost the same for a 200 KB
+/// packument as for a 512 MB tarball, so a stall in any of them is a stall
+/// whatever was asked for. Only the body is different — and a single deadline
+/// generous enough for the largest body jerky will accept is no bound at all
+/// on everything before it, which is why `timeout_global` is left unset.
+///
+/// ureq 3 has no *idle* deadline to offer, which is the one shape that would
+/// suit a body: its socket read deadline is whatever remains of the phase's
+/// allowance and is not restarted per read, so a body deadline is a total
+/// budget or it is nothing. That is the whole reason the two paths carry
+/// different numbers instead of sharing one.
+struct Deadlines {
+    /// Reaching the server: the name lookup, then the socket and any TLS
+    /// handshake. One number for both, and ureq budgets them separately, so
+    /// this is spent twice in the worst case.
+    connect: Duration,
+    /// Getting an answer out of it: the request head out, the response head
+    /// back. One number for both — and so, likewise, spent twice — because
+    /// neither scales with anything, and a peer that will not take a GET's
+    /// headers is the same stall as one that takes them and then says nothing.
+    response: Duration,
+    /// Reading a metadata body, start to finish.
+    metadata_body: Duration,
+    /// Reading a tarball body, start to finish.
+    tarball_body: Duration,
+}
+
+impl Deadlines {
+    /// The numbers jerky ships.
+    ///
+    /// **Ten seconds to reach the registry**, spent once on the name lookup
+    /// and again on the socket, since ureq budgets those separately. A lookup
+    /// and a TLS handshake to a CDN either happen in about a second or are not
+    /// going to; ten leaves room for a congested link without leaving room for
+    /// a stall.
+    ///
+    /// **Thirty seconds for an answer**, likewise once for the request head
+    /// going out and once for the response head coming back. The registry
+    /// serves a packument in well under a second, so this is two orders of
+    /// magnitude of headroom and still a bound. It is the one that ends #79,
+    /// where a connection was accepted and then said nothing for eleven
+    /// minutes.
+    ///
+    /// **A minute for a metadata body**, which is enormous for a document that
+    /// is a few megabytes in its abbreviated form at the very largest.
+    ///
+    /// **Five minutes for a tarball body**, which is npm's own `fetch-timeout`
+    /// default — except that npm spends it on the whole request and jerky
+    /// spends it on the body alone, so jerky is strictly the more patient of
+    /// the two with a slow download. That matters because a total budget
+    /// cannot tell a stalled 512 MB download from a slow one, and killing a
+    /// legitimate one would trade this bug for a worse bug; the number to lean
+    /// on is the ecosystem's rather than a guess.
+    ///
+    /// A stall retries like any other transport failure, so what a user waits
+    /// is three attempts and the backoff between them. In practice that is one
+    /// phase's deadline three times over — a stalled request dies in the phase
+    /// it stalled in and does not reach the next — and for a request that is
+    /// answered directly, the upper bound is around seven minutes on a
+    /// metadata request and nineteen on a tarball.
+    ///
+    /// A redirect multiplies the first of those. ureq restarts every phase
+    /// budget on each hop and leaves ten hops available, so a registry that
+    /// answers a tarball URL with a 302 to a CDN — which several do — can
+    /// spend the pre-body phases up to eleven times over before the body
+    /// starts. Still a bound, and still the thing this type exists to
+    /// establish, but an hour rather than nineteen minutes in the worst case.
+    /// `max_redirects` is the knob that shortens it, and it is left at ureq's
+    /// default because refusing a hop a real registry needs would break an
+    /// install to shorten a bound that only a hostile chain ever reaches.
+    ///
+    /// None of them are infinity, which is what they all were.
+    const DEFAULT: Self = Self {
+        connect: Duration::from_secs(10),
+        response: Duration::from_secs(30),
+        metadata_body: Duration::from_secs(60),
+        tarball_body: Duration::from_secs(300),
+    };
+
+    /// Short deadlines for a test, in the production *shape*.
+    ///
+    /// Every phase but one takes `deadline`. The tarball body deliberately
+    /// does not: it takes a multiple, because a test cannot prove the two body
+    /// paths differ if the flattened version makes them the same. With one
+    /// number everywhere, the agent's own body deadline fires at the instant
+    /// the tarball path's raise would, so deleting the raise entirely leaves
+    /// every test green — which is exactly the regression the raise exists to
+    /// prevent.
+    const fn short(deadline: Duration) -> Self {
+        Self {
+            connect: deadline,
+            response: deadline,
+            metadata_body: deadline,
+            tarball_body: Duration::from_millis(deadline.as_millis() as u64 * 4),
+        }
+    }
+}
+
 /// The npm registry over HTTP.
 pub struct HttpRegistry {
     base_url: String,
     agent: ureq::Agent,
+    /// The agent carries the metadata body deadline, since that is what
+    /// almost every request is; the tarball path raises it per request,
+    /// because only that path knows it has asked for a body three orders of
+    /// magnitude larger.
+    tarball_body_deadline: Duration,
 }
 
 impl Default for HttpRegistry {
@@ -342,6 +463,23 @@ impl HttpRegistry {
     }
 
     pub fn with_base_url(base_url: impl Into<String>) -> Self {
+        Self::build(base_url, Deadlines::DEFAULT)
+    }
+
+    /// A client on short deadlines, scaled from `deadline`. See
+    /// `Deadlines::short` for which phase is not simply `deadline` and why.
+    ///
+    /// Public because the tests that prove a stalled connection is given up on
+    /// live in `tests/`, and a test that waited out `Deadlines::DEFAULT` would
+    /// add half a minute to the suite to learn what a quarter of a second
+    /// teaches. It is not configuration: nothing in the binary calls it and no
+    /// flag reaches it, because how long to wait for a registry is jerky's
+    /// answer to give rather than a knob to hand over.
+    pub fn with_deadline(base_url: impl Into<String>, deadline: Duration) -> Self {
+        Self::build(base_url, Deadlines::short(deadline))
+    }
+
+    fn build(base_url: impl Into<String>, deadlines: Deadlines) -> Self {
         // The idle pool is sized from the fan-out rather than left at ureq's
         // default of three per host, because jerky points all sixteen workers
         // at one host. A pool narrower than the fan-out means a worker that
@@ -364,11 +502,29 @@ impl HttpRegistry {
             .max_idle_connections(MAX_CONCURRENT_FETCHES)
             .max_idle_connections_per_host(MAX_CONCURRENT_FETCHES)
             .http_status_as_error(false)
+            // Bounding the name lookup costs a thread per *request*, not per
+            // connection: ureq resolves before it asks the pool for one, so a
+            // pooled connection does not skip the lookup, and the only way to
+            // abandon a blocked `getaddrinfo` is to have run it somewhere that
+            // can be abandoned. A lookup that does time out leaves its thread
+            // parked until the system resolver gives up on it.
+            //
+            // Paid anyway. The threads are short-lived and never more than
+            // `MAX_CONCURRENT_FETCHES` at a time, the alternative is trusting
+            // limits that live in a file the user is free to have set to
+            // something patient, and the phase is otherwise the one part of a
+            // request with no bound on it at all.
+            .timeout_resolve(Some(deadlines.connect))
+            .timeout_connect(Some(deadlines.connect))
+            .timeout_send_request(Some(deadlines.response))
+            .timeout_recv_response(Some(deadlines.response))
+            .timeout_recv_body(Some(deadlines.metadata_body))
             .build();
 
         Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             agent: config.into(),
+            tarball_body_deadline: deadlines.tarball_body,
         }
     }
 
@@ -428,6 +584,57 @@ impl HttpRegistry {
         }
     }
 
+    /// Turn a failure that never became a response into an error and a retry
+    /// policy.
+    ///
+    /// A deadline that ran out is reported as a stall rather than as an
+    /// unreachable registry, for the reason `Stalled` exists: the two are
+    /// different situations and a reader acts on them differently.
+    ///
+    /// Both retry, on the transient schedule. A stall is a transport failure
+    /// like a reset or a refused connection, and the only reason `with_retries`
+    /// never saw one before is that it retries attempts that *return* — which
+    /// a wait with no end never did. Bounding the wait is what puts a stalled
+    /// connection back on the path that already existed for everything else
+    /// that failed in transport.
+    fn from_transport(url: &str, source: ureq::Error) -> (RegistryError, Retry) {
+        let url = url.to_string();
+        let err = if matches!(source, ureq::Error::Timeout(_)) {
+            RegistryError::Stalled {
+                url,
+                source: Box::new(source),
+            }
+        } else {
+            RegistryError::Network {
+                url,
+                source: Box::new(source),
+            }
+        };
+        (err, Retry::Transient)
+    }
+
+    /// Turn a failure part-way through a metadata body into an error and a
+    /// retry policy.
+    ///
+    /// Everything but a stall keeps the reading the size limits were written
+    /// for: a body past `MAX_METADATA_BYTES` and a body that is not UTF-8 are
+    /// both the registry sending something jerky cannot use. A stall is
+    /// neither — the bytes that arrived were fine as far as they got — and
+    /// reporting one as a malformed response would send the reader looking for
+    /// a broken registry rather than a stuck one.
+    fn from_metadata_body(url: &str, source: ureq::Error) -> (RegistryError, Retry) {
+        if matches!(source, ureq::Error::Timeout(_)) {
+            return Self::from_transport(url, source);
+        }
+        (
+            RegistryError::MalformedResponse {
+                url: url.to_string(),
+                source: Box::new(source),
+            },
+            Retry::Transient,
+        )
+    }
+
     /// The `Retry-After` delay, in seconds.
     ///
     /// The header may also carry an HTTP date. jerky does not read one: it
@@ -477,22 +684,8 @@ impl HttpRegistry {
                     .with_config()
                     .limit(MAX_METADATA_BYTES)
                     .read_to_string()
-                    .map_err(|source| {
-                        (
-                            RegistryError::MalformedResponse {
-                                url: url.to_string(),
-                                source: Box::new(source),
-                            },
-                            Retry::Transient,
-                        )
-                    }),
-                Err(source) => Err((
-                    RegistryError::Network {
-                        url: url.to_string(),
-                        source: Box::new(source),
-                    },
-                    Retry::Transient,
-                )),
+                    .map_err(|source| Self::from_metadata_body(url, source)),
+                Err(source) => Err(Self::from_transport(url, source)),
             }
         })
     }
@@ -551,35 +744,29 @@ impl HttpRegistry {
                         .limit(MAX_METADATA_BYTES)
                         .read_to_string()
                         .map(|body| Some((body, etag)))
-                        .map_err(|source| {
-                            (
-                                RegistryError::MalformedResponse {
-                                    url: url.to_string(),
-                                    source: Box::new(source),
-                                },
-                                Retry::Transient,
-                            )
-                        })
+                        .map_err(|source| Self::from_metadata_body(url, source))
                 }
-                Err(source) => Err((
-                    RegistryError::Network {
-                        url: url.to_string(),
-                        source: Box::new(source),
-                    },
-                    Retry::Transient,
-                )),
+                Err(source) => Err(Self::from_transport(url, source)),
             }
         })
     }
 
     /// Does this package exist at all? Used only on the error path, to turn a
     /// 404 into either `PackageNotFound` or `VersionNotFound`.
-    fn package_exists(&self, name: &str) -> bool {
+    ///
+    /// A probe that fails reports rather than answering. It used to collapse
+    /// every error into "no", which turned an unreachable registry into a
+    /// confident `PackageNotFound` for a package that was there all along —
+    /// and once a stall is bounded rather than endless, that is the shape a
+    /// stalled probe takes: jerky waits out the deadline and then says the
+    /// package does not exist. Naming a package that is not missing is worse
+    /// than admitting the question went unanswered.
+    fn package_exists(&self, name: &str) -> Result<bool, RegistryError> {
         let url = format!("{}/{}", self.base_url, Self::encode_name(name));
-        self.agent
-            .get(&url)
-            .call()
-            .is_ok_and(|response| response.status().is_success())
+        match self.agent.get(&url).call() {
+            Ok(response) => Ok(response.status().is_success()),
+            Err(source) => Err(Self::from_transport(&url, source).0),
+        }
     }
 }
 
@@ -593,15 +780,15 @@ impl RegistryClient for HttpRegistry {
 
         // A 404 here is ambiguous: the package may not exist, or it may exist
         // without this version. Only the error path pays for the distinction.
-        let body = self.get_json(&url, false, || {
-            if self.package_exists(name) {
-                RegistryError::VersionNotFound {
-                    name: name.to_string(),
-                    version: version.to_string(),
-                }
-            } else {
-                RegistryError::PackageNotFound(name.to_string())
-            }
+        let body = self.get_json(&url, false, || match self.package_exists(name) {
+            Ok(true) => RegistryError::VersionNotFound {
+                name: name.to_string(),
+                version: version.to_string(),
+            },
+            Ok(false) => RegistryError::PackageNotFound(name.to_string()),
+            // The probe could not say. Reporting why beats picking one of the
+            // two answers it was asked to choose between.
+            Err(err) => err,
         })?;
 
         serde_json::from_str(&body).map_err(|source| RegistryError::MalformedResponse {
@@ -636,34 +823,40 @@ impl RegistryClient for HttpRegistry {
     }
 
     fn fetch_tarball(&self, url: &str) -> Result<Vec<u8>, RegistryError> {
-        Self::with_retries(|| match self.agent.get(url).call() {
-            Ok(response) if response.status() == 404 => {
-                Err((RegistryError::PackageNotFound(url.to_string()), Retry::No))
+        Self::with_retries(|| {
+            // The one request that raises the agent's body deadline: a tarball
+            // is the only body whose size is worth waiting minutes for, and
+            // the budget is total rather than idle, so the metadata number
+            // would cut off a large package on a slow link.
+            let request = self
+                .agent
+                .get(url)
+                .config()
+                .timeout_recv_body(Some(self.tarball_body_deadline))
+                .build();
+
+            match request.call() {
+                Ok(response) if response.status() == 404 => {
+                    Err((RegistryError::PackageNotFound(url.to_string()), Retry::No))
+                }
+                Ok(response) if !response.status().is_success() => {
+                    Err(Self::from_status(url, &response))
+                }
+                // Deliberately not `from_metadata_body`'s rule. A tarball's
+                // bytes are not judged here — they are checked against the
+                // integrity hash the packument published, downstream of this
+                // — so there is no reading of them this layer could call
+                // malformed. Everything that can fail here is transport, bar
+                // a body past `MAX_TARBALL_BYTES`, which is rare enough and
+                // loud enough not to be worth a second rule.
+                Ok(mut response) => response
+                    .body_mut()
+                    .with_config()
+                    .limit(MAX_TARBALL_BYTES)
+                    .read_to_vec()
+                    .map_err(|source| Self::from_transport(url, source)),
+                Err(source) => Err(Self::from_transport(url, source)),
             }
-            Ok(response) if !response.status().is_success() => {
-                Err(Self::from_status(url, &response))
-            }
-            Ok(mut response) => response
-                .body_mut()
-                .with_config()
-                .limit(MAX_TARBALL_BYTES)
-                .read_to_vec()
-                .map_err(|source| {
-                    (
-                        RegistryError::Network {
-                            url: url.to_string(),
-                            source: Box::new(source),
-                        },
-                        Retry::Transient,
-                    )
-                }),
-            Err(source) => Err((
-                RegistryError::Network {
-                    url: url.to_string(),
-                    source: Box::new(source),
-                },
-                Retry::Transient,
-            )),
         })
     }
 }
