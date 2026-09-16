@@ -821,6 +821,7 @@ pub fn resolve_peers(graph: ResolvedGraph) -> (ResolvedGraph, Vec<UnsatisfiedPee
         instances: BTreeMap::new(),
         identities: BTreeMap::new(),
         identifying: BTreeSet::new(),
+        cutting: BTreeSet::new(),
         unsatisfied: BTreeMap::new(),
     };
 
@@ -889,10 +890,34 @@ pub fn resolve_peers(graph: ResolvedGraph) -> (ResolvedGraph, Vec<UnsatisfiedPee
 /// declares. A package with no peers of its own is still duplicated by one
 /// deeper down, so keying on its own peers would give it a single instance and
 /// silently collapse the copies.
+///
+/// It names each provider as an *instance* rather than as the id the walk
+/// selected, and that recursion is load-bearing rather than tidy. A provider
+/// reached only across a peer edge contributes nothing to
+/// [`peer_names_needed`], which follows dependency edges — so `host` peering
+/// `mid`, and `mid` peering `leaf`, gives `host` the same peer-blind
+/// `mid@1.0.0` under two importers supplying different `leaf`s, and the two
+/// `host`s collapse into one wired to whichever `mid` was named first. Naming
+/// the provider's copy closes that: the two `mid` copies differ, so the two
+/// `host`s do. It closes the shadowed case with it, which widening the
+/// alphabet alone would not — a provider's copy is settled by what was above
+/// *the provider*, and an intermediate between it and the dependent that
+/// happens to declare the same name cannot make two different providers look
+/// alike.
+///
+/// Only names satisfied from *above* appear. A peer answered by the package's
+/// own dependencies is answered identically in every copy of it — the
+/// dependency ids are the walk's, and which copy of them answers follows from
+/// this environment — so recording it would distinguish nothing. Leaving it
+/// out is also half of what bounds the recursion: every entry is resolved
+/// against a prefix of the chain no longer than the one that asked for it, so
+/// the chain cannot grow as the lookups nest. The other half is the repeat
+/// guard in [`PeerPass::instance_at`], since a prefix of the *same* length is
+/// allowed and is what a provider in the immediately enclosing frame takes.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct Instance {
     package: PackageId,
-    environment: BTreeMap<String, PackageId>,
+    environment: BTreeMap<String, Instance>,
 }
 
 /// What one instance resolved, before anything has been named.
@@ -922,6 +947,9 @@ struct PeerPass<'a> {
     /// cycle, and the edge that closed it is left out of the name — see
     /// [`PeerPass::identify`].
     identifying: BTreeSet<Instance>,
+    /// Instances whose *cut* name is being computed, which is a second and
+    /// separate loop to break — see [`PeerPass::cut_name`].
+    cutting: BTreeSet<Instance>,
     /// Keyed by what a reader would consider one complaint, so a package
     /// duplicated eleven ways reports its unmet peer once.
     unsatisfied: BTreeMap<(PackageId, String), UnsatisfiedPeer>,
@@ -1003,19 +1031,25 @@ impl PeerPass<'_> {
 
         let copy = self.instances[instance].clone();
 
-        // A peer contributes the id its provider was *found* under, not the
-        // one the provider ends up with. The two differ exactly when the
-        // provider's own subtree carries a context, and in that case they
-        // differ circularly — a peer can point back up at an ancestor, so
-        // asking for the provider's final name here would be asking for this
-        // one. The found id is finite, and is what makes a cyclic context
-        // spellable at all. `peers` records the final id, which is the answer
-        // anything reading the graph wants; a name cannot.
-        let own: BTreeMap<String, PackageId> = copy
-            .own
-            .iter()
-            .map(|(name, provider)| (name.clone(), provider.package.clone()))
-            .collect();
+        // A peer contributes the name its provider ends up with, and falls
+        // back to a *cut* name only when that name is the one being computed —
+        // a peer pointing back up at an ancestor, where asking for the
+        // provider's final name would be asking for this one.
+        //
+        // What is cut has to be the loop and not the provider. Two copies of a
+        // dependent are told apart by which copy of the provider answered
+        // them, so falling back to the peer-blind id the walk selected spells
+        // both copies identically, and `emit` keeps one of them — the
+        // duplication happening in the graph and not in the names it is
+        // written under, which is #110 again through a different door.
+        let mut own: BTreeMap<String, PackageId> = BTreeMap::new();
+        for (name, provider) in &copy.own {
+            let id = match self.identify(provider) {
+                Some(id) => id,
+                None => self.cut_name(provider),
+            };
+            own.insert(name.clone(), id);
+        }
         let named: Vec<(String, PackageId)> = copy
             .dependencies
             .iter()
@@ -1031,6 +1065,60 @@ impl PeerPass<'_> {
         self.identifying.remove(instance);
         self.identities.insert(instance.clone(), id.clone());
         Some(id)
+    }
+
+    /// A provider's name, cut where it would ask for the name being computed.
+    ///
+    /// The same shape as [`Self::identify`] — own peers, plus each dependency
+    /// that carries a context — over its own stack, so the only thing left out
+    /// is the loop itself. An instance already named answers with that name,
+    /// so a cut name appears in exactly one place: the suffix of a node whose
+    /// peer points back up at an ancestor still being named.
+    ///
+    /// It can therefore differ from the name the provider is finally emitted
+    /// under, and that is the established split rather than a new one. A name
+    /// is finite and owns its parts, so a loop cannot be spelled out inside
+    /// one; `peers` records the final id, which is the answer anything reading
+    /// the graph wants, and the suffix records as much of the provider as can
+    /// be written down. What matters is that it writes down enough: the cut is
+    /// at the second visit to an instance rather than the first, so everything
+    /// that distinguishes two copies of a provider short of the loop — its own
+    /// resolved peers, and the contexts its dependencies carry — is in the
+    /// name before anything is dropped.
+    fn cut_name(&mut self, instance: &Instance) -> PackageId {
+        if let Some(id) = self.identities.get(instance) {
+            return id.clone();
+        }
+        // The second visit. `insert` reports whether it was the first, which
+        // is the check and the mark in one call.
+        if !self.cutting.insert(instance.clone()) {
+            return instance.package.clone();
+        }
+
+        let Some(copy) = self.instances.get(instance).cloned() else {
+            self.cutting.remove(instance);
+            return instance.package.clone();
+        };
+
+        let mut own = BTreeMap::new();
+        for (name, provider) in &copy.own {
+            let id = self.cut_name(provider);
+            own.insert(name.clone(), id);
+        }
+
+        let mut named = Vec::new();
+        for (name, dependency) in &copy.dependencies {
+            let id = self.cut_name(dependency);
+            named.push((name.clone(), id));
+        }
+
+        self.cutting.remove(instance);
+
+        PackageId {
+            name: instance.package.name.clone(),
+            version: instance.package.version.clone(),
+            context: context_of(own, named),
+        }
     }
 
     /// Build the re-keyed package map from the named instances.
@@ -1130,32 +1218,76 @@ impl PeerPass<'_> {
 
     /// Which copy of a package sits below `providers`.
     ///
-    /// The one definition of what an instance *is*: the package, plus a
-    /// provider for every peer name its subtree can ask about, looked up in
-    /// what is visible from where it sits — the frames above it, then its own
-    /// dependencies. [`Self::discover`] asks this of the node it is walking
-    /// into; [`Self::own_peers`] asks it of a provider it found partway up the
-    /// chain, handing over only the frames that were above *that*. A second
-    /// spelling of this would be a second answer to "are these the same copy",
-    /// which is the question the whole pass turns on.
+    /// The one definition of what an instance *is*: the package, plus the copy
+    /// of a provider for every peer name its subtree can ask about and cannot
+    /// answer itself, looked up in what is visible from where it sits — the
+    /// frames above it, then its own dependencies. [`Self::discover`] asks this
+    /// of the node it is walking into; [`Self::own_peers`] asks it of a
+    /// provider it found partway up the chain, handing over only the frames
+    /// that were above *that*. A second spelling of this would be a second
+    /// answer to "are these the same copy", which is the question the whole
+    /// pass turns on.
     fn instance_of(&self, id: &PackageId, providers: &[&BTreeMap<String, PackageId>]) -> Instance {
-        let Some(package) = self.source.packages.get(id) else {
-            return Instance {
-                package: id.clone(),
-                environment: BTreeMap::new(),
-            };
+        self.instance_at(id, providers, &mut BTreeSet::new())
+    }
+
+    /// [`Self::instance_of`], carrying the queries already on the stack.
+    ///
+    /// An environment names provider *copies*, so answering one query asks
+    /// another, and a peer pointing back up can ask the question that is
+    /// already being answered: an importer supplying `a` while `a`'s subtree
+    /// peers `a`. `computing` holds `(package, how much of the chain was
+    /// visible)`, which identifies a query exactly — every nested lookup takes
+    /// a prefix of the same chain, so its length names the prefix — and
+    /// re-entering one yields the package with no environment of its own.
+    ///
+    /// That is the cycle rule the rendered name already lives under: a name is
+    /// finite and owns its parts, so a loop cannot be spelled out inside one.
+    /// The truncation is the same kind of under-fragmentation, and in the same
+    /// direction — a copy told apart from fewer things than it might be, never
+    /// two copies conflated that the loop itself distinguishes.
+    fn instance_at(
+        &self,
+        id: &PackageId,
+        providers: &[&BTreeMap<String, PackageId>],
+        computing: &mut BTreeSet<(PackageId, usize)>,
+    ) -> Instance {
+        let bare = || Instance {
+            package: id.clone(),
+            environment: BTreeMap::new(),
         };
+
+        let Some(package) = self.source.packages.get(id) else {
+            return bare();
+        };
+
+        let query = (id.clone(), providers.len());
+        if computing.contains(&query) {
+            return bare();
+        }
 
         let mut visible: Vec<&BTreeMap<String, PackageId>> = providers.to_vec();
         visible.push(&package.dependencies);
+        // The frame the package itself contributes. A name answered there is
+        // answered the same way in every copy, which is why it is left out.
+        let own_frame = providers.len();
 
-        let environment = self
-            .needed
-            .get(id)
-            .into_iter()
-            .flatten()
-            .filter_map(|name| provider_of(name, &visible).map(|(_, found)| (name.clone(), found)))
-            .collect();
+        computing.insert(query.clone());
+        let mut environment = BTreeMap::new();
+        for name in self.needed.get(id).into_iter().flatten() {
+            let Some((frame, found)) = provider_of(name, &visible) else {
+                continue;
+            };
+            if frame == own_frame {
+                continue;
+            }
+            // Truncated at the frame that named it, for the reason
+            // [`Self::own_peers`] truncates: that is what was above the
+            // provider, and it is what settles which copy of it this is.
+            let provider = self.instance_at(&found, &visible[..=frame], computing);
+            environment.insert(name.clone(), provider);
+        }
+        computing.remove(&query);
 
         Instance {
             package: id.clone(),
@@ -1228,13 +1360,24 @@ fn provider_of(name: &str, chain: &[&BTreeMap<String, PackageId>]) -> Option<(us
         .find_map(|(frame, provided)| provided.get(name).map(|id| (frame, id.clone())))
 }
 
-/// Every peer name each node's subtree can ask about, itself included.
+/// Every peer name each node's subtree can ask about along a dependency edge,
+/// itself included.
 ///
-/// This is what an instance is keyed on, and the reason it has to exist: a
+/// Half of what an instance is keyed on, and the reason it has to exist: a
 /// package declaring no peers of its own is still duplicated by one deeper
 /// down, so "what did *this* node resolve" cannot tell two copies apart. What
 /// separates them is what the subtree beneath them resolved, and this names the
-/// only part of the environment that can affect it.
+/// part of the environment a dependency edge can reach.
+///
+/// Only that part, and the limit is deliberate rather than a gap left open. A
+/// provider reached across a *peer* edge is not in any of these sets — `host`
+/// peering `mid` never gets `mid`'s own `leaf` — and it does not need to be,
+/// because [`Instance`] names the provider's copy and that copy carries what
+/// its own subtree asked for. Growing the alphabet across peer edges instead
+/// would be both looser and wrong: looser because it names the alphabet by
+/// package name rather than by which copy answered, wrong because it looks
+/// every name up where the *dependent* sits, and a nearer package of that name
+/// answers there while the peer was answered further up.
 ///
 /// A least fixed point rather than a recursive walk, because the dependency
 /// graph has cycles. The sets only grow over a finite alphabet, so it settles.

@@ -462,9 +462,17 @@ fn a_resolved_peer_names_the_node_the_graph_holds() {
 
     assert!(unsatisfied.is_empty(), "{unsatisfied:?}");
     assert_no_dangling_edges(&graph);
+    // The loop is cut at the *second* visit to a node rather than the first,
+    // which is what leaves enough of a provider in the name to tell two copies
+    // of it apart. It costs one more unrolling than a first-visit cut would,
+    // and that is the whole of the cost: the suffix is finite, and a cycle of
+    // any length is still spelled once and then closed.
     assert_eq!(
         keys(&graph),
-        ["host@1.0.0(lib@1.0.0(host@1.0.0))", "lib@1.0.0(host@1.0.0)"]
+        [
+            "host@1.0.0(lib@1.0.0(host@1.0.0(lib@1.0.0(host@1.0.0))))",
+            "lib@1.0.0(host@1.0.0(lib@1.0.0(host@1.0.0)))",
+        ]
     );
 
     let lib = graph
@@ -474,6 +482,254 @@ fn a_resolved_peer_names_the_node_the_graph_holds() {
         .expect("lib is in the graph");
     assert_eq!(
         lib.peers["host"].to_string(),
-        "host@1.0.0(lib@1.0.0(host@1.0.0))"
+        "host@1.0.0(lib@1.0.0(host@1.0.0(lib@1.0.0(host@1.0.0))))"
     );
+}
+
+#[test]
+fn a_peer_only_provider_duplicates_its_dependent() {
+    // `host` does not *depend* on `mid`, it peers it — so `mid`'s own peer
+    // `leaf` never enters `host`'s subtree by a dependency edge. Two apps
+    // supplying different `leaf`s give `mid` two copies, and `host` must
+    // follow: the copy of `mid` that answers `host` differs between them.
+    //
+    // The failure this pins is silent and reaches disk. One `host` served both
+    // apps, wired to whichever `mid` was named first, so one app's tree linked
+    // a `mid` that had resolved against the other app's `leaf`.
+    let registry = FixtureRegistry::new()
+        .with_tree(&[
+            ("host", "1.0.0", &[]),
+            ("mid", "1.0.0", &[]),
+            ("leaf", "1.0.0", &[]),
+            ("leaf", "2.0.0", &[]),
+        ])
+        .with_declared_peers("host", "1.0.0", &[("mid", "^1.0.0", false)])
+        .with_declared_peers("mid", "1.0.0", &[("leaf", ">=1", false)]);
+
+    let roots = BTreeMap::from([
+        (
+            ImporterPath::new("apps/x").unwrap(),
+            section(
+                &[("host", "^1.0.0"), ("mid", "^1.0.0"), ("leaf", "1.0.0")],
+                Kind::Prod,
+            ),
+        ),
+        (
+            ImporterPath::new("apps/y").unwrap(),
+            section(
+                &[("host", "^1.0.0"), ("mid", "^1.0.0"), ("leaf", "2.0.0")],
+                Kind::Prod,
+            ),
+        ),
+    ]);
+
+    let graph = resolve(&registry, &roots, &no_members()).unwrap();
+    let (graph, unsatisfied) = resolve_peers(graph);
+
+    assert!(unsatisfied.is_empty(), "{unsatisfied:?}");
+    assert_no_dangling_edges(&graph);
+    assert_eq!(
+        keys_named(&graph, "mid"),
+        ["mid@1.0.0(leaf@1.0.0)", "mid@1.0.0(leaf@2.0.0)"],
+        "the two leaves give mid two copies",
+    );
+    assert_eq!(
+        keys_named(&graph, "host").len(),
+        2,
+        "and host, whose only route to leaf is across a peer edge, follows",
+    );
+
+    // Each app must reach the host peered to the mid that app supplied.
+    for (path, leaf) in [("apps/x", "leaf@1.0.0"), ("apps/y", "leaf@2.0.0")] {
+        let importer = &graph.importers[&ImporterPath::new(path).unwrap()];
+        let Resolution::Registry(id) = &importer.dependencies["host"].resolution else {
+            panic!("host resolved to a registry package");
+        };
+        let mid = &graph.packages[id].peers["mid"];
+        assert_eq!(
+            graph.packages[mid].peers["leaf"].to_string(),
+            leaf,
+            "{path} reached a host peered to a mid that resolved against the wrong leaf",
+        );
+    }
+}
+
+#[test]
+fn a_nearer_package_of_the_same_name_does_not_hide_the_disagreement() {
+    // The same shape as above with a shadow in the way: `wrapper` ships a
+    // `leaf` of its own, nearer to `host` than either app's. `host` still
+    // peers `mid`, and `mid` is still found at the app frame, so `mid` still
+    // resolves its own `leaf` against the app's — the shadow is below where
+    // the lookup happens and cannot answer it.
+    //
+    // This is the case that separates naming provider *copies* from merely
+    // widening the alphabet an instance is keyed on. Widening it puts `leaf`
+    // in `host`'s environment, where the nearest one is `wrapper`'s in both
+    // apps — identical, and the two `host`s collapse again.
+    let registry = FixtureRegistry::new()
+        .with_tree(&[
+            (
+                "app-x",
+                "1.0.0",
+                &[("wrapper", "^1.0.0"), ("mid", "^1.0.0"), ("leaf", "1.0.0")],
+            ),
+            (
+                "app-y",
+                "1.0.0",
+                &[("wrapper", "^1.0.0"), ("mid", "^1.0.0"), ("leaf", "2.0.0")],
+            ),
+            ("wrapper", "1.0.0", &[("host", "^1.0.0"), ("leaf", "3.0.0")]),
+            ("host", "1.0.0", &[]),
+            ("mid", "1.0.0", &[]),
+            ("leaf", "1.0.0", &[]),
+            ("leaf", "2.0.0", &[]),
+            ("leaf", "3.0.0", &[]),
+        ])
+        .with_declared_peers("host", "1.0.0", &[("mid", "^1.0.0", false)])
+        .with_declared_peers("mid", "1.0.0", &[("leaf", ">=1", false)]);
+
+    let graph = resolve(
+        &registry,
+        &roots(&[("app-x", "^1.0.0"), ("app-y", "^1.0.0")]),
+        &no_members(),
+    )
+    .unwrap();
+    let (graph, unsatisfied) = resolve_peers(graph);
+
+    assert!(unsatisfied.is_empty(), "{unsatisfied:?}");
+    assert_no_dangling_edges(&graph);
+
+    let wrapper = graph
+        .packages
+        .values()
+        .find(|package| package.id.name == "wrapper")
+        .expect("wrapper is in the graph");
+    assert_eq!(
+        wrapper.dependencies["leaf"].version, "3.0.0",
+        "the shadow this test turns on is in place",
+    );
+    assert_eq!(
+        keys_named(&graph, "host").len(),
+        2,
+        "the shadow is nearer than either app's leaf, and answers nothing",
+    );
+}
+
+#[test]
+fn a_dependency_cycle_under_disagreeing_importers_terminates_and_duplicates() {
+    // Two things at once, because each hides the other. `a` and `b` depend on
+    // each other and both peer `x`, which the apps answer differently — so the
+    // loop has to be walked once per app rather than once, and the walk has to
+    // stop both times. An instance is keyed on the copies its environment
+    // names, and a loop makes that key ask for itself; a pass that spelled the
+    // loop out instead of cutting it would not return.
+    let registry = FixtureRegistry::new()
+        .with_tree(&[
+            ("a", "1.0.0", &[("b", "^1.0.0")]),
+            ("b", "1.0.0", &[("a", "^1.0.0")]),
+            ("x", "1.0.0", &[]),
+            ("x", "2.0.0", &[]),
+        ])
+        .with_declared_peers("a", "1.0.0", &[("x", ">=1", false)])
+        .with_declared_peers("b", "1.0.0", &[("x", ">=1", false)]);
+
+    let roots = BTreeMap::from([
+        (
+            ImporterPath::new("apps/x").unwrap(),
+            section(&[("a", "^1.0.0"), ("x", "1.0.0")], Kind::Prod),
+        ),
+        (
+            ImporterPath::new("apps/y").unwrap(),
+            section(&[("a", "^1.0.0"), ("x", "2.0.0")], Kind::Prod),
+        ),
+    ]);
+
+    let graph = resolve(&registry, &roots, &no_members()).unwrap();
+    let (graph, unsatisfied) = resolve_peers(graph);
+
+    assert!(unsatisfied.is_empty(), "{unsatisfied:?}");
+    assert_no_dangling_edges(&graph);
+    assert_eq!(
+        keys_named(&graph, "a").len(),
+        2,
+        "one copy of the loop per app"
+    );
+    assert_eq!(keys_named(&graph, "b").len(), 2);
+
+    for (path, x) in [("apps/x", "x@1.0.0"), ("apps/y", "x@2.0.0")] {
+        let importer = &graph.importers[&ImporterPath::new(path).unwrap()];
+        let Resolution::Registry(id) = &importer.dependencies["a"].resolution else {
+            panic!("a resolved to a registry package");
+        };
+        let a = &graph.packages[id];
+        assert_eq!(a.peers["x"].to_string(), x);
+        let b = &graph.packages[&a.dependencies["b"]];
+        assert_eq!(
+            b.peers["x"].to_string(),
+            x,
+            "{path} reached the wrong copy of the loop"
+        );
+    }
+}
+
+#[test]
+fn a_peer_that_closes_a_cycle_still_tells_two_copies_apart() {
+    // The cycle case of the same bug, which the fix above does not reach on
+    // its own. `a` peers `x`, which two apps answer differently, and `b` peers
+    // back up at `a`. Both become two copies — and then both have to be
+    // *named* apart, which is where a cycle bites: `b`'s name asks for `a`'s,
+    // which is the name being computed.
+    //
+    // A cycle cannot be spelled out inside a finite name, so the edge that
+    // closes one is cut. What is cut has to be the loop and not the whole
+    // provider: cutting to the peer-blind `a@1.0.0` spells `b`'s two copies
+    // identically, and one of them is dropped on the way into the package map
+    // — the same silent collapse under a different door.
+    let registry = FixtureRegistry::new()
+        .with_tree(&[
+            ("a", "1.0.0", &[("b", "^1.0.0")]),
+            ("b", "1.0.0", &[]),
+            ("x", "1.0.0", &[]),
+            ("x", "2.0.0", &[]),
+        ])
+        .with_declared_peers("a", "1.0.0", &[("x", ">=1", false)])
+        .with_declared_peers("b", "1.0.0", &[("a", "^1.0.0", false)]);
+
+    let roots = BTreeMap::from([
+        (
+            ImporterPath::new("apps/x").unwrap(),
+            section(&[("a", "^1.0.0"), ("x", "1.0.0")], Kind::Prod),
+        ),
+        (
+            ImporterPath::new("apps/y").unwrap(),
+            section(&[("a", "^1.0.0"), ("x", "2.0.0")], Kind::Prod),
+        ),
+    ]);
+
+    let graph = resolve(&registry, &roots, &no_members()).unwrap();
+    let (graph, unsatisfied) = resolve_peers(graph);
+
+    assert!(unsatisfied.is_empty(), "{unsatisfied:?}");
+    assert_no_dangling_edges(&graph);
+    assert_eq!(keys_named(&graph, "a").len(), 2);
+    assert_eq!(
+        keys_named(&graph, "b").len(),
+        2,
+        "b peers back up at a, and the two a's it peers are different copies",
+    );
+
+    for (path, x) in [("apps/x", "x@1.0.0"), ("apps/y", "x@2.0.0")] {
+        let importer = &graph.importers[&ImporterPath::new(path).unwrap()];
+        let Resolution::Registry(id) = &importer.dependencies["a"].resolution else {
+            panic!("a resolved to a registry package");
+        };
+        let a = &graph.packages[id];
+        assert_eq!(a.peers["x"].to_string(), x);
+        let b = &graph.packages[&a.dependencies["b"]];
+        assert_eq!(
+            graph.packages[&b.peers["a"]].peers["x"].to_string(),
+            x,
+            "{path} reached a b peered to an a that resolved against the wrong x",
+        );
+    }
 }

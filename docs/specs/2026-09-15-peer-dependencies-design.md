@@ -315,30 +315,91 @@ a node that exists.
 
 **Termination and identity share one key**, and getting it wrong is subtle. The
 pass memoizes each node and treats a repeat as a hit — the same novelty gate the
-main walk uses, `if self.packages.contains_key(&id) { return Ok(()) }` — so the
-design carries one termination argument rather than two, and a peer cycle
-terminates for the same reason a dependency cycle does. An iteration cap would
-be guessing.
+main walk uses, `if self.packages.contains_key(&id) { return Ok(()) }` — so a
+peer cycle terminates for the same reason a dependency cycle does. An iteration
+cap would be guessing. The two cuts below are the same argument applied to the
+two questions the walk does not answer, and not a second kind of reasoning.
 
 What it keys on is *not* `(node, its own resolved peers)`, which was this spec's
 first answer and is wrong for exactly the `wrapper` case in §5: a node with no
 peers of its own has the same key in every context, so the first copy computed
 comes back for all of them and the duplication never happens. The key is
 `(node, the providers its whole subtree can see)` — every peer name reachable
-from the node, itself included, mapped to whoever currently provides it. Two
-visits agreeing on all of them must produce the same subtree, which is what
+from the node, itself included, mapped to **which copy** currently provides it.
+Two visits agreeing on all of them must produce the same subtree, which is what
 makes the key sound.
+
+**"Which copy" and not "which `name@version`", and the difference is the whole
+of #110.** This spec first said the providers were mapped to peer-blind ids,
+and that key is under-fragmented whenever a provider is reachable only across a
+peer edge: `host` peers `mid`, `mid` peers `leaf`, and two importers supply
+different `leaf`s. `mid` correctly becomes two copies. `host` does not — it
+*peers* `mid` rather than depending on it, so `leaf` never enters `host`'s
+subtree, both visits see the same `mid@1.0.0`, and one `host` serves both
+importers wired to whichever `mid` was named first. The environment therefore
+names each provider as a copy — an instance, recursively — so the two `mid`
+copies make two `host`s. The provider's copy is settled by what was above *the
+provider*, which is also what keeps a nearer package of the same name, sitting
+between the provider and the dependent, from making two different providers
+look alike.
+
+The alphabet is not what was wrong, and widening it across peer edges is not
+the fix. It would key on names rather than copies, and it would look each name
+up where the dependent sits rather than where the peer was answered, so the
+shadowed case above stays broken. It stays a dependency-edge closure, and the
+recursion carries what a peer edge reaches.
 
 The converse does not hold, and the spec should not claim it: two visits that
 differ somewhere in that environment often still produce the *same* node, when
 the name they differ on is one the subtree always answers internally. The key is
 therefore finer than strictly necessary — it costs extra instances, never a
-missed duplication, which is the direction to err in.
+missed duplication, which is the direction to err in. That claim is about a
+key that names copies; it was **false** of the peer-blind one, which missed a
+duplication outright, and that is the correction #110 records.
 
-That set of names is a least fixed point over the peer-blind graph, computed
+A name answered by the node's own dependencies is left out of the key
+altogether. Every copy of a node answers it the same way, so it distinguishes
+nothing, and leaving it out is half of what bounds the recursion: each entry is
+resolved against a prefix of the ancestor chain no longer than the one that
+asked for it, so the chain cannot grow as the lookups nest. A prefix of the
+*same* length is allowed — that is what a provider in the immediately enclosing
+frame takes — so the other half is a repeat guard on `(package, how much of the
+chain was visible)`, which over a chain that cannot grow is a finite space. A
+re-entered query contributes the package and no environment of its own, which
+is the loop an importer supplying `a` makes while `a`'s subtree peers `a`. Same
+direction to err in: fewer things telling two copies apart, never two copies
+conflated that the loop itself distinguishes.
+
+**Three cuts, not one.** The pass memoizes a node and treats a repeat as a hit,
+which is the termination argument above; naming a node cuts a loop a second
+time, and so does the environment. They are three because they answer three
+different questions — which copies exist, what each is called, and which copy
+answered a peer — and a single gate cannot serve all three: the first must
+happen before any name exists, and the last must happen while a name is being
+computed. What they share is the direction they err in.
+
+The set of names is a least fixed point over the peer-blind graph, computed
 once before the walk down. A fixed point rather than a recursive walk because
 the dependency graph has cycles, and the sets only grow over a finite alphabet,
 so it terminates.
+
+**A resolved peer contributes the provider's final name to the dependent's
+id**, not the id the provider was found under. The two differ exactly when the
+provider's own subtree carries a context — which is the duplicated case — so
+naming the found id spells two distinct copies of a dependent identically, and
+the map they are emitted into keeps one.
+
+Where the provider's final name is the one being computed — a peer pointing
+back up at an ancestor — the fallback is a *cut* name and not the found id: the
+provider spelled the same way, over its own stack, so that the only thing left
+out is the loop. Cutting to the found id instead reproduces #110 exactly, one
+peer cycle along, and it is worth being plain about why: two copies of a
+dependent are told apart by which copy of the provider answered, and the found
+id is peer-blind, so both copies spell the same. The cut falls at the second
+visit to an instance rather than the first, which is what leaves everything
+short of the loop — the provider's own resolved peers, and the contexts its
+dependencies carry — inside the name. It costs one more unrolling than a
+first-visit cut: a two-node loop is spelled twice and then closed.
 
 ### Why not fold peers into the walk
 
