@@ -396,6 +396,8 @@ impl FixtureRegistry {
                 shasum: None,
             },
             dependencies: BTreeMap::new(),
+            peer_dependencies: BTreeMap::new(),
+            peer_dependencies_meta: BTreeMap::new(),
         };
 
         self.tarballs.insert(url, tarball);
@@ -475,6 +477,9 @@ impl FixtureRegistry {
                 .iter()
                 .map(|(n, r)| (n.to_string(), r.to_string()))
                 .collect(),
+            // Peer-free: a fixture needing peers registers them itself.
+            peer_dependencies: BTreeMap::new(),
+            peer_dependencies_meta: BTreeMap::new(),
         };
 
         (metadata, tarball)
@@ -574,6 +579,8 @@ impl FixtureRegistry {
                 shasum: None,
             },
             dependencies: BTreeMap::new(),
+            peer_dependencies: BTreeMap::new(),
+            peer_dependencies_meta: BTreeMap::new(),
         };
 
         self.tarballs.insert(url, tarball);

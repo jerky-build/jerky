@@ -308,6 +308,8 @@ impl jerky::registry::RegistryClient for HandBuilt {
                             shasum: None,
                         },
                         dependencies: BTreeMap::new(),
+                        peer_dependencies: BTreeMap::new(),
+                        peer_dependencies_meta: BTreeMap::new(),
                     },
                 )
             })
