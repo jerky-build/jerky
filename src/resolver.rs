@@ -47,6 +47,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use thiserror::Error;
 
 use crate::integrity::{Integrity, IntegrityError};
+use crate::platform::{Platform, PlatformSupport};
 use crate::pool;
 use crate::range::{Range, RangeError, Version};
 use crate::registry::{
@@ -286,6 +287,31 @@ fn declared_peers(metadata: &VersionMetadata) -> BTreeMap<String, DeclaredPeer> 
         .collect()
 }
 
+/// Every dependency edge a version declares, and whether it is optional.
+///
+/// One function, used by both the crawl and the walk, because the two must ask
+/// the registry about exactly the same set — the crawl's whole claim to
+/// deciding nothing rests on it reading the same edges the walk will.
+///
+/// A name declared in *both* blocks appears once, as the optional one, which is
+/// npm's documented rule: "entries in optionalDependencies will override
+/// entries of the same name in dependencies". Written as a filter rather than
+/// as an overwrite, so the rule holds for a caller that reads this as a
+/// sequence as well as for one that collects it into a map — and so that the
+/// walk does not resolve a version it is about to throw away.
+fn declared_edges(metadata: &VersionMetadata) -> impl Iterator<Item = (&str, &str, bool)> {
+    let required = metadata
+        .dependencies
+        .iter()
+        .filter(|(name, _)| !metadata.optional_dependencies.contains_key(*name))
+        .map(|(name, specifier)| (name.as_str(), specifier.as_str(), false));
+    let optional = metadata
+        .optional_dependencies
+        .iter()
+        .map(|(name, specifier)| (name.as_str(), specifier.as_str(), true));
+    required.chain(optional)
+}
+
 /// Split a rendered [`PackageId`] key into its name and version, discarding
 /// any peer suffix.
 ///
@@ -330,7 +356,34 @@ pub struct ResolvedPackage {
     pub resolved: String,
     pub integrity: Integrity,
     /// What this package calls a dependency -> the node it resolved to.
+    ///
+    /// Every edge, optional or not. Which of them were declared optional is
+    /// `optional_dependencies` below, and nothing else about an optional edge
+    /// differs.
     pub dependencies: BTreeMap<String, PackageId>,
+    /// Which keys of `dependencies` came from `optionalDependencies`.
+    ///
+    /// Spelled out rather than `optional`, because `DeclaredPeer::optional`
+    /// already lives in this module and says something else entirely — that a
+    /// peer may go unsatisfied. Two `.optional`s a few hundred lines apart,
+    /// meaning different things, is a field name that has to be read twice.
+    ///
+    /// A marker over the edge names rather than a second edge map or a flag on
+    /// the edge value, because an optional dependency that is installed is an
+    /// ordinary dependency in every respect — it resolves, links, prunes and
+    /// answers a peer identically. Optionality changes exactly one thing:
+    /// whether a platform mismatch at the far end is tolerated. Keeping it out
+    /// of the edge is what lets every existing walker over `dependencies` stay
+    /// single-branch and stay right, and leaves the one pass that has the
+    /// question — [`ResolvedGraph::for_platform`] — to ask it.
+    pub optional_dependencies: BTreeSet<String>,
+    /// What this package published about the machines it runs on.
+    ///
+    /// Carried rather than evaluated, for the reason `declared_peers` is: the
+    /// answer depends on which machine is asking, the lockfile records this
+    /// graph, and a lockfile that recorded one machine's answer would be a
+    /// different file on every platform.
+    pub supports: PlatformSupport,
     /// What this package requires of its consumer, exactly as published.
     ///
     /// Carried rather than resolved by the walk, because a peer is not an edge
@@ -577,8 +630,14 @@ enum Dependent {
     /// steering anything: resolution is identical either way, and the value is
     /// only carried so the graph can record what the manifest said.
     Importer { path: ImporterPath, kind: Kind },
-    /// A package declaring one of its own.
-    Package(PackageId),
+    /// A package declaring one of its own, and whether it declared it in
+    /// `optionalDependencies`.
+    ///
+    /// The flag rides along rather than steering anything, exactly as `kind`
+    /// does above: an optional edge is selected, fetched and recorded like any
+    /// other, and the value is carried only so the graph can record which
+    /// section asked.
+    Package { id: PackageId, optional: bool },
 }
 
 impl ResolvedGraph {
@@ -626,6 +685,112 @@ impl ResolvedGraph {
                 .filter(|(id, _)| reachable.contains(id))
                 .collect(),
         }
+    }
+
+    /// The sub-graph one machine actually materialises, and what it left out.
+    ///
+    /// A package declaring an `os` or `cpu` this machine does not satisfy is
+    /// skipped — but *only* where it was reached through an optional edge,
+    /// which is the only place a skip is available. Reached through a plain
+    /// `dependencies` entry the constraint is not consulted at all: refusing a
+    /// tree that works is not a stricter kind of correct, and `os` is advisory
+    /// metadata publishers get wrong.
+    ///
+    /// Written as a walk that declines to *enter* a node rather than as a
+    /// filter over the finished set, because that is what makes the subtree
+    /// fall out for free. Anything only the skipped package led to is never
+    /// reached, and anything it merely shared with a package that is kept is
+    /// reached by the other path and stays — which is npm's rule, that a node
+    /// is optional only when every path to it is, arrived at rather than
+    /// stated.
+    ///
+    /// **This is not `reachable`, and must not be folded into it.** The
+    /// lockfile is written from the full graph, which is what makes it
+    /// platform independent: it records `@esbuild/win32-x64` on a Mac and on
+    /// Linux alike, so the same committed file plans differently on each
+    /// machine instead of being re-resolved into a different file on each. So
+    /// the caller needs both graphs at once, which is why this borrows where
+    /// `reachable` consumes.
+    ///
+    /// Two things happen beyond dropping nodes, both of them about not leaving
+    /// a dangling link behind: an edge naming a dropped package is dropped
+    /// from whoever declared it, and so is a resolved peer naming one. Without
+    /// the first the plan writes a symlink into a virtual store entry nothing
+    /// created.
+    ///
+    /// It clones, and in the common case where nothing is skipped it clones
+    /// the whole graph to change nothing. A `Cow` would save that, and would
+    /// put a deref in front of every reader of a graph for a cost that does
+    /// not register beside one tarball — this runs once per install, against
+    /// the fetch and the unpack that follow it.
+    pub fn for_platform(&self, platform: &Platform) -> (Self, Vec<PackageId>) {
+        let mut kept: BTreeSet<PackageId> = BTreeSet::new();
+        let mut skipped: BTreeSet<PackageId> = BTreeSet::new();
+        // An importer declares no optional section, so every edge leaving one
+        // is required and is entered unconditionally.
+        let mut queue: VecDeque<PackageId> = self
+            .importers
+            .values()
+            .flat_map(|importer| importer.dependencies.values())
+            .filter_map(|dependency| match &dependency.resolution {
+                Resolution::Registry(id) => Some(id.clone()),
+                Resolution::Local(_) => None,
+            })
+            .collect();
+
+        while let Some(id) = queue.pop_front() {
+            if !kept.insert(id.clone()) {
+                continue;
+            }
+            let Some(package) = self.packages.get(&id) else {
+                continue;
+            };
+            for (name, target) in &package.dependencies {
+                let skippable = package.optional_dependencies.contains(name);
+                let admitted = self
+                    .packages
+                    .get(target)
+                    .is_none_or(|dependency| dependency.supports.admits(platform));
+                if skippable && !admitted {
+                    skipped.insert(target.clone());
+                    continue;
+                }
+                queue.push_back(target.clone());
+            }
+        }
+
+        // A node reached by one path and skipped on another is kept: the first
+        // path is a reason to install it and the second is only permission not
+        // to. Computed by subtraction rather than by checking at the point of
+        // the skip, because the two paths can be discovered in either order.
+        skipped.retain(|id| !kept.contains(id));
+
+        let packages = self
+            .packages
+            .iter()
+            .filter(|(id, _)| kept.contains(id))
+            .map(|(id, package)| {
+                let mut package = package.clone();
+                package.dependencies.retain(|_, to| kept.contains(to));
+                // The marker set names keys of `dependencies`, so it has to
+                // follow them out. Nothing downstream reads it today, which is
+                // exactly why leaving it stale would be a field whose own
+                // documentation is false by the time something does.
+                package
+                    .optional_dependencies
+                    .retain(|name| package.dependencies.contains_key(name));
+                package.peers.retain(|_, to| kept.contains(to));
+                (id.clone(), package)
+            })
+            .collect();
+
+        (
+            ResolvedGraph {
+                importers: self.importers.clone(),
+                packages,
+            },
+            skipped.into_iter().collect(),
+        )
     }
 }
 
@@ -1269,6 +1434,13 @@ impl PeerPass<'_> {
                     resolved: source.resolved.clone(),
                     integrity: source.integrity.clone(),
                     dependencies,
+                    // Both carried straight across. Peer duplication makes
+                    // copies of one published version, and a copy declares
+                    // what the version declared: which of its edges were
+                    // optional, and which machines it runs on, are properties
+                    // of the publish and not of which peers answered.
+                    optional_dependencies: source.optional_dependencies.clone(),
+                    supports: source.supports.clone(),
                     declared_peers: source.declared_peers.clone(),
                     peers: copy
                         .own
@@ -1801,10 +1973,13 @@ impl<'a> Walk<'a> {
                 return;
             };
 
-            // `dependencies` only, exactly as `visit` reads them: a
+            // Exactly the edges `visit` reads, through the same function: a
             // dependency's `devDependencies` must never be followed, and
-            // `VersionMetadata` has no field they could arrive through.
-            for (name, specifier) in &metadata.dependencies {
+            // `VersionMetadata` has no field they could arrive through. An
+            // optional dependency is crawled like any other — whether this
+            // machine ends up linking it is settled long after resolution, and
+            // a crawl that guessed would be deciding something.
+            for (name, specifier, _) in declared_edges(metadata) {
                 let Ok(next) = Asked::read(name, specifier) else {
                     continue;
                 };
@@ -1858,9 +2033,15 @@ impl<'a> Walk<'a> {
         // dependency is recorded against the importer rather than against a
         // package, because that is what its `node_modules` is built from.
         match dependent {
-            Dependent::Package(parent) => {
+            Dependent::Package {
+                id: parent,
+                optional,
+            } => {
                 if let Some(package) = self.packages.get_mut(&parent) {
                     package.dependencies.insert(name.clone(), id.clone());
+                    if optional {
+                        package.optional_dependencies.insert(name.clone());
+                    }
                 }
             }
             Dependent::Importer { path, kind } => {
@@ -1900,14 +2081,21 @@ impl<'a> Walk<'a> {
             })?;
         let resolved = metadata.dist.tarball.clone();
 
-        // `dependencies` only. A dependency's `devDependencies` must never be
-        // followed — doing so pulls in most of the registry — which is why
-        // `VersionMetadata` has no field for them to be read from.
-        for (dep_name, dep_specifier) in &metadata.dependencies {
+        // `dependencies` and `optionalDependencies`. Still no
+        // `devDependencies`: a dependency's must never be followed — doing so
+        // pulls in most of the registry — which is why `VersionMetadata` has
+        // no field for them to be read from.
+        //
+        // A name in both blocks arrives once, as the optional one at the
+        // optional range, which is npm's rule and `declared_edges`'s job.
+        for (dep_name, dep_specifier, optional) in declared_edges(metadata) {
             self.work.push_back(Pending {
-                dependent: Dependent::Package(id.clone()),
-                name: dep_name.clone(),
-                specifier: dep_specifier.clone(),
+                dependent: Dependent::Package {
+                    id: id.clone(),
+                    optional,
+                },
+                name: dep_name.to_string(),
+                specifier: dep_specifier.to_string(),
                 asked: Asked::read(dep_name, dep_specifier)?,
             });
         }
@@ -1919,6 +2107,13 @@ impl<'a> Walk<'a> {
                 resolved,
                 integrity,
                 dependencies: BTreeMap::new(),
+                // Filled as each edge above is visited, since that is where
+                // the name an edge is recorded under is settled.
+                optional_dependencies: BTreeSet::new(),
+                supports: PlatformSupport {
+                    os: metadata.os.clone(),
+                    cpu: metadata.cpu.clone(),
+                },
                 declared_peers: declared_peers(metadata),
                 // Filled by the peer pass. The walk is peer-blind by design.
                 peers: BTreeMap::new(),

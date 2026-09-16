@@ -8,6 +8,7 @@ pub mod linker;
 pub mod lockfile;
 pub mod manifest;
 pub mod metadata_cache;
+pub mod platform;
 pub mod pool;
 pub mod range;
 pub mod registry;

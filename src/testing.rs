@@ -396,6 +396,9 @@ impl FixtureRegistry {
                 shasum: None,
             },
             dependencies: BTreeMap::new(),
+            optional_dependencies: BTreeMap::new(),
+            os: Vec::new(),
+            cpu: Vec::new(),
             peer_dependencies: BTreeMap::new(),
             peer_dependencies_meta: BTreeMap::new(),
         };
@@ -414,7 +417,7 @@ impl FixtureRegistry {
     ///
     /// Each entry is `(name, range, optional)`.
     pub fn with_declared_peers(
-        mut self,
+        self,
         name: &str,
         version: &str,
         peers: &[(&str, &str, bool)],
@@ -432,26 +435,85 @@ impl FixtureRegistry {
             }
         };
 
-        // Both copies, because `register` cloned the metadata into each and a
-        // fixture that amended only one would resolve differently depending on
-        // whether the packument or the version map was consulted.
-        //
-        // Panics on a name or version that is not registered, for the reason
-        // `with_dist_tag` does: silently amending nothing turns a typo into a
-        // peer-free fixture and a green test that proves the opposite of what
-        // it claims.
+        self.amend(name, version, amend)
+    }
+
+    /// Declare `optionalDependencies` on a version that is already registered.
+    ///
+    /// Separate from the builders that register a version, for the reason
+    /// [`FixtureRegistry::with_declared_peers`] is: optional dependencies
+    /// appear in a handful of tests, and threading an almost-always-empty
+    /// argument through every call site would cost every existing fixture a
+    /// `&[]`.
+    ///
+    /// Each entry is `(name, range)`.
+    pub fn with_optional_dependencies(
+        self,
+        name: &str,
+        version: &str,
+        optional: &[(&str, &str)],
+    ) -> Self {
+        self.amend(name, version, |metadata| {
+            for (dependency, range) in optional {
+                metadata
+                    .optional_dependencies
+                    .insert(dependency.to_string(), range.to_string());
+            }
+        })
+    }
+
+    /// Declare `os` and `cpu` on a version that is already registered.
+    ///
+    /// Tests that must be about a machine other than the one running them use
+    /// the two constants jerky's own target list provides: `["win32"]` is a
+    /// platform this project has an invariant against ever supporting, and
+    /// `["linux", "darwin"]` covers every platform it does. Both are therefore
+    /// the same answer on every machine the suite can run on.
+    pub fn with_platform(self, name: &str, version: &str, os: &[&str], cpu: &[&str]) -> Self {
+        self.amend(name, version, |metadata| {
+            metadata.os = os.iter().map(|value| value.to_string()).collect();
+            metadata.cpu = cpu.iter().map(|value| value.to_string()).collect();
+        })
+    }
+
+    /// Apply an edit to one registered version, in both places it is held.
+    ///
+    /// Both copies, because `register` cloned the metadata into each and a
+    /// fixture that amended only one would resolve differently depending on
+    /// whether the packument or the version map was consulted.
+    ///
+    /// Panics on a name or version that is not registered, for the reason
+    /// `with_dist_tag` does: silently amending nothing turns a typo into a
+    /// fixture without the thing under test, and a green test that proves the
+    /// opposite of what it claims.
+    fn amend(mut self, name: &str, version: &str, edit: impl Fn(&mut VersionMetadata)) -> Self {
         let metadata = self
             .versions
             .get_mut(&(name.to_string(), version.to_string()))
-            .unwrap_or_else(|| panic!("no `{name}` at `{version}` to declare peers on"));
-        amend(metadata);
+            .unwrap_or_else(|| panic!("no `{name}` at `{version}` to amend"));
+        edit(metadata);
 
-        let metadata = self
+        let packument = self
             .packuments
             .get_mut(name)
-            .and_then(|packument| packument.versions.get_mut(version))
+            .unwrap_or_else(|| panic!("no packument for `{name}`"));
+        let metadata = packument
+            .versions
+            .get_mut(version)
             .unwrap_or_else(|| panic!("no packument entry for `{name}` at `{version}`"));
-        amend(metadata);
+        edit(metadata);
+
+        // `register` also files a copy of the highest stable version under the
+        // `latest` key, for the single-version path that resolves a dist-tag
+        // through the version map. Amending the version without refreshing
+        // that copy leaves the two disagreeing, so a fixture amended after
+        // registration would behave differently depending on whether the test
+        // asked for `1.0.0` or for `latest`.
+        if packument.dist_tags.get("latest").map(String::as_str) == Some(version) {
+            let refreshed = packument.versions[version].clone();
+            self.versions
+                .insert((name.to_string(), "latest".to_string()), refreshed);
+        }
 
         self
     }
@@ -528,7 +590,11 @@ impl FixtureRegistry {
                 .iter()
                 .map(|(n, r)| (n.to_string(), r.to_string()))
                 .collect(),
-            // Peer-free: a fixture needing peers registers them itself.
+            // Optional-free and peer-free, and platform-free with it: a
+            // fixture needing any of the three amends the version afterwards.
+            optional_dependencies: BTreeMap::new(),
+            os: Vec::new(),
+            cpu: Vec::new(),
             peer_dependencies: BTreeMap::new(),
             peer_dependencies_meta: BTreeMap::new(),
         };
@@ -630,6 +696,9 @@ impl FixtureRegistry {
                 shasum: None,
             },
             dependencies: BTreeMap::new(),
+            optional_dependencies: BTreeMap::new(),
+            os: Vec::new(),
+            cpu: Vec::new(),
             peer_dependencies: BTreeMap::new(),
             peer_dependencies_meta: BTreeMap::new(),
         };

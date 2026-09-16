@@ -110,6 +110,18 @@ upon — a crate bump would otherwise reopen it in silence.
 **Nothing is recorded that is not already true on disk.** The manifest and the
 lockfile are both written after every package is linked.
 
+The one exception is deliberate and is the whole of the optional-dependency
+design: a package whose declared `os`/`cpu` rules this machine out is recorded
+by the lockfile and is not on disk. It has to be. The file is committed and
+read on other machines, so it says what every package *declared* and lets each
+machine reach its own conclusion — and an install that reuses the lockfile
+resolves nothing, so the file is the only thing left that can say the package
+was skippable at all. Recording only what this machine linked would make the
+lockfile a function of the machine that wrote it, which is the property it
+exists not to have. The rule as it stands is about a package jerky *chose* not
+to record; it is not permission to record something jerky merely failed to
+install. See `docs/specs/2026-09-16-optional-dependencies-design.md` §2.
+
 **Nothing stays on disk that is no longer recorded.** The converse, and the
 half that makes the first one more than permission to leave things lying
 around. Every install converges each importer's `node_modules` and prunes the

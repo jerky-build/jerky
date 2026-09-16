@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::integrity::Integrity;
+use crate::platform::PlatformSupport;
 use crate::resolver::{
     DeclaredPeer, Dependency, Importer, ImporterPath, Kind, PackageId, Resolution, ResolvedGraph,
     ResolvedPackage, context_of, split_key,
@@ -186,6 +187,41 @@ struct Entry {
     /// the lockfile records what a resolution decided, not what it was given.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     dependencies: BTreeMap<String, String>,
+    /// The edges the package declared in `optionalDependencies`, in the same
+    /// encoding as `dependencies` above.
+    ///
+    /// Two blocks here and one flat map in the graph, which is the split the
+    /// importer's `dependencies`/`devDependencies` already makes and for the
+    /// same reason: the on-disk format wants the sections because that is what
+    /// the package published, and the graph has no use for them.
+    ///
+    /// Recorded even for a package this machine will not link, which is the
+    /// whole of what makes this file platform independent. An install whose
+    /// importers all still match resolves nothing and builds its graph out of
+    /// this file alone — so a file that did not say which edges were optional
+    /// would have no way to know `@esbuild/win32-x64` was skippable, and would
+    /// link it. The peer spec records declared peers so a *warning* survives a
+    /// cache hit; this is the tree surviving one.
+    #[serde(
+        rename = "optionalDependencies",
+        default,
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    optional_dependencies: BTreeMap<String, String>,
+    /// What the package published about the machines it runs on, verbatim.
+    ///
+    /// Never this machine's *answer* to it. There is no `"skipped": true` and
+    /// no entry-level `"optional": true` of the kind npm writes, because both
+    /// are derived — the first from the machine, the second from every path to
+    /// the node — and a file whose job is recording facts is the wrong place
+    /// for either. Recording the declaration is what lets a lockfile written
+    /// on a Mac plan correctly on Linux instead of being re-resolved into a
+    /// different file there.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    os: Vec<String>,
+    /// The architectures, same rule as `os`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    cpu: Vec<String>,
     /// What this node's own peers resolved to: the name it declared each under
     /// -> the key of the node that answered.
     ///
@@ -307,6 +343,26 @@ fn edge_key(name: &str, recorded: &str) -> String {
     }
 }
 
+/// Every dependency edge one entry records, both blocks.
+///
+/// One reader for the two blocks, used by identity rebuilding, the
+/// dangling-edge check and the graph itself, because an optional edge is an
+/// edge in all three and three spellings of "both blocks" is three chances for
+/// one of them to forget the second.
+///
+/// A name recorded in both — which only a hand-edited file produces — reads as
+/// the optional one, the same way the resolver reads a package declaring one in
+/// both. Filtered rather than overwritten so that every caller sees the rule,
+/// including the dangling-edge check, which must not refuse a file over a row
+/// nothing reads.
+fn recorded_edges(entry: &Entry) -> impl Iterator<Item = (&String, &String)> {
+    entry
+        .dependencies
+        .iter()
+        .filter(|(name, _)| !entry.optional_dependencies.contains_key(*name))
+        .chain(&entry.optional_dependencies)
+}
+
 pub fn save(graph: &ResolvedGraph, project_dir: &Path) -> Result<(), LockfileError> {
     let packages = graph
         .packages
@@ -318,11 +374,23 @@ pub fn save(graph: &ResolvedGraph, project_dir: &Path) -> Result<(), LockfileErr
                     version: package.id.version.clone(),
                     resolved: package.resolved.clone(),
                     integrity: package.integrity.to_ssri(),
+                    // Partitioned on the way out, which is the only place the
+                    // two sections exist as separate things — the same split
+                    // an importer's two blocks get, one level down.
                     dependencies: package
                         .dependencies
                         .iter()
+                        .filter(|(name, _)| !package.optional_dependencies.contains(*name))
                         .map(|(name, id)| (name.clone(), edge_value(name, id)))
                         .collect(),
+                    optional_dependencies: package
+                        .dependencies
+                        .iter()
+                        .filter(|(name, _)| package.optional_dependencies.contains(*name))
+                        .map(|(name, id)| (name.clone(), edge_value(name, id)))
+                        .collect(),
+                    os: package.supports.os.clone(),
+                    cpu: package.supports.cpu.clone(),
                     peers: package
                         .peers
                         .iter()
@@ -522,8 +590,12 @@ impl<'a> Identities<'a> {
             };
             own.insert(declared.clone(), id);
         }
-        let mut dependencies = Vec::with_capacity(entry.dependencies.len());
-        for (declared, recorded) in &entry.dependencies {
+        // Both blocks, because an optional edge is an edge: one whose target
+        // carries a peer context contributes to this node's identity exactly
+        // as a required one does, and leaving it out would spell two copies of
+        // a dependent the same way.
+        let mut dependencies = Vec::new();
+        for (declared, recorded) in recorded_edges(entry) {
             dependencies.push((declared.clone(), self.of(&edge_key(declared, recorded))));
         }
 
@@ -681,10 +753,7 @@ pub fn load(project_dir: &Path) -> Result<Option<ResolvedGraph>, LockfileError> 
     // naming a node the file does not record is the same broken install a
     // dangling dependency is.
     for (key, entry) in &entries {
-        let dependencies = entry
-            .dependencies
-            .iter()
-            .map(|(name, recorded)| edge_key(name, recorded));
+        let dependencies = recorded_edges(entry).map(|(name, recorded)| edge_key(name, recorded));
         for target in dependencies.chain(entry.peers.values().cloned()) {
             if !entries.contains_key(&target) {
                 return Err(LockfileError::DanglingEdge {
@@ -725,17 +794,28 @@ pub fn load(project_dir: &Path) -> Result<Option<ResolvedGraph>, LockfileError> 
         let DecodedEntry { integrity, .. } =
             decoded.remove(&key).expect("every key was decoded above");
 
+        // The two blocks flattened back into the one map the graph keeps, with
+        // the section they came from recorded beside it. Ahead of the
+        // initializer rather than inside it, because `entry` is moved from
+        // there field by field and the flatten reads all of it.
+        let dependencies = recorded_edges(&entry)
+            .map(|(name, recorded)| (name.clone(), ids[&edge_key(name, recorded)].clone()))
+            .collect();
+        let optional_dependencies = entry.optional_dependencies.keys().cloned().collect();
+        let supports = PlatformSupport {
+            os: entry.os.clone(),
+            cpu: entry.cpu.clone(),
+        };
+
         packages.insert(
             id.clone(),
             ResolvedPackage {
                 id,
                 resolved: entry.resolved,
                 integrity,
-                dependencies: entry
-                    .dependencies
-                    .iter()
-                    .map(|(name, recorded)| (name.clone(), ids[&edge_key(name, recorded)].clone()))
-                    .collect(),
+                dependencies,
+                optional_dependencies,
+                supports,
                 peers: entry
                     .peers
                     .iter()
