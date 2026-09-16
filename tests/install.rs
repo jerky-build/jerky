@@ -3627,3 +3627,297 @@ fn scope_directories_jerky_creates_are_not_world_writable() {
         assert_eq!(mode, 0o755, "{} is {mode:o}, not 0o755", scope.display());
     }
 }
+
+/// A tree where `react-dom` wants a react the project does not have, beside a
+/// `vite` whose optional `terser` nothing provides.
+///
+/// Two unanswered peers in one fixture on purpose: the out-of-range one, which
+/// names what it found, and the optional one, which says nothing at all. A
+/// fixture with only the first would pass under "every unsatisfied peer
+/// warns", which is the reading `peerDependenciesMeta.optional` exists to
+/// refuse.
+fn peer_registry() -> FixtureRegistry {
+    FixtureRegistry::new()
+        .with_tree(&[
+            ("react-dom", "18.2.0", &[]),
+            ("react", "17.0.2", &[]),
+            ("vite", "5.0.0", &[]),
+        ])
+        .with_declared_peers("react-dom", "18.2.0", &[("react", "^18.2.0", false)])
+        .with_declared_peers("vite", "5.0.0", &[("terser", "^5.4.0", true)])
+}
+
+/// Every complaint an install made, as `dependent / peer / what was found`.
+fn complaints(outcome: &Outcome) -> Vec<(String, String, Option<String>)> {
+    outcome
+        .unsatisfied_peers
+        .iter()
+        .map(|peer| {
+            (
+                peer.dependent.to_string(),
+                peer.peer.clone(),
+                peer.found.clone(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn an_unsatisfied_peer_warns_and_the_install_still_succeeds() {
+    // The decision this pins is that a warning stays a warning. Making it
+    // fatal would leave jerky unable to install large parts of a live
+    // ecosystem whose peer ranges routinely lag a major release, so the tree
+    // is written and the complaint rides back beside it.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let store = Store::new(home.path().join("store"));
+
+    write_manifest(
+        root,
+        r#"{"name":"demo","dependencies":{"react-dom":"18.2.0","react":"17.0.2","vite":"5.0.0"}}"#,
+    );
+
+    let outcome = sync(&solo(root), &store, &peer_registry(), None, Mode::Develop).unwrap();
+
+    assert_eq!(
+        complaints(&outcome),
+        [(
+            "react-dom@18.2.0".to_string(),
+            "react".to_string(),
+            Some("17.0.2".to_string())
+        )],
+        "the out-of-range peer names the version it found, and the optional one is silent"
+    );
+
+    // And the install really did install: the links are there, and so is the
+    // lockfile the next run reads.
+    assert_eq!(linked_version(root, "react-dom"), "18.2.0");
+    assert_eq!(linked_version(root, "react"), "17.0.2");
+    assert!(root.join("jerky-lock.json").is_file());
+}
+
+#[test]
+fn a_second_install_over_an_unchanged_lockfile_warns_identically() {
+    // The one that matters. An install whose importers all still match skips
+    // resolution entirely, so nothing recomputes a peer — and a project that
+    // warned on its first install and went quiet on every one after it, with
+    // nothing about the project having changed, is the silence #34 was filed
+    // about wearing a different hat.
+    //
+    // What makes it survive is `declaredPeers` on disk: the ranges each
+    // package published are recorded, so the complaint is a function of the
+    // lockfile rather than a by-product of having resolved.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let store = Store::new(home.path().join("store"));
+
+    write_manifest(
+        root,
+        r#"{"name":"demo","dependencies":{"react-dom":"18.2.0","react":"17.0.2","vite":"5.0.0"}}"#,
+    );
+
+    let first = sync(&solo(root), &store, &peer_registry(), None, Mode::Develop).unwrap();
+
+    // A fresh registry holding the same packages, so a re-resolution would
+    // have succeeded and been counted rather than failing for another reason.
+    let registry = peer_registry();
+    let second = sync(&solo(root), &store, &registry, None, Mode::Develop).unwrap();
+
+    assert_eq!(
+        registry.packument_calls() + registry.metadata_calls(),
+        0,
+        "the second install re-resolved, so this proves nothing about the lockfile"
+    );
+    assert!(!complaints(&first).is_empty(), "the first run said nothing");
+    assert_eq!(
+        complaints(&second),
+        complaints(&first),
+        "the complaint did not survive the cache hit"
+    );
+}
+
+#[test]
+fn a_peer_cycle_is_not_unrolled_one_turn_further_on_every_install() {
+    // `host` depends on `lib` and `lib` peers back on `host`, so each is named
+    // partly after the other and the key spells the loop out until it closes.
+    // Peer resolution is *not* idempotent over that — handed a graph it has
+    // already resolved, it unrolls the loop one more turn — so an install that
+    // re-ran the pass over what the lockfile recorded would rename two store
+    // directories every time, on a project nobody had touched.
+    //
+    // The byte comparison is the whole assertion. Names that grow show up in
+    // the keys, in the edges between them, and in the peer blocks at once.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let store = Store::new(home.path().join("store"));
+
+    let registry = || {
+        FixtureRegistry::new()
+            .with_tree(&[
+                ("host", "1.0.0", &[("lib", "^1.0.0")]),
+                ("lib", "1.0.0", &[]),
+            ])
+            .with_declared_peers("lib", "1.0.0", &[("host", "^1.0.0", false)])
+    };
+
+    write_manifest(root, r#"{"name":"demo","dependencies":{"host":"1.0.0"}}"#);
+
+    sync(&solo(root), &store, &registry(), None, Mode::Develop).unwrap();
+    let first = std::fs::read_to_string(root.join("jerky-lock.json")).unwrap();
+
+    sync(&solo(root), &store, &registry(), None, Mode::Develop).unwrap();
+    let second = std::fs::read_to_string(root.join("jerky-lock.json")).unwrap();
+
+    assert_eq!(first, second, "a second install renamed what it found");
+}
+
+#[test]
+fn a_tree_with_every_peer_satisfied_says_nothing() {
+    // The common case, and the one that decides whether any of this is worth
+    // reading: a project whose peers are all answered prints nothing at all.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let store = Store::new(home.path().join("store"));
+
+    let registry = FixtureRegistry::new()
+        .with_tree(&[("react-dom", "18.2.0", &[]), ("react", "18.2.0", &[])])
+        .with_declared_peers("react-dom", "18.2.0", &[("react", "^18.2.0", false)]);
+
+    write_manifest(
+        root,
+        r#"{"name":"demo","dependencies":{"react-dom":"18.2.0","react":"18.2.0"}}"#,
+    );
+
+    let outcome = sync(&solo(root), &store, &registry, None, Mode::Develop).unwrap();
+
+    assert_eq!(complaints(&outcome), []);
+
+    // And the peer reached the tree rather than only the diagnostic: the node
+    // is keyed by what it resolved against, and links that answer beside its
+    // own dependencies, where nothing is hoisted for it to find.
+    assert_eq!(
+        read_json(&root.join("jerky-lock.json"))["packages"]["react-dom@18.2.0(react@18.2.0)"]["peers"]
+            ["react"],
+        "react@18.2.0"
+    );
+    assert_eq!(
+        linked_version(
+            &root.join("node_modules/.jerky/react-dom@18.2.0(react@18.2.0)"),
+            "react"
+        ),
+        "18.2.0"
+    );
+}
+
+#[test]
+fn a_production_install_does_not_link_a_peer_it_pruned() {
+    // `reachable` follows dependency edges only, on the argument that the
+    // nearest-ancestor rule makes a provider reachable through whoever
+    // declared it. True of the whole graph — and exactly what `--production`
+    // takes away: `react-dom` is a dependency and the `react` answering its
+    // peer is a devDependency, so the node stays and its provider does not.
+    //
+    // Left in the node's peer block, that edge is planned anyway, and the
+    // entry's `node_modules` gets a symlink into a virtual store directory
+    // nothing wrote. A dangling link in `node_modules` is the exact failure
+    // convergence exists to prevent, arrived at from the other side.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let store = Store::new(home.path().join("store"));
+
+    let registry = FixtureRegistry::new()
+        .with_tree(&[("react-dom", "18.2.0", &[]), ("react", "18.2.0", &[])])
+        .with_declared_peers("react-dom", "18.2.0", &[("react", "^18.2.0", false)]);
+
+    write_manifest(
+        root,
+        r#"{"name":"demo","dependencies":{"react-dom":"18.2.0"},"devDependencies":{"react":"18.2.0"}}"#,
+    );
+
+    // A clone: the lockfile is committed and `node_modules` is not, which is
+    // where `--production` actually runs.
+    sync(&solo(root), &store, &registry, None, Mode::Develop).unwrap();
+    std::fs::remove_dir_all(root.join("node_modules")).unwrap();
+
+    let outcome = production_install(root, &store, &registry).unwrap();
+
+    let entry = root.join("node_modules/.jerky/react-dom@18.2.0(react@18.2.0)");
+    assert!(entry.is_dir(), "the dependent itself is still installed");
+    assert!(
+        !still_there(&entry.join("node_modules/react")),
+        "a link was written into a store entry the prune removed"
+    );
+
+    // And the user is told, in the words the missing case uses: in a
+    // production tree this peer genuinely is not there.
+    assert_eq!(
+        complaints(&outcome),
+        [("react-dom@18.2.0".to_string(), "react".to_string(), None)]
+    );
+}
+
+#[test]
+fn a_package_duplicated_by_its_peers_is_downloaded_once() {
+    // Two importers disagreeing about `react` give `plugin` two nodes and two
+    // virtual store entries — of one published tarball, with one integrity and
+    // one content-store entry. A fetch per node would download the same bytes
+    // once per copy, and a package duplicated across a large monorepo would
+    // pay for every copy.
+    //
+    // Two importers rather than one because that is what makes the
+    // duplication happen at all.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let store = Store::new(home.path().join("store"));
+
+    let registry = FixtureRegistry::new()
+        .with_tree(&[
+            ("plugin", "1.0.0", &[]),
+            ("react", "17.0.0", &[]),
+            ("react", "18.2.0", &[]),
+        ])
+        .with_declared_peers("plugin", "1.0.0", &[("react", ">=17", false)]);
+
+    write_manifest(root, r#"{"name":"ws","workspaces":["packages/*"]}"#);
+    write_manifest(
+        &root.join("packages/x"),
+        r#"{"name":"x","dependencies":{"plugin":"1.0.0","react":"17.0.0"}}"#,
+    );
+    write_manifest(
+        &root.join("packages/y"),
+        r#"{"name":"y","dependencies":{"plugin":"1.0.0","react":"18.2.0"}}"#,
+    );
+
+    let outcome = sync(
+        &Workspace::discover(root).unwrap(),
+        &store,
+        &registry,
+        None::<&Request>,
+        Mode::Develop,
+    )
+    .unwrap();
+
+    assert!(
+        root.join("node_modules/.jerky/plugin@1.0.0(react@17.0.0)")
+            .is_dir()
+            && root
+                .join("node_modules/.jerky/plugin@1.0.0(react@18.2.0)")
+                .is_dir(),
+        "the disagreement really did produce two entries"
+    );
+    assert_eq!(
+        registry.tarball_calls(),
+        3,
+        "one tarball per published version — plugin, and the two reacts"
+    );
+
+    // And what the summary line counts is packages, not the directories they
+    // landed in.
+    assert_eq!(outcome.linked.len(), 3);
+}

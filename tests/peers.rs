@@ -339,6 +339,58 @@ fn an_unsatisfied_optional_peer_is_silent() {
 }
 
 #[test]
+fn one_complaint_is_reported_once_however_many_copies_carry_it() {
+    // `plugin` peers two names: `react`, which the two importers answer
+    // differently, and `vue`, which nobody answers at all. The first splits
+    // `plugin` into two nodes and the second is the same complaint in both of
+    // them — a *published* fact about `plugin@1.0.0`, not about either copy.
+    //
+    // Reported per copy it would be printed twice here and eleven times on a
+    // tree that duplicated eleven ways, which is how a real signal becomes
+    // scroll. The dedupe is therefore on what a reader would call one
+    // complaint: the dependent as published, and the peer name.
+    let registry = FixtureRegistry::new()
+        .with_tree(&[
+            ("plugin", "1.0.0", &[]),
+            ("react", "17.0.0", &[]),
+            ("react", "18.2.0", &[]),
+        ])
+        .with_declared_peers(
+            "plugin",
+            "1.0.0",
+            &[("react", ">=17", false), ("vue", "^3.0.0", false)],
+        );
+
+    let roots = BTreeMap::from([
+        (
+            ImporterPath::new("apps/x").unwrap(),
+            section(&[("plugin", "^1.0.0"), ("react", "17.0.0")], Kind::Prod),
+        ),
+        (
+            ImporterPath::new("apps/y").unwrap(),
+            section(&[("plugin", "^1.0.0"), ("react", "18.2.0")], Kind::Prod),
+        ),
+    ]);
+
+    let graph = resolve(&registry, &roots, &no_members()).unwrap();
+    let (graph, unsatisfied) = resolve_peers(graph);
+
+    assert_eq!(
+        keys_named(&graph, "plugin"),
+        ["plugin@1.0.0(react@17.0.0)", "plugin@1.0.0(react@18.2.0)"],
+        "the two reacts really did duplicate the node"
+    );
+    assert_eq!(
+        unsatisfied
+            .iter()
+            .map(|peer| format!("{} wants {}", peer.dependent, peer.peer))
+            .collect::<Vec<_>>(),
+        ["plugin@1.0.0 wants vue"],
+        "one complaint, named after the package as published rather than after a copy"
+    );
+}
+
+#[test]
 fn a_missing_required_peer_is_distinct_from_one_out_of_range() {
     let registry = FixtureRegistry::new()
         .with_tree(&[

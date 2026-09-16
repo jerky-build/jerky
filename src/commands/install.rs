@@ -14,7 +14,7 @@ use crate::range::{Range, Version};
 use crate::registry::{MAX_CONCURRENT_FETCHES, RegistryClient, RegistryError};
 use crate::resolver::{
     self, ALIAS_PROTOCOL, Declared, Importer, ImporterPath, Kind, PackageId, Resolution,
-    ResolveError, ResolvedGraph, ResolvedPackage,
+    ResolveError, ResolvedGraph, ResolvedPackage, UnsatisfiedPeer,
 };
 use crate::store::{Store, StoreError};
 use crate::workspace::Workspace;
@@ -174,6 +174,13 @@ pub struct Outcome {
     /// importer, deduplicated by `name@version` because the virtual store
     /// holds one entry per version however many importers asked for it.
     ///
+    /// The dedupe used to be free — `ResolvedGraph::packages` was keyed by
+    /// exactly `name@version` — and peer resolution is what took that away: a
+    /// version resolved against two different peers is two nodes and two store
+    /// entries, of one published package. What a reader is counting when they
+    /// read `installed 1291 packages` is packages, so the dedupe is now
+    /// performed rather than inherited.
+    ///
     /// Workspace members are deliberately absent: they are linked in place
     /// rather than installed, so counting them would report work that did not
     /// happen and would change with nothing but a `workspaces` edit.
@@ -186,6 +193,21 @@ pub struct Outcome {
     /// the layer that knows how to say so, which is the same division
     /// `Workspace::warnings()` already draws.
     pub left_alone: Vec<Unowned>,
+    /// Required peers nothing in the tree answers, one per published
+    /// complaint.
+    ///
+    /// Carried for the reason `left_alone` is: the install knows what it
+    /// found and the caller is the layer that knows a terminal is reading.
+    /// Reported on *every* install rather than only the ones that resolved —
+    /// an install that reuses its lockfile computes these from the ranges the
+    /// lockfile recorded, so a project does not warn once and then go quiet
+    /// with nothing about it having changed.
+    ///
+    /// A warning and not a failure, deliberately. Peer ranges across the live
+    /// ecosystem routinely lag a major release, and refusing a tree that works
+    /// is not a stricter kind of correct. `--strict-peers` is a policy on top
+    /// of this and belongs with #41's configuration surface.
+    pub unsatisfied_peers: Vec<UnsatisfiedPeer>,
     /// Present only when there was a request to record.
     pub recorded: Option<Recorded>,
 }
@@ -341,6 +363,23 @@ pub fn sync(
         .reachable(),
         (_, lock) => {
             let resolved = resolver::resolve(registry, &stale, &members)?;
+
+            // The walk is peer-blind by design, so what it answers with is not
+            // the tree yet: a package resolved against peers needs a directory
+            // per answer, and this is the pass that turns one selected version
+            // into the nodes the store will hold.
+            //
+            // Only the freshly resolved half goes through it. The reused half
+            // came out of a lockfile that records those answers already, and
+            // the pass is not idempotent over a peer *cycle* — re-running it
+            // unrolls the loop one turn further each time — so handing it a
+            // graph it has already resolved would rename store directories on
+            // an install that changed nothing.
+            //
+            // Its diagnostics go with it for the same reason: they speak for
+            // this half only, and what is reported is asked of the whole tree
+            // once it has one.
+            let (resolved, _) = resolver::resolve_peers(resolved);
             let locked_packages = lock.map(|lock| lock.packages).unwrap_or_default();
             ResolvedGraph {
                 importers: reused.into_iter().chain(resolved.importers).collect(),
@@ -368,7 +407,42 @@ pub fn sync(
                 .retain(|_, dep| dep.kind == Kind::Prod);
         }
         graph = graph.reachable();
+
+        // And a peer whose provider the prune took with it stops being a
+        // resolved peer. `reachable` follows dependency edges only, which the
+        // peer spec argued was enough because the nearest-ancestor rule makes
+        // a provider reachable through whoever declared it — true of the whole
+        // graph, and exactly what this kind filter takes away: a `react-dom`
+        // in `dependencies` whose `react` is a devDependency keeps its node
+        // and loses its provider's.
+        //
+        // Left in place the edge would be planned anyway, so the entry's
+        // `node_modules` would hold a symlink into a virtual store directory
+        // nothing ever wrote — a dangling link in every project that ran
+        // `--production` on such a tree. Dropping it is also the answer the
+        // rest of the design already gives: an unsatisfied peer is left
+        // unlinked, and `--production` means this one genuinely is not
+        // installed. The diagnostic below is computed after this and says so.
+        let present: BTreeSet<PackageId> = graph.packages.keys().cloned().collect();
+        for package in graph.packages.values_mut() {
+            package
+                .peers
+                .retain(|_, provider| present.contains(provider));
+        }
     }
+
+    // Asked of the finished tree rather than taken from the pass above, which
+    // is what makes the answer the same on every install. An install whose
+    // importers all still match never runs that pass at all — the `stale` map
+    // is empty and the lockfile *is* the graph — so a complaint collected
+    // while resolving would appear once and then vanish, with nothing about
+    // the project having changed. `declaredPeers` is recorded per entry
+    // exactly so this can be recomputed from the file.
+    //
+    // After the production prune, not before: `--production` links no
+    // devDependencies, and a peer of a package that is no longer in the tree
+    // is not a thing to tell anyone about.
+    let unsatisfied_peers = resolver::unsatisfied_peers(&graph);
 
     // The locked-integrity gate, over every package, before a single byte is
     // fetched. It was previously folded into the materialisation loop, which
@@ -451,16 +525,23 @@ pub fn sync(
         lockfile::save(&graph, workspace.root())?;
     }
 
+    // A set rather than the keys themselves: peer resolution can put several
+    // nodes on one published version, and `installed 3 packages` for two
+    // copies of a react-dom and the react they disagree about counts
+    // directories rather than packages.
+    let linked: BTreeSet<(String, String)> = graph
+        .packages
+        .keys()
+        .map(|id| (id.name.clone(), id.version.clone()))
+        .collect();
+
     Ok(Outcome {
-        linked: graph
-            .packages
-            .keys()
-            .map(|id| Installed {
-                name: id.name.clone(),
-                version: id.version.clone(),
-            })
+        linked: linked
+            .into_iter()
+            .map(|(name, version)| Installed { name, version })
             .collect(),
         left_alone,
+        unsatisfied_peers,
         recorded,
     })
 }
@@ -621,10 +702,18 @@ fn fetch_missing(
     // Decided up front, on one thread. Asking the store mid-flight would race
     // the commits this function is itself performing, and a package listed
     // twice would be downloaded twice.
+    //
+    // One entry per *tarball* and not per node, which stopped being the same
+    // thing when peer resolution landed: a version resolved against two
+    // different peers is two nodes sharing one integrity, so one content-store
+    // entry answers for both and fetching per node would download the same
+    // bytes once per copy.
+    let mut wanted = BTreeSet::new();
     let missing: Vec<(&PackageId, &ResolvedPackage)> = graph
         .packages
         .iter()
         .filter(|(_, package)| !store.contains(&package.integrity))
+        .filter(|(_, package)| wanted.insert(package.integrity.to_ssri()))
         .collect();
 
     if missing.is_empty() {
