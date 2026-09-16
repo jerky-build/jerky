@@ -50,7 +50,7 @@ use crate::integrity::{Integrity, IntegrityError};
 use crate::pool;
 use crate::range::{Range, RangeError};
 use crate::registry::{
-    Freshness, MAX_CONCURRENT_FETCHES, Packument, RegistryClient, RegistryError,
+    Freshness, MAX_CONCURRENT_FETCHES, Packument, RegistryClient, RegistryError, VersionMetadata,
 };
 
 /// The protocol marking a dependency as a workspace member rather than a
@@ -248,6 +248,32 @@ impl std::fmt::Display for PackageId {
     }
 }
 
+/// Read a version's published peers into the graph's own shape.
+///
+/// `peerDependenciesMeta` may name a peer that `peerDependencies` does not
+/// declare. That is meaningless rather than malformed — the registry has
+/// published worse — so the declaration drives the pairing and a meta entry
+/// with nothing to flag is simply never read.
+fn declared_peers(metadata: &VersionMetadata) -> BTreeMap<String, DeclaredPeer> {
+    metadata
+        .peer_dependencies
+        .iter()
+        .map(|(name, range)| {
+            let optional = metadata
+                .peer_dependencies_meta
+                .get(name)
+                .is_some_and(|meta| meta.optional);
+            (
+                name.clone(),
+                DeclaredPeer {
+                    range: range.clone(),
+                    optional,
+                },
+            )
+        })
+        .collect()
+}
+
 /// Split a rendered [`PackageId`] key into its name and version, discarding
 /// any peer suffix.
 ///
@@ -293,6 +319,29 @@ pub struct ResolvedPackage {
     pub integrity: Integrity,
     /// What this package calls a dependency -> the node it resolved to.
     pub dependencies: BTreeMap<String, PackageId>,
+    /// What this package requires of its consumer, exactly as published.
+    ///
+    /// Carried rather than resolved by the walk, because a peer is not an edge
+    /// to follow: it is a constraint answered by whoever installs this package,
+    /// and the walk has no idea who that is. The peer pass does.
+    ///
+    /// Recorded even for packages whose peers all turn out to be satisfied, so
+    /// that a diagnostic can be recomputed later from the graph alone.
+    pub declared_peers: BTreeMap<String, DeclaredPeer>,
+}
+
+/// One `peerDependencies` entry, with the flag `peerDependenciesMeta` carries
+/// for it.
+///
+/// A pair rather than two parallel maps, because a range with no optionality
+/// and an optionality with no range are both meaningless, and keeping them
+/// together means no consumer can read one and forget the other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredPeer {
+    pub range: String,
+    /// `peerDependenciesMeta[name].optional`. An unsatisfied optional peer is
+    /// silent; an unsatisfied required one is a diagnostic.
+    pub optional: bool,
 }
 
 /// A workspace-relative directory that declares dependencies. `.` is the
@@ -1108,6 +1157,7 @@ impl<'a> Walk<'a> {
                 resolved,
                 integrity,
                 dependencies: BTreeMap::new(),
+                declared_peers: declared_peers(metadata),
             },
         );
 

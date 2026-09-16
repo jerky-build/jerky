@@ -195,7 +195,7 @@ use std::time::Duration;
 
 use crate::integrity::Integrity;
 use crate::registry::{
-    Dist, Fetched, Freshness, Packument, RegistryClient, RegistryError, VersionMetadata,
+    Dist, Fetched, Freshness, Packument, PeerMeta, RegistryClient, RegistryError, VersionMetadata,
 };
 
 /// One version in a fixture: its number and the dependencies it declares.
@@ -402,6 +402,53 @@ impl FixtureRegistry {
 
         self.tarballs.insert(url, tarball);
         self.register(name, version, metadata);
+        self
+    }
+
+    /// Declare peers on a version that is already registered.
+    ///
+    /// Separate from the builders that register a version, rather than a
+    /// parameter on each of them: peers appear in a handful of tests and
+    /// nowhere else, and threading an almost-always-empty argument through
+    /// every call site would cost every existing fixture a `&[]`.
+    ///
+    /// Each entry is `(name, range, optional)`.
+    pub fn declaring_peers(
+        mut self,
+        name: &str,
+        version: &str,
+        peers: &[(&str, &str, bool)],
+    ) -> Self {
+        let amend = |metadata: &mut VersionMetadata| {
+            for (peer, range, optional) in peers {
+                metadata
+                    .peer_dependencies
+                    .insert(peer.to_string(), range.to_string());
+                if *optional {
+                    metadata
+                        .peer_dependencies_meta
+                        .insert(peer.to_string(), PeerMeta { optional: true });
+                }
+            }
+        };
+
+        // Both copies, because `register` cloned the metadata into each and a
+        // fixture that amended only one would resolve differently depending on
+        // whether the packument or the version map was consulted.
+        if let Some(metadata) = self
+            .versions
+            .get_mut(&(name.to_string(), version.to_string()))
+        {
+            amend(metadata);
+        }
+        if let Some(metadata) = self
+            .packuments
+            .get_mut(name)
+            .and_then(|packument| packument.versions.get_mut(version))
+        {
+            amend(metadata);
+        }
+
         self
     }
 

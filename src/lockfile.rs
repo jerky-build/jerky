@@ -378,6 +378,11 @@ pub fn load(project_dir: &Path) -> Result<Option<ResolvedGraph>, LockfileError> 
                 resolved: entry.resolved,
                 integrity,
                 dependencies,
+                // A version 1 lockfile records no peers, so a graph read back
+                // from one declares none. Recording them is #103's job; until
+                // then a reused graph simply has nothing for the peer pass to
+                // find, which is exactly what a peer-blind lockfile means.
+                declared_peers: BTreeMap::new(),
             },
         );
     }
