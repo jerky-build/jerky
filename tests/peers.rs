@@ -281,6 +281,44 @@ fn a_peer_cycle_terminates_without_dangling_edges() {
 }
 
 #[test]
+fn pruning_keeps_every_node_a_peer_names() {
+    // `reachable` follows dependencies and not peers, and needs no second half
+    // for them: under the nearest-ancestor rule a peer is answered from
+    // something already in scope, so whoever provided it declared it as a
+    // dependency and the pruner reaches it that way. Here that is `app` — the
+    // importer asks for nothing else, and `react` survives the prune because
+    // `app` depends on it rather than because `plugin` peers it.
+    //
+    // Worth pinning because the failure is silent: a pruned peer target leaves
+    // the linker an edge into a package nothing ever unpacked.
+    let registry = FixtureRegistry::new()
+        .with_tree(&[
+            ("app", "1.0.0", &[("plugin", "^1.0.0"), ("react", "18.2.0")]),
+            ("plugin", "1.0.0", &[]),
+            ("react", "18.2.0", &[]),
+        ])
+        .with_declared_peers("plugin", "1.0.0", &[("react", ">=17", false)]);
+
+    let graph = resolve(&registry, &roots(&[("app", "^1.0.0")]), &no_members()).unwrap();
+    let (graph, unsatisfied) = resolve_peers(graph);
+    assert!(unsatisfied.is_empty(), "{unsatisfied:?}");
+    let before = keys(&graph);
+
+    let pruned = graph.reachable();
+
+    assert_eq!(keys(&pruned), before, "pruning dropped a node");
+    for package in pruned.packages.values() {
+        for (name, target) in &package.peers {
+            assert!(
+                pruned.packages.contains_key(target),
+                "{} peers {name} -> {target}, which the prune removed",
+                package.id
+            );
+        }
+    }
+}
+
+#[test]
 fn an_unsatisfied_optional_peer_is_silent() {
     let registry = FixtureRegistry::new()
         .with_tree(&[("vite", "5.0.0", &[])])
