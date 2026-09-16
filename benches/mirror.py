@@ -238,6 +238,10 @@ class Handler(BaseHTTPRequestHandler):
     recording = None
     base_url = None
 
+    # Seconds to wait before answering, modelling a registry that is not on
+    # this machine. Zero is the default and the historical behaviour.
+    delay = 0.0
+
     def log_message(self, *_args):
         """Silence the per-request access log: thousands of lines of it cost
         real time in the middle of something being timed."""
@@ -272,6 +276,24 @@ class Handler(BaseHTTPRequestHandler):
         self.send_bytes(404, body, "text/plain")
 
     def do_GET(self):  # noqa: N802 - the name is BaseHTTPRequestHandler's
+        # Before the response is built, so it is a *round trip* being modelled
+        # rather than a slow disk. A recording served from loopback out of the
+        # page cache answers in well under a millisecond, which makes the
+        # mirror an excellent instrument for anything CPU-bound and a useless
+        # one for anything whose cost is waiting — there is no latency present
+        # for an overlap, a cache or a pipeline to remove. Real registries sit
+        # tens of milliseconds away and that is the regime those changes are
+        # for, so it has to be expressible here or their effect cannot be
+        # measured at all.
+        #
+        # Latency only, and deliberately not bandwidth. A delay per request is
+        # one number with one meaning, and it is the half that separates a
+        # design that overlaps its waiting from one that does not. Throttling
+        # bytes as well would model a real link more closely and would make
+        # every row depend on a second invented constant.
+        if self.delay:
+            time.sleep(self.delay)
+
         path = self.path.split("?", 1)[0]
         try:
             if path.endswith(".tgz"):
@@ -413,6 +435,7 @@ def serve(args):
 
     Handler.recording = recording
     Handler.base_url = "http://127.0.0.1:%d" % port
+    Handler.delay = max(0.0, getattr(args, "delay", 0.0)) / 1000.0
 
     if args.port_file:
         # Written after the bind and through a rename, so a reader that sees
@@ -423,8 +446,13 @@ def serve(args):
         os.replace(temporary, args.port_file)
 
     sys.stderr.write(
-        "mirror: serving %s on %s%s\n"
-        % (recording.root, Handler.base_url, " (recording)" if args.record else "")
+        "mirror: serving %s on %s%s%s\n"
+        % (
+            recording.root,
+            Handler.base_url,
+            " (recording)" if args.record else "",
+            " (+%gms per request)" % (Handler.delay * 1000) if Handler.delay else "",
+        )
     )
     sys.stderr.flush()
     try:
@@ -462,6 +490,14 @@ def main(argv):
     )
     serve_parser.add_argument(
         "--upstream", default=None, help="registry to record from (default %s)" % DEFAULT_UPSTREAM
+    )
+    serve_parser.add_argument(
+        "--delay",
+        type=float,
+        default=0.0,
+        metavar="MS",
+        help="wait this many milliseconds before answering each request, "
+        "modelling a registry that is not on this machine",
     )
     serve_parser.set_defaults(run=serve)
 
