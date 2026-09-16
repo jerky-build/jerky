@@ -14,7 +14,7 @@ use thiserror::Error;
 use crate::integrity::Integrity;
 use crate::resolver::{
     Dependency, Importer, ImporterPath, Kind, PackageId, Resolution, ResolvedGraph,
-    ResolvedPackage, split_name_and_version,
+    ResolvedPackage, split_key, split_name_and_version,
 };
 
 pub const LOCKFILE_NAME: &str = "jerky-lock.json";
@@ -324,11 +324,15 @@ pub fn load(project_dir: &Path) -> Result<Option<ResolvedGraph>, LockfileError> 
 
     let mut packages = BTreeMap::new();
     for (key, entry) in on_disk.packages {
-        let (name, keyed_version) =
-            split_name_and_version(&key).ok_or_else(|| LockfileError::BadKey {
-                path: path.clone(),
-                entry: key.clone(),
-            })?;
+        // `split_key`, not `split_name_and_version`: this is a *key*, and a
+        // key may carry a peer suffix. The suffix is deliberately dropped
+        // here — it only ever exists to keep two peer resolutions of one
+        // version apart, and what those peers were is recorded in a field of
+        // its own rather than re-parsed out of the name.
+        let (name, keyed_version) = split_key(&key).ok_or_else(|| LockfileError::BadKey {
+            path: path.clone(),
+            entry: key.clone(),
+        })?;
 
         // The key and the entry state the version twice, so they can disagree.
         // Trusting one and ignoring the other lets two keys collapse into one
@@ -349,27 +353,19 @@ pub fn load(project_dir: &Path) -> Result<Option<ResolvedGraph>, LockfileError> 
                 source,
             })?;
 
-        let id = PackageId {
-            name: name.to_string(),
-            version: entry.version.clone(),
-        };
+        let id = PackageId::plain(name, entry.version.as_str());
 
         let dependencies = entry
             .dependencies
             .iter()
             .map(|(dep_name, recorded)| {
-                // `split_key` or nothing, exactly as the importer block reads
-                // its own value: a bare version carries no `@`, so anything
-                // that splits is an alias naming the package it resolved to.
+                // `split_name_and_version` or nothing, exactly as the
+                // importer block reads its own value: a bare version carries
+                // no `@`, so anything that splits is an alias naming the
+                // package it resolved to.
                 let id = match split_name_and_version(recorded) {
-                    Some((aliased, version)) => PackageId {
-                        name: aliased.to_string(),
-                        version: version.to_string(),
-                    },
-                    None => PackageId {
-                        name: dep_name.clone(),
-                        version: recorded.clone(),
-                    },
+                    Some((aliased, version)) => PackageId::plain(aliased, version),
+                    None => PackageId::plain(dep_name.as_str(), recorded.as_str()),
                 };
                 (dep_name.clone(), id)
             })
@@ -452,14 +448,8 @@ pub fn load(project_dir: &Path) -> Result<Option<ResolvedGraph>, LockfileError> 
                     // the name whenever it differs, and only falls back to the
                     // key when it does not.
                     let id = match split_name_and_version(&dependency.version) {
-                        Some((aliased_name, version)) => PackageId {
-                            name: aliased_name.to_string(),
-                            version: version.to_string(),
-                        },
-                        None => PackageId {
-                            name: name.clone(),
-                            version: dependency.version.clone(),
-                        },
+                        Some((aliased_name, version)) => PackageId::plain(aliased_name, version),
+                        None => PackageId::plain(name.as_str(), dependency.version.as_str()),
                     };
 
                     // Keyed lookup rather than a scan: `packages` is already a

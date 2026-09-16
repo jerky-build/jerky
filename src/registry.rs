@@ -77,8 +77,40 @@ pub struct VersionMetadata {
     /// There is deliberately no `devDependencies` field. A dependency's dev
     /// dependencies must never be followed — doing so pulls in most of the
     /// registry — and a field that exists is a field someone will read.
+    ///
+    /// There is deliberately no `optionalDependencies` field either, for the
+    /// second half of that reason: they ride in the same response, they are
+    /// out of scope for peer support, and leaving them unparsed is what keeps
+    /// them unimplemented rather than half-implemented.
     #[serde(default)]
     pub dependencies: BTreeMap<String, String>,
+    /// What this package requires of its consumer's environment.
+    ///
+    /// Not an edge to resolve. `react-dom` declaring `react` here means
+    /// "whoever installs me must give me a compatible react", and the answer
+    /// depends on what that consumer already has — which is why this is read
+    /// and then handed to a pass over the finished graph rather than walked.
+    #[serde(default, rename = "peerDependencies")]
+    pub peer_dependencies: BTreeMap<String, String>,
+    /// Flags on the peers above. Only `optional` exists, and only its `true`
+    /// case does anything: an unsatisfied optional peer is silent where a
+    /// required one warns.
+    ///
+    /// An entry naming a peer that `peer_dependencies` does not declare is
+    /// meaningless rather than malformed, and is simply never read.
+    #[serde(default, rename = "peerDependenciesMeta")]
+    pub peer_dependencies_meta: BTreeMap<String, PeerMeta>,
+}
+
+/// One peer's flags, as `peerDependenciesMeta` carries them.
+///
+/// There is deliberately no field for anything but `optional`. The key is
+/// published as an object so it can grow, and everything it might grow is
+/// something jerky would have to decide about before reading.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct PeerMeta {
+    #[serde(default)]
+    pub optional: bool,
 }
 
 /// Every published version of one package, in the registry's abbreviated form.
@@ -720,6 +752,100 @@ mod tests {
         assert!(
             !metadata.dependencies.contains_key("test-only-dep"),
             "a devDependency leaked into the runtime dependency map"
+        );
+    }
+
+    #[test]
+    fn peer_dependencies_are_read_off_the_abbreviated_packument() {
+        // Verified against the live registry: react-dom@18.2.0 returns
+        // peerDependencies in the abbreviated form jerky already asks for, so
+        // this needs no second request for a full packument.
+        let raw = r#"{
+            "name": "react-dom", "version": "18.2.0",
+            "dist": { "tarball": "https://r.test/a.tgz" },
+            "dependencies": { "scheduler": "^0.23.0" },
+            "peerDependencies": { "react": "^18.2.0" }
+        }"#;
+
+        let metadata: VersionMetadata = serde_json::from_str(raw).unwrap();
+
+        assert_eq!(metadata.peer_dependencies["react"], "^18.2.0");
+        assert_eq!(
+            metadata.dependencies["scheduler"], "^0.23.0",
+            "a peer must not land in the runtime dependency map"
+        );
+    }
+
+    #[test]
+    fn peer_dependencies_meta_marks_a_peer_optional() {
+        // vite's latest publishes seven optional peers this way.
+        let raw = r#"{
+            "name": "vite", "version": "5.0.0",
+            "dist": { "tarball": "https://r.test/a.tgz" },
+            "peerDependencies": { "terser": "^5.4.0", "sass": "^1.0.0" },
+            "peerDependenciesMeta": { "terser": { "optional": true }, "sass": {} }
+        }"#;
+
+        let metadata: VersionMetadata = serde_json::from_str(raw).unwrap();
+
+        assert!(metadata.peer_dependencies_meta["terser"].optional);
+        assert!(
+            !metadata.peer_dependencies_meta["sass"].optional,
+            "an empty meta object leaves the peer required"
+        );
+    }
+
+    #[test]
+    fn a_version_with_no_peer_fields_parses_with_both_maps_empty() {
+        // The overwhelmingly common case, and the one that must not regress.
+        let raw = r#"{
+            "name": "lodash", "version": "4.17.21",
+            "dist": { "tarball": "https://r.test/a.tgz" }
+        }"#;
+
+        let metadata: VersionMetadata = serde_json::from_str(raw).unwrap();
+
+        assert!(metadata.peer_dependencies.is_empty());
+        assert!(metadata.peer_dependencies_meta.is_empty());
+    }
+
+    #[test]
+    fn meta_naming_a_peer_that_is_not_declared_is_ignored_rather_than_fatal() {
+        // Meaningless rather than malformed, and the registry has published
+        // worse. Nothing downstream reads the entry, because the peer it names
+        // is never walked.
+        let raw = r#"{
+            "name": "a", "version": "1.0.0",
+            "dist": { "tarball": "https://r.test/a.tgz" },
+            "peerDependencies": { "real": "^1.0.0" },
+            "peerDependenciesMeta": { "ghost": { "optional": true } }
+        }"#;
+
+        let metadata: VersionMetadata = serde_json::from_str(raw).unwrap();
+
+        assert_eq!(metadata.peer_dependencies.len(), 1);
+        assert!(!metadata.peer_dependencies.contains_key("ghost"));
+    }
+
+    #[test]
+    fn optional_dependencies_are_dropped_at_deserialization() {
+        // They ride in the same abbreviated response as peers — vite's latest
+        // carries both — and they are deliberately out of scope for peer
+        // support. A field that exists is a field someone will read, so the
+        // way to keep them unimplemented is to keep them unparsed.
+        let raw = r#"{
+            "name": "a", "version": "1.0.0",
+            "dist": { "tarball": "https://r.test/a.tgz" },
+            "dependencies": { "runtime-dep": "^1.0.0" },
+            "optionalDependencies": { "fsevents": "^2.3.0" }
+        }"#;
+
+        let metadata: VersionMetadata = serde_json::from_str(raw).unwrap();
+
+        assert_eq!(metadata.dependencies.len(), 1);
+        assert!(
+            !metadata.dependencies.contains_key("fsevents"),
+            "an optionalDependency leaked into the runtime dependency map"
         );
     }
 

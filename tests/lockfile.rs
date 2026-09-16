@@ -681,10 +681,7 @@ fn an_alias_survives_a_save_and_load_cycle() {
     )
     .unwrap();
 
-    let real = PackageId {
-        name: "safe-execa".to_string(),
-        version: "0.3.0".to_string(),
-    };
+    let real = PackageId::plain("safe-execa", "0.3.0");
     let mut importer = Importer::default();
     importer.dependencies.insert(
         "execa".to_string(),
