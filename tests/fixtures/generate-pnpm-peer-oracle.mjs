@@ -247,6 +247,33 @@ function recordPnpm(lock, tree) {
     importers[at] = sorted(Object.entries(links));
   }
 
+  // Every node has to be reachable from an importer through the edges this
+  // recording keeps, or the fixture asks jerky for a node it has no route to
+  // and the parity test fails for a reason that is nothing to do with peers.
+  //
+  // The way that happens is `optionalDependencies`, which `recordPackages`
+  // drops on purpose: pnpm resolves the ones this platform wants and lists
+  // them as snapshots, and nothing here would then name them. None of the
+  // trees below has one, and this is what stops the next one from being added
+  // without noticing.
+  const reached = new Set();
+  const walk = (at) => {
+    if (reached.has(at)) return;
+    reached.add(at);
+    for (const next of Object.values(nodes[at].dependencies)) walk(next);
+    for (const next of Object.values(nodes[at].peers)) walk(next);
+  };
+  for (const links of Object.values(importers)) Object.values(links).forEach(walk);
+
+  const stranded = nodes.filter((node) => !reached.has(node.id));
+  if (stranded.length > 0) {
+    throw new Error(
+      `${tree.name}: no importer reaches ${stranded
+        .map((node) => `${node.name}@${node.version}`)
+        .join(", ")} — an optionalDependency, most likely`,
+    );
+  }
+
   return { nodes, importers };
 }
 

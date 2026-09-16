@@ -937,15 +937,13 @@ impl PeerPass<'_> {
         // than as long as `&mut self`.
         let source = self.source;
 
+        let instance = self.instance_of(id, providers);
+
         let Some(package) = source.packages.get(id) else {
             // Nothing a walk produces, but a hand-written lockfile can name an
-            // edge it does not record. Returning a bare instance lets the
+            // edge it does not record. Recording the bare instance lets the
             // lockfile's own validation report that, rather than this pass
             // panicking on it first.
-            let instance = Instance {
-                package: id.clone(),
-                environment: BTreeMap::new(),
-            };
             self.instances.entry(instance.clone()).or_insert(Copy_ {
                 own: BTreeMap::new(),
                 dependencies: BTreeMap::new(),
@@ -955,18 +953,6 @@ impl PeerPass<'_> {
 
         let mut chain: Vec<&BTreeMap<String, PackageId>> = providers.to_vec();
         chain.push(&package.dependencies);
-
-        let environment = self
-            .needed
-            .get(id)
-            .into_iter()
-            .flatten()
-            .filter_map(|name| provider_of(name, &chain).map(|(_, found)| (name.clone(), found)))
-            .collect();
-        let instance = Instance {
-            package: id.clone(),
-            environment,
-        };
 
         if self.instances.contains_key(&instance) {
             return instance;
@@ -1081,8 +1067,17 @@ impl PeerPass<'_> {
                     peers: copy
                         .own
                         .iter()
-                        .filter_map(|(name, provider)| {
-                            Some((name.clone(), self.identities.get(provider)?.clone()))
+                        .map(|(name, provider)| {
+                            // Named, necessarily: a provider is an ancestor's
+                            // own dependency or an importer's, so whatever
+                            // reached this node reached it too. Asserted
+                            // rather than skipped, because dropping the edge
+                            // while `id.context` still names the peer is the
+                            // silent half of the bug this field just had.
+                            let id = self.identities.get(provider).unwrap_or_else(|| {
+                                panic!("peer {name} of {} was never named", instance.package)
+                            });
+                            (name.clone(), id.clone())
                         })
                         .collect(),
                 },
@@ -1116,7 +1111,11 @@ impl PeerPass<'_> {
             };
 
             if satisfies(&provider.version, &declared.range) {
-                own.insert(name.clone(), self.instance_at(&provider, chain, frame));
+                // Truncated at the frame that named it, because that is what
+                // was above the provider when the walk reached it. Slicing
+                // here rather than passing the index down keeps the cut beside
+                // the chain it cuts — the two are meaningless apart.
+                own.insert(name.clone(), self.instance_of(&provider, &chain[..=frame]));
                 continue;
             }
 
@@ -1131,21 +1130,17 @@ impl PeerPass<'_> {
         own
     }
 
-    /// Which copy of a provider answered, given the frame it was found in.
+    /// Which copy of a package sits below `providers`.
     ///
-    /// A peer is answered by a node somewhere up the chain, and that node may
-    /// itself exist several times over. Which copy it is follows from where it
-    /// sits: [`Self::discover`] reached it with the chain as far as the frame
-    /// that named it, plus its own dependencies, and an instance is nothing
-    /// but its package and that environment. Recomputed here rather than
-    /// remembered, so there is one definition of what an instance *is* and no
-    /// second copy of it to fall out of step.
-    fn instance_at(
-        &self,
-        id: &PackageId,
-        chain: &[&BTreeMap<String, PackageId>],
-        frame: usize,
-    ) -> Instance {
+    /// The one definition of what an instance *is*: the package, plus a
+    /// provider for every peer name its subtree can ask about, looked up in
+    /// what is visible from where it sits — the frames above it, then its own
+    /// dependencies. [`Self::discover`] asks this of the node it is walking
+    /// into; [`Self::own_peers`] asks it of a provider it found partway up the
+    /// chain, handing over only the frames that were above *that*. A second
+    /// spelling of this would be a second answer to "are these the same copy",
+    /// which is the question the whole pass turns on.
+    fn instance_of(&self, id: &PackageId, providers: &[&BTreeMap<String, PackageId>]) -> Instance {
         let Some(package) = self.source.packages.get(id) else {
             return Instance {
                 package: id.clone(),
@@ -1153,7 +1148,7 @@ impl PeerPass<'_> {
             };
         };
 
-        let mut visible: Vec<&BTreeMap<String, PackageId>> = chain[..=frame].to_vec();
+        let mut visible: Vec<&BTreeMap<String, PackageId>> = providers.to_vec();
         visible.push(&package.dependencies);
 
         let environment = self

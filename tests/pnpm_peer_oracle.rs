@@ -141,6 +141,13 @@ impl Graph {
     /// down: jerky keys an instance on everything its subtree can see, which
     /// is finer than it strictly needs to be, and the copies that come of that
     /// are indistinguishable once resolved.
+    ///
+    /// It is worth being clear about which way that blinds the comparison. An
+    /// *extra* copy of a subtree already present goes unseen, which is the
+    /// tolerance above. A *lost* one does not: two nodes collapsed into one —
+    /// by a context hash colliding, spec §12's open question, or by a key that
+    /// fails to tell them apart — removes a rendering pnpm still has, and that
+    /// reads as "pnpm resolved a node jerky did not".
     fn answer(&self) -> (BTreeSet<String>, BTreeMap<String, BTreeMap<String, String>>) {
         let nodes = (0..self.nodes.len())
             .map(|at| self.render(at, &mut Vec::new()))
@@ -308,18 +315,32 @@ fn divergences(tree: &Tree) -> Vec<String> {
         divergences.push(format!("pnpm resolved a node jerky did not: {node}"));
     }
 
-    for (at, theirs) in &their_importers {
-        let Some(mine) = my_importers.get(at) else {
-            divergences.push(format!("jerky has no importer `{at}`"));
-            continue;
-        };
-        for (name, target) in theirs {
-            match mine.get(name) {
-                None => divergences.push(format!("importer `{at}` links no `{name}`")),
-                Some(got) if got != target => divergences.push(format!(
-                    "importer `{at}` links {name} to {got}, pnpm to {target}"
-                )),
-                Some(_) => {}
+    // Both directions, at both levels. An importer jerky invented, or a link
+    // it added under one both sides have, is as much a disagreement as a
+    // missing one — and walking only pnpm's side would see neither.
+    let paths: BTreeSet<&String> = my_importers.keys().chain(their_importers.keys()).collect();
+    for at in paths {
+        match (my_importers.get(at), their_importers.get(at)) {
+            (None, _) => {
+                divergences.push(format!("pnpm has an importer `{at}` and jerky does not"))
+            }
+            (_, None) => {
+                divergences.push(format!("jerky has an importer `{at}` and pnpm does not"))
+            }
+            (Some(mine), Some(theirs)) => {
+                let names: BTreeSet<&String> = mine.keys().chain(theirs.keys()).collect();
+                for name in names {
+                    match (mine.get(name), theirs.get(name)) {
+                        (Some(mine), Some(theirs)) if mine != theirs => divergences.push(format!(
+                            "importer `{at}` links {name} to {mine}, pnpm to {theirs}"
+                        )),
+                        (Some(_), None) => divergences
+                            .push(format!("importer `{at}` links a `{name}` pnpm does not")),
+                        (None, Some(_)) => divergences
+                            .push(format!("importer `{at}` links no `{name}`, pnpm does")),
+                        _ => {}
+                    }
+                }
             }
         }
     }
@@ -412,31 +433,47 @@ fn exhibits(tree: &Tree, phenomenon: Phenomenon) -> bool {
             .expect("every node names a recorded package")
     };
 
-    // Who could have answered a peer for `name`: a package that depends on it,
-    // or an importer that does. Which of the two it is separates the first two
-    // phenomena, and is a property of the tree rather than of the walk.
-    let provided_by_importer = |name: &str| {
+    // Who answered a peer, matched against the edge's actual target rather
+    // than against the name alone. "Some importer declares react" and "this
+    // node's react came from an importer" are different claims, and only the
+    // second is the phenomenon; the first would be satisfied by any tree that
+    // happened to mention the name anywhere.
+    let importer_answered = |name: &str, target: usize| {
+        tree.pnpm
+            .importers
+            .values()
+            .any(|links| links.get(name) == Some(&target))
+    };
+    let package_answered = |name: &str, target: usize| {
+        tree.pnpm
+            .nodes
+            .iter()
+            .any(|node| node.dependencies.get(name) == Some(&target))
+    };
+
+    // And the other half: that nothing of the *other* kind could have answered
+    // it, which is what makes the two exclusive rather than merely different.
+    let declared_by_importer = |name: &str| {
         tree.importers
             .values()
             .any(|section| section.contains_key(name))
     };
-    let provided_by_package = |name: &str| {
-        tree.pnpm
-            .nodes
+    let declared_by_package = |name: &str| {
+        tree.packages
             .iter()
-            .any(|node| node.dependencies.contains_key(name))
+            .any(|package| package.dependencies.contains_key(name))
     };
 
     match phenomenon {
         Phenomenon::ImporterSatisfied => tree.pnpm.nodes.iter().any(|node| {
-            node.peers
-                .keys()
-                .any(|peer| provided_by_importer(peer) && !provided_by_package(peer))
+            node.peers.iter().any(|(peer, target)| {
+                importer_answered(peer, *target) && !declared_by_package(peer)
+            })
         }),
         Phenomenon::AncestorSatisfied => tree.pnpm.nodes.iter().any(|node| {
-            node.peers
-                .keys()
-                .any(|peer| provided_by_package(peer) && !provided_by_importer(peer))
+            node.peers.iter().any(|(peer, target)| {
+                package_answered(peer, *target) && !declared_by_importer(peer)
+            })
         }),
         Phenomenon::DuplicatedByPeers => tree.pnpm.nodes.iter().any(|node| {
             tree.pnpm.nodes.iter().any(|other| {
@@ -531,6 +568,25 @@ fn a_deliberately_wrong_expectation_is_caught() {
     assert!(
         !divergences(&relinked).is_empty(),
         "an importer linked to the wrong copy went unnoticed"
+    );
+
+    let unlinked = {
+        // A link jerky makes that the expectation does not. The other three
+        // perturbations all take something away from jerky's side or move it;
+        // this is the only one where jerky has *more*, and a comparison that
+        // walked pnpm's importers and looked each up in jerky's would find
+        // nothing wrong with it.
+        let mut tree = tree_named(&oracle, "peer-duplication-across-importers");
+        tree.pnpm
+            .importers
+            .get_mut("packages/react17")
+            .unwrap()
+            .remove("react");
+        tree
+    };
+    assert!(
+        !divergences(&unlinked).is_empty(),
+        "an importer link jerky made and pnpm did not went unnoticed"
     );
 }
 
