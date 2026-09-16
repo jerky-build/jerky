@@ -172,10 +172,10 @@ Then, against the diff:
   this rule exists to prevent: it is a directory reaching the store or a
   project at whatever the umask allowed, and the reason the rule needs one
   owner rather than a grep over four copies. Directories aside, no `unpack`
-  writes a path that reaches
-  the store or a project without an explicit mode set after it. Run the suite
-  under `umask 0` as well as the default — a strict umask hides every
-  directory-mode hole, so the usual run proves nothing about them.
+  writes a path that reaches the store or a project without an explicit mode
+  set after it. Run the suite under `umask 0` as well as the default — a strict
+  umask hides every directory-mode hole, so the usual run proves nothing about
+  them.
 - No `#[cfg(windows)]` or `#[cfg(not(unix))]`. jerky targets WSL, Linux and
   macOS; a fallback for a platform nothing runs on is a second definition to
   keep in agreement with the first, for nobody.
