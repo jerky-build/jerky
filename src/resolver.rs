@@ -1011,23 +1011,21 @@ impl PeerPass<'_> {
         // one. The found id is finite, and is what makes a cyclic context
         // spellable at all. `peers` records the final id, which is the answer
         // anything reading the graph wants; a name cannot.
-        let mut context: BTreeMap<String, PackageId> = copy
+        let own: BTreeMap<String, PackageId> = copy
             .own
             .iter()
             .map(|(name, provider)| (name.clone(), provider.package.clone()))
             .collect();
-        for (name, dependency) in &copy.dependencies {
-            if let Some(id) = self.identify(dependency)
-                && !id.context.is_empty()
-            {
-                context.insert(name.clone(), id);
-            }
-        }
+        let named: Vec<(String, PackageId)> = copy
+            .dependencies
+            .iter()
+            .filter_map(|(name, dependency)| Some((name.clone(), self.identify(dependency)?)))
+            .collect();
 
         let id = PackageId {
             name: instance.package.name.clone(),
             version: instance.package.version.clone(),
-            context,
+            context: context_of(own, named),
         };
 
         self.identifying.remove(instance);
@@ -1181,6 +1179,37 @@ impl PeerPass<'_> {
                 found,
             });
     }
+}
+
+/// What names a node: its own resolved peers, plus every dependency that
+/// itself carries a context.
+///
+/// The second half is the one easy to leave out, and leaving it out is silent:
+/// a package declaring no peers at all is still duplicated by one deeper down,
+/// so two copies pointing at different subtrees would key identically and
+/// `ResolvedGraph::packages` would keep one and drop the other's whole subtree.
+/// A dependency's entry wins over a peer of the same name, which is the order
+/// [`PeerPass::own_peers`] already resolves in — a package shipping a fallback
+/// for a peer it would rather take from above gets its own copy.
+///
+/// Shared with the lockfile deliberately. This is a *rule* with two readers —
+/// the pass that names a node and the load that rebuilds the name from what
+/// was recorded — and the two must agree forever, or a node is written back
+/// under a key it was never read from and every install renames directories
+/// nothing asked it to touch. One spelling is how that is guaranteed rather
+/// than remembered, which is the argument `split_name_and_version` already
+/// makes about having one decoder for one encoder.
+pub(crate) fn context_of(
+    own: BTreeMap<String, PackageId>,
+    dependencies: impl IntoIterator<Item = (String, PackageId)>,
+) -> BTreeMap<String, PackageId> {
+    let mut context = own;
+    for (name, id) in dependencies {
+        if !id.context.is_empty() {
+            context.insert(name, id);
+        }
+    }
+    context
 }
 
 /// Find who provides `name`, nearest frame first, and which frame that was.

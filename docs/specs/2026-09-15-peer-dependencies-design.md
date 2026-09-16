@@ -78,9 +78,10 @@ an error on the second peer resolution — is not a simpler design but a wrong
 one: two build tools each pinning a different `typescript` is routine.
 
 **The identity change is paid now, while the format is young.** `PackageId`
-gains a peer context and `LOCKFILE_VERSION` goes to 2. There is one released
-format version and few committed lockfiles in the world; retrofitting identity
-later costs strictly more.
+gains a peer context, and the lockfile format changes to match without a
+version bump — jerky has shipped no 1.0, so there is no committed population a
+version number could distinguish. Retrofitting identity after a release would
+cost strictly more.
 
 **Version selection never depends on peer resolution.** This falls out of the
 first decision and is the load-bearing consequence of it: because peers are
@@ -96,7 +97,7 @@ adds no registry traffic and needs no change to `Walk`.
 - Optional peers: declared-optional and unsatisfied is silent, not a warning
 - A peer resolution pass over the resolved graph, duplicating nodes by peer context
 - `PackageId` carrying a peer context, and the directory / lockfile-key spelling of one
-- Lockfile version 2: resolved peers and declared peers
+- The lockfile records resolved peers and declared peers
 - Warnings for unsatisfied required peers, surfaced on every install
 - A committed pnpm parity oracle for the resolution rule
 
@@ -227,7 +228,7 @@ a@1.0.0(b@2.0.0(c@3.0.0))(d@4.0.0)
 - **The empty-peer-set spelling is byte-identical to today's `name@version`.**
   This is a requirement, not an observation. It keeps the change invisible for
   every package without peers — which is nearly all of them — so a lockfile
-  regenerated under version 2 differs only where peers actually appear, and
+  regenerated after this change differs only where peers actually appear, and
   every existing test asserting a key keeps asserting the same string.
 
 ### The hash fallback
@@ -348,7 +349,7 @@ would lose its batching, and the cycle-termination argument would have to be
 rewritten. Two cheap passes beat one expensive one, and the second pass costs no
 network at all.
 
-## 7. The lockfile: version 2
+## 7. The lockfile
 
 `Entry` gains two fields:
 
@@ -390,15 +391,19 @@ Recording the diagnostics themselves instead would put derived state in a file
 whose job is recording facts, and it would go stale against a hand-edited
 manifest.
 
-`LOCKFILE_VERSION` becomes `2`, and **a version 1 file is rejected rather than
-upgraded**. It falls through to the existing `UnsupportedVersion` error. jerky
-has not shipped an MVP and nobody is holding a v1 lockfile, so a migration has
-nobody to serve; writing one would spend real design and test surface on a case
-that cannot occur. The bare-install spec set this precedent, keeping
-`lockfile_version` at `1` through a shape change on the grounds that "the format
-is unreleased, so this costs a find-and-replace now and would cost a migration
-later." The same reasoning points the other way here only because the *key*
-spelling changes, which a find-and-replace cannot cover.
+**`LOCKFILE_VERSION` stays at `1`.** jerky has not shipped a 1.0, so there is
+no population of committed lockfiles for a version number to tell apart — the
+format simply changes, and a stale file is regenerated. Bumping it would spend
+the version on a distinction nothing can observe and leave a number in the
+file's history that never separated anything.
+
+This is the precedent the bare-install spec set, keeping `lockfile_version` at
+`1` through a shape change on the grounds that "the format is unreleased, so
+this costs a find-and-replace now and would cost a migration later." It is also
+why #104 was closed: there is no version 1 population to migrate *from*, and
+with the version unchanged there is not even a version to migrate *to*.
+
+Versioning becomes real work at 1.0 and not before.
 
 ## 8. Diagnostics
 

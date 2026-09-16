@@ -310,6 +310,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   total, because the answer to one is not the answer to the other. Inside the
   window the range's fetch makes no network request at all, so what this
   actually costs is a single conditional request.
+- **The lockfile records peers.** Two new fields per package: `peers`, what
+  that node's own peer dependencies resolved to, and `declaredPeers`, the
+  ranges and optional flags the package published. Both are omitted when empty,
+  so a package with no peers — nearly all of them — writes exactly the bytes it
+  wrote before, and `lockfileVersion` stays at `1`: jerky has shipped no 1.0,
+  so there is no committed population for a version bump to distinguish.
+
+  A package resolved against peers is keyed `plugin@1.0.0(react@18.2.0)`,
+  which is pnpm's spelling, and an edge pointing at one carries the same
+  suffix. Such a package is linked with its peers beside its dependencies in
+  its own `node_modules`, which is what makes a peer importable at all when
+  nothing is hoisted.
+
+  **Only the refusal is observable yet.** Peer resolution does not run during
+  an install until unsatisfied peers are reported
+  ([#105](https://github.com/jerky-build/jerky/issues/105)), so today jerky
+  writes no `peers` block for any tree — this is the format arriving ahead of
+  the pass that fills it
+  ([#103](https://github.com/jerky-build/jerky/issues/103))
 
 ### Removed
 

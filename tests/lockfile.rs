@@ -3,6 +3,12 @@
 //! Each maps to one of the four properties #11 asked for: deterministic key
 //! ordering, minimal diff noise, a format version field from day one, and an
 //! integrity hash per package.
+//!
+//! Peers add a fifth, from #103: a node is identified by what it records
+//! rather than by the key it is recorded under. The key carries a peer suffix
+//! now, and a suffix that can be a hash is one nothing can parse back — so the
+//! tests that matter most here are the ones asking whether two keys can land
+//! on one node, and whether a file read back writes itself out unchanged.
 
 use std::collections::BTreeMap;
 
@@ -383,19 +389,19 @@ fn an_edge_resolved_later_in_the_file_is_accepted() {
 
 #[test]
 fn a_future_format_says_upgrade_rather_than_malformed() {
-    // A plausible v2 with entirely different field names. It is valid JSON, so
+    // A plausible v3 with entirely different field names. It is valid JSON, so
     // reporting a syntax error would send the user hunting for one.
     let dir = TempDir::new().unwrap();
     write_raw(
         &dir,
-        r#"{"lockfileVersion":2,"importers":{},"snapshots":{}}"#,
+        r#"{"lockfileVersion":3,"importers":{},"snapshots":{}}"#,
     );
 
     match lockfile::load(dir.path()) {
         Err(LockfileError::UnsupportedVersion {
             found, supported, ..
         }) => {
-            assert_eq!((found, supported), (2, lockfile::LOCKFILE_VERSION));
+            assert_eq!((found, supported), (3, lockfile::LOCKFILE_VERSION));
         }
         other => panic!("expected an upgrade message, got {other:?}"),
     }
@@ -877,4 +883,364 @@ fn an_importers_alias_survives_the_round_trip() {
         }
         other => panic!("expected a registry resolution, got {other:?}"),
     }
+}
+
+/// What version 1 wrote for [`small_tree`], character for character.
+///
+/// Embedded rather than generated, because the claim is about a shape that no
+/// longer exists to generate from: a graph with no peers in it must write
+/// exactly the bytes it wrote before peers existed. Peers change the file for
+/// the packages that have them and for nothing else, and every package that has
+/// none — which is nearly all of them — must not move at all.
+const VERSION_ONE_SMALL_TREE: &str = r#"{
+  "lockfileVersion": 1,
+  "importers": {
+    ".": {
+      "dependencies": {
+        "a": {
+          "specifier": "^1.0.0",
+          "version": "1.0.0"
+        }
+      }
+    }
+  },
+  "packages": {
+    "a@1.0.0": {
+      "version": "1.0.0",
+      "resolved": "https://fixture.test/a/-/a-1.0.0.tgz",
+      "integrity": "sha512-C4xmM0847OI4IsgerHv7mvHZYmzDKCEfqFyjjGgFckN7oERLIonogjsb3Mm7TOkjWEbZFKx+WYG30Wol+CpqBQ==",
+      "dependencies": {
+        "b": "1.0.0"
+      }
+    },
+    "b@1.0.0": {
+      "version": "1.0.0",
+      "resolved": "https://fixture.test/b/-/b-1.0.0.tgz",
+      "integrity": "sha512-1rWZDraHgQcWA94G7WXeMd4PhVFBjGUMgA8LD/2MS5t5DNASjbYD+gghpka6cgcvSFyYFyhcDJXH7Zi6NDP9AA=="
+    }
+  }
+}
+"#;
+
+#[test]
+fn a_tree_with_no_peers_writes_exactly_what_it_wrote_before() {
+    let registry = small_tree();
+    let dir = TempDir::new().unwrap();
+    let graph = resolve(&registry, &roots(&[("a", "^1.0.0")]), &no_members()).unwrap();
+    lockfile::save(&graph, dir.path()).unwrap();
+
+    // Byte-identical, version number included. Peers added two fields to the
+    // format and changed nothing for the packages that declare none — which is
+    // nearly all of them — so a tree without peers must still write exactly
+    // what it wrote before.
+    assert_eq!(read(&dir), VERSION_ONE_SMALL_TREE);
+}
+
+/// The peer keys this fixture produces, spelled out so a test asserting on one
+/// reads as a claim about the format rather than as string-building.
+const PLUGIN: &str = "plugin@1.0.0(react@18.2.0)";
+const WRAPPER: &str = "wrapper@1.0.0(plugin@1.0.0(react@18.2.0))";
+
+/// A resolved tree with one peer in it.
+///
+/// `plugin` peers `react`, which the importer supplies, and also peers a
+/// `react-dom` that nothing provides — optional, so silent, and recorded all
+/// the same. `wrapper` declares no peers of its own and sits above `plugin`,
+/// which is what gives the file a *dependency* edge whose target carries a
+/// suffix.
+fn peer_graph() -> jerky::resolver::ResolvedGraph {
+    let registry = FixtureRegistry::new()
+        .with_tree(&[
+            ("wrapper", "1.0.0", &[("plugin", "^1.0.0")]),
+            ("plugin", "1.0.0", &[]),
+            ("react", "18.2.0", &[]),
+        ])
+        .with_declared_peers(
+            "plugin",
+            "1.0.0",
+            &[("react", ">=17", false), ("react-dom", "^18.0.0", true)],
+        );
+
+    let graph = resolve(
+        &registry,
+        &roots(&[("wrapper", "^1.0.0"), ("react", "18.2.0")]),
+        &no_members(),
+    )
+    .unwrap();
+    let (graph, unsatisfied) = jerky::resolver::resolve_peers(graph);
+    assert!(unsatisfied.is_empty(), "{unsatisfied:?}");
+    graph
+}
+
+#[test]
+fn a_resolved_peer_lands_in_its_own_block() {
+    // Merging peers into `dependencies` would leave the format and the linker
+    // untouched, which is what makes it tempting. It would also make the
+    // recorded `dependencies` stop corresponding to what the package
+    // published, so anyone diffing this file against a real `package.json`
+    // reads edges the package never declared.
+    let dir = TempDir::new().unwrap();
+    lockfile::save(&peer_graph(), dir.path()).unwrap();
+
+    let parsed: serde_json::Value = serde_json::from_str(&read(&dir)).unwrap();
+    let plugin = &parsed["packages"][PLUGIN];
+    assert_eq!(plugin["peers"]["react"], "react@18.2.0");
+    assert!(
+        plugin["dependencies"].is_null(),
+        "a resolved peer was written as a dependency the package never declared"
+    );
+    assert!(
+        parsed["packages"]["react@18.2.0"]["peers"].is_null(),
+        "a package with no peers grew an empty block"
+    );
+}
+
+#[test]
+fn declared_peers_record_the_range_and_the_optional_flag() {
+    // The range is what makes the warning survive a cache hit: an install that
+    // reuses every importer resolves nothing, so without this the second
+    // install of an unsatisfied peer is silent.
+    let dir = TempDir::new().unwrap();
+    lockfile::save(&peer_graph(), dir.path()).unwrap();
+
+    let parsed: serde_json::Value = serde_json::from_str(&read(&dir)).unwrap();
+    let declared = &parsed["packages"][PLUGIN]["declaredPeers"];
+    assert_eq!(declared["react"]["range"], ">=17");
+    assert!(
+        declared["react"]["optional"].is_null(),
+        "`optional: false` is what saying nothing already means"
+    );
+    assert_eq!(declared["react-dom"]["range"], "^18.0.0");
+    assert_eq!(declared["react-dom"]["optional"], true);
+    // Declared and unsatisfied: what a package asked for is a fact about the
+    // package, and recording it is what lets the diagnostic be recomputed.
+    // What it resolved to is a different question with no answer here.
+    assert!(parsed["packages"][PLUGIN]["peers"]["react-dom"].is_null());
+    assert!(
+        parsed["packages"]["react@18.2.0"]["declaredPeers"].is_null(),
+        "a package declaring no peers grew an empty block"
+    );
+}
+
+#[test]
+fn peers_survive_the_round_trip_and_the_file_written_from_them_is_the_same_file() {
+    let dir = TempDir::new().unwrap();
+    let graph = peer_graph();
+    lockfile::save(&graph, dir.path()).unwrap();
+    let back = lockfile::load(dir.path()).unwrap().unwrap();
+
+    assert_eq!(back.packages.len(), graph.packages.len());
+    for (id, package) in &graph.packages {
+        let other = back
+            .packages
+            .get(id)
+            .unwrap_or_else(|| panic!("{id} came back under a different identity"));
+        assert_eq!(other.peers, package.peers);
+        assert_eq!(other.declared_peers, package.declared_peers);
+        assert_eq!(other.dependencies, package.dependencies);
+    }
+
+    // The half a field-by-field comparison cannot cover. Identity is rebuilt
+    // from the recorded fields rather than read off the key, so the rebuilt
+    // identity has to render back to the key it was read from — otherwise
+    // every install rewrites keys nothing asked it to change, and renames the
+    // virtual store directories under them.
+    let again = TempDir::new().unwrap();
+    lockfile::save(&back, again.path()).unwrap();
+    assert_eq!(read(&again), read(&dir));
+}
+
+#[test]
+fn a_dependency_on_a_duplicated_node_keeps_its_peer_suffix() {
+    // The edge has to name a node, and once `plugin` is duplicated there is no
+    // `plugin@1.0.0` to name. Recording the bare version — which was enough
+    // while every key was `name@version` — leaves `wrapper` pointing at a key
+    // the file does not record, which `load` refuses as dangling: jerky
+    // writing a lockfile jerky cannot read.
+    let dir = TempDir::new().unwrap();
+    lockfile::save(&peer_graph(), dir.path()).unwrap();
+
+    let parsed: serde_json::Value = serde_json::from_str(&read(&dir)).unwrap();
+    assert_eq!(
+        parsed["packages"][WRAPPER]["dependencies"]["plugin"],
+        "1.0.0(react@18.2.0)"
+    );
+
+    let back = lockfile::load(dir.path()).unwrap().unwrap();
+    let wrapper = back
+        .packages
+        .values()
+        .find(|package| package.id.name == "wrapper")
+        .expect("wrapper was recorded");
+    let plugin = &wrapper.dependencies["plugin"];
+    assert_eq!(plugin.to_string(), PLUGIN);
+    assert!(
+        back.packages.contains_key(plugin),
+        "the edge read back points at no recorded package"
+    );
+}
+
+#[test]
+fn one_version_under_two_peer_contexts_is_two_packages() {
+    // The hazard the recorded peers exist to close, and the reason identity is
+    // rebuilt
+    // from the recorded peers rather than parsed out of the key. Both keys
+    // here split to `plugin` and `1.0.0`; only what they record tells them
+    // apart, and a peer-free identity taken from the key would land them both
+    // on one node — keeping one, dropping the other's subtree, saying nothing.
+    let dir = TempDir::new().unwrap();
+    write_raw(
+        &dir,
+        &format!(
+            r#"{{"lockfileVersion":1,"importers":{{}},"packages":{{
+                "react@17.0.2": {{"version":"17.0.2","resolved":"https://r.test/r17.tgz","integrity":"{HASH}"}},
+                "react@18.2.0": {{"version":"18.2.0","resolved":"https://r.test/r18.tgz","integrity":"{HASH}"}},
+                "plugin@1.0.0(react@17.0.2)": {{"version":"1.0.0","resolved":"https://r.test/p.tgz","integrity":"{HASH}",
+                    "peers":{{"react":"react@17.0.2"}}}},
+                "plugin@1.0.0(react@18.2.0)": {{"version":"1.0.0","resolved":"https://r.test/p.tgz","integrity":"{HASH}",
+                    "peers":{{"react":"react@18.2.0"}}}}
+            }}}}"#
+        ),
+    );
+
+    let graph = lockfile::load(dir.path()).unwrap().unwrap();
+    assert_eq!(graph.packages.len(), 4);
+
+    let plugins: Vec<String> = graph
+        .packages
+        .keys()
+        .filter(|id| id.name == "plugin")
+        .map(|id| id.to_string())
+        .collect();
+    assert_eq!(
+        plugins,
+        ["plugin@1.0.0(react@17.0.2)", "plugin@1.0.0(react@18.2.0)"],
+        "two entries, two nodes, each keyed by what it resolved against"
+    );
+
+    // And each node's peer names the react it recorded, not merely some react.
+    for package in graph.packages.values().filter(|p| p.id.name == "plugin") {
+        assert_eq!(
+            package.peers["react"].version,
+            package.id.context["react"].version
+        );
+    }
+}
+
+#[test]
+fn a_peer_pointing_at_nothing_is_refused() {
+    // A peer is linked like a dependency, so a peer naming a node the file
+    // does not record is the same broken install: a `node_modules` with a link
+    // into nowhere. Same check, same report.
+    let dir = TempDir::new().unwrap();
+    write_raw(
+        &dir,
+        &format!(
+            r#"{{"lockfileVersion":1,"importers":{{}},"packages":{{
+                "plugin@1.0.0(react@18.2.0)": {{"version":"1.0.0","resolved":"https://r.test/p.tgz","integrity":"{HASH}",
+                    "peers":{{"react":"react@18.2.0"}}}}
+            }}}}"#
+        ),
+    );
+
+    match lockfile::load(dir.path()) {
+        Err(LockfileError::DanglingEdge {
+            entry, dependency, ..
+        }) => {
+            assert_eq!(entry, "plugin@1.0.0(react@18.2.0)");
+            assert_eq!(dependency, "react@18.2.0");
+        }
+        other => panic!("expected a dangling edge error, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_key_whose_suffix_swallowed_the_version_is_refused() {
+    // What the suffix *says* is never read back — a collapsed one is a hash
+    // and does not decode — but where it begins still has to leave a
+    // `name@version` in front of it.
+    let dir = TempDir::new().unwrap();
+    write_raw(
+        &dir,
+        &format!(
+            r#"{{"lockfileVersion":1,"importers":{{}},"packages":{{
+                "plugin(react@18.2.0)": {{"version":"1.0.0","resolved":"https://r.test/p.tgz","integrity":"{HASH}"}}
+            }}}}"#
+        ),
+    );
+
+    assert!(matches!(
+        lockfile::load(dir.path()),
+        Err(LockfileError::BadKey { .. })
+    ));
+}
+
+#[test]
+fn a_key_disagreeing_with_the_peers_it_records_is_refused() {
+    // A block copied and its key edited, which is what hand-editing produces.
+    // The file states the peer context twice — once in the key and once in
+    // `peers` — so the two can disagree, exactly as the key and the version
+    // can. Refusing is also what stops the copy landing on the original: two
+    // keys recording one set of peers are one node, and a file that cannot say
+    // which entry an edge means is not one to install from.
+    let dir = TempDir::new().unwrap();
+    write_raw(
+        &dir,
+        &format!(
+            r#"{{"lockfileVersion":1,"importers":{{}},"packages":{{
+                "react@18.2.0": {{"version":"18.2.0","resolved":"https://r.test/r18.tgz","integrity":"{HASH}"}},
+                "plugin@1.0.0(react@17.0.2)": {{"version":"1.0.0","resolved":"https://r.test/p.tgz","integrity":"{HASH}",
+                    "peers":{{"react":"react@18.2.0"}}}},
+                "plugin@1.0.0(react@18.2.0)": {{"version":"1.0.0","resolved":"https://r.test/p.tgz","integrity":"{HASH}",
+                    "peers":{{"react":"react@18.2.0"}}}}
+            }}}}"#
+        ),
+    );
+
+    match lockfile::load(dir.path()) {
+        Err(LockfileError::KeyIdentityMismatch { entry, rebuilt, .. }) => {
+            assert_eq!(
+                (entry.as_str(), rebuilt.as_str()),
+                ("plugin@1.0.0(react@17.0.2)", "plugin@1.0.0(react@18.2.0)"),
+                "the key claims a react the entry itself does not record"
+            );
+        }
+        other => panic!("expected a key/identity mismatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_cycle_through_a_peer_keyed_node_reads_back_under_the_keys_it_was_written_with() {
+    // Identity is rebuilt by walking edges, and a dependency cycle is where a
+    // walk has to stop. The peer pass leaves the edge that closed the loop it
+    // entered out of the name; reading the file back has to leave out the same
+    // edge, which means entering the loop where the pass did — from the
+    // importers, not from whichever key happens to sort first. Break a
+    // different edge and `b` comes back carrying `z`'s context, so it is
+    // written under a key it was never read from and the whole subtree is
+    // renamed by an install that changed nothing.
+    let registry = FixtureRegistry::new()
+        .with_tree(&[
+            ("z", "1.0.0", &[("b", "^1.0.0"), ("plugin", "^1.0.0")]),
+            ("b", "1.0.0", &[("z", "^1.0.0")]),
+            ("plugin", "1.0.0", &[]),
+            ("react", "18.2.0", &[]),
+        ])
+        .with_declared_peers("plugin", "1.0.0", &[("react", ">=17", false)]);
+
+    let dir = TempDir::new().unwrap();
+    let graph = resolve(
+        &registry,
+        &roots(&[("z", "^1.0.0"), ("react", "18.2.0")]),
+        &no_members(),
+    )
+    .unwrap();
+    let (graph, _) = jerky::resolver::resolve_peers(graph);
+    lockfile::save(&graph, dir.path()).unwrap();
+
+    let back = lockfile::load(dir.path()).unwrap().unwrap();
+    let again = TempDir::new().unwrap();
+    lockfile::save(&back, again.path()).unwrap();
+
+    assert_eq!(read(&again), read(&dir));
 }

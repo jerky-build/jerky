@@ -711,9 +711,23 @@ fn plan_for(graph: &ResolvedGraph, workspace: &Workspace, store: &Store) -> link
             dir_name: id.to_string(),
             pkg_name: id.name.clone(),
             content_store_path: store.entry_path(&package.integrity),
+            // Dependencies and resolved peers both. With no ambient hoisting
+            // a package sees exactly what sits beside it in its own private
+            // `node_modules`, so a peer that is not linked there is a peer it
+            // cannot import — which is the whole reason peer resolution had to
+            // reach the layout rather than stopping at a diagnostic.
+            //
+            // A union rather than a merge upstream: the graph keeps the two
+            // apart so the lockfile can record what the package published. A
+            // name in both is a package shipping a fallback for a peer it
+            // would rather take from above, and the peer pass resolved that
+            // peer to the package's own copy — own dependencies being the
+            // nearest frame there is — so the two agree and the union has
+            // nothing to arbitrate.
             edges: package
                 .dependencies
                 .iter()
+                .chain(&package.peers)
                 .map(|(name, dep_id)| (name.clone(), virtual_store_ref(dep_id)))
                 .collect(),
         });
@@ -1196,6 +1210,99 @@ mod tests {
                 ),
             ]),
         );
+        expected.add_importer(&root.join("packages/empty"), BTreeMap::new());
+
+        assert_eq!(plan_for(&graph, &workspace, &store), expected);
+    }
+
+    #[test]
+    fn a_resolved_peer_is_linked_beside_the_dependents_own_dependencies() {
+        // With no ambient hoisting, a package sees exactly what sits beside it
+        // in its own private `node_modules` — so a peer that is not linked
+        // there is a peer it cannot import, and peer resolution would have
+        // been a diagnostic that changed nothing about the tree.
+        //
+        // `plugin` declares no dependencies at all and peers `react`, which
+        // the importer supplies. Its entry has one edge, and nothing in
+        // `dependencies` put it there.
+        let home = TempDir::new().unwrap();
+        let work = TempDir::new().unwrap();
+        let workspace = workspace(work.path());
+        let store = Store::new(home.path().join("store"));
+        let root = workspace.root().to_path_buf();
+
+        let react = id("react", "18.2.0");
+        let plugin = PackageId {
+            name: "plugin".to_string(),
+            version: "1.0.0".to_string(),
+            context: BTreeMap::from([("react".to_string(), react.clone())]),
+        };
+
+        let mut resolved = package("plugin", "1.0.0", &[]);
+        resolved.id = plugin.clone();
+        resolved.peers = BTreeMap::from([("react".to_string(), react.clone())]);
+
+        let graph = ResolvedGraph {
+            importers: BTreeMap::from([
+                (
+                    at("."),
+                    importer(&[
+                        (
+                            "plugin",
+                            dependency("^1.0.0", Resolution::Registry(plugin.clone())),
+                        ),
+                        (
+                            "react",
+                            dependency("18.2.0", Resolution::Registry(react.clone())),
+                        ),
+                    ]),
+                ),
+                (at("packages/ui"), importer(&[])),
+                (at("packages/empty"), importer(&[])),
+            ]),
+            packages: BTreeMap::from([
+                (plugin.clone(), resolved),
+                (react.clone(), package("react", "18.2.0", &[])),
+            ]),
+        };
+
+        let mut expected = Plan::new(
+            &root,
+            BTreeSet::from([
+                root.clone(),
+                root.join("packages/ui"),
+                root.join("packages/empty"),
+            ]),
+        );
+        expected.add_entry(VirtualStoreEntry {
+            // The peer context is part of the directory name, which is what
+            // lets a second `plugin` resolved against another react sit beside
+            // this one with a different link inside it.
+            dir_name: "plugin@1.0.0(react@18.2.0)".to_string(),
+            pkg_name: "plugin".to_string(),
+            content_store_path: store.entry_path(&integrity("plugin@1.0.0")),
+            edges: BTreeMap::from([("react".to_string(), at_entry("react@18.2.0", "react"))]),
+        });
+        expected.add_entry(VirtualStoreEntry {
+            dir_name: "react@18.2.0".to_string(),
+            pkg_name: "react".to_string(),
+            content_store_path: store.entry_path(&integrity("react@18.2.0")),
+            edges: BTreeMap::new(),
+        });
+        expected.add_importer(
+            &root,
+            BTreeMap::from([
+                (
+                    "plugin".to_string(),
+                    ImporterTarget::Entry(at_entry("plugin@1.0.0(react@18.2.0)", "plugin")),
+                ),
+                (
+                    "react".to_string(),
+                    ImporterTarget::Entry(at_entry("react@18.2.0", "react")),
+                ),
+            ]),
+        );
+        expected.add_importer(&root.join("packages/ui"), BTreeMap::new());
         expected.add_importer(&root.join("packages/empty"), BTreeMap::new());
 
         assert_eq!(plan_for(&graph, &workspace, &store), expected);
