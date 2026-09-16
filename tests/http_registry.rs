@@ -70,10 +70,27 @@ fn serve_counting_connections(
     (format!("http://127.0.0.1:{port}"), connections)
 }
 
+/// Read one request's head — every line up to the blank one — and report
+/// whether one arrived at all. Only GETs reach these fixtures, so a request is
+/// its head and nothing else. `false` is the client having hung up or the
+/// socket having failed, which are the same thing to a fixture.
+fn read_head(head: &mut impl BufRead) -> bool {
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match head.read_line(&mut line) {
+            Ok(0) | Err(_) => return false,
+            Ok(_) => {}
+        }
+        if line == "\r\n" || line == "\n" {
+            return true;
+        }
+    }
+}
+
 /// Answer every request on one connection until the client hangs up.
 ///
-/// Only GETs arrive, so a request is its head and nothing else: lines up to
-/// the blank one. The response carries a `Content-Length` and no `Connection`
+/// The response carries a `Content-Length` and no `Connection`
 /// header, which under HTTP/1.1 is the invitation to send another request on
 /// the same socket — without it the client could not reuse a connection even
 /// if it wanted to, and the test would measure the fixture.
@@ -81,19 +98,7 @@ fn serve_one_connection(mut stream: TcpStream, body: &'static str, on_request: &
     let Ok(peer) = stream.try_clone() else { return };
     let mut head = BufReader::new(peer);
 
-    loop {
-        let mut line = String::new();
-        loop {
-            line.clear();
-            match head.read_line(&mut line) {
-                Ok(0) | Err(_) => return,
-                Ok(_) => {}
-            }
-            if line == "\r\n" || line == "\n" {
-                break;
-            }
-        }
-
+    while read_head(&mut head) {
         on_request();
 
         let response = format!(
@@ -828,5 +833,164 @@ fn a_revalidation_that_matches_is_not_a_retry() {
         seen.lock().unwrap().len(),
         1,
         "a 304 is an answer, not something to try again"
+    );
+}
+
+// A registry that accepts a connection and then says nothing is the failure
+// `with_retries` structurally cannot see: the loop only runs again on an
+// attempt that *returned*, and a hang never does. These fixtures hold the
+// socket open rather than closing it, because closing it is an answer — ureq
+// reports the EOF immediately — and what is under test is what happens when
+// there is no answer at all.
+
+/// Accept connections, read each request's head, write `prelude` — nothing at
+/// all, or a response head promising a body that never follows — and then
+/// hold the socket open for the rest of the test.
+///
+/// Speaks HTTP by hand for the reason `serve_counting_connections` does, plus
+/// one of its own: tiny_http answers a request when the handler returns, and
+/// there is no way to ask it not to answer. Requests are counted as they
+/// arrive, which is the only evidence a stalled attempt leaves behind.
+fn serve_stalling(prelude: &'static str) -> (String, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&requests);
+
+    std::thread::spawn(move || {
+        // Every socket is kept rather than dropped at the end of its
+        // iteration: dropping it closes the connection, which the client
+        // would see as a prompt answer.
+        let mut held = Vec::new();
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let Ok(peer) = stream.try_clone() else {
+                continue;
+            };
+            let mut head = BufReader::new(peer);
+            if !read_head(&mut head) {
+                continue;
+            }
+            counter.fetch_add(1, Ordering::Relaxed);
+            if !prelude.is_empty() && stream.write_all(prelude.as_bytes()).is_err() {
+                continue;
+            }
+            held.push(stream);
+        }
+    });
+
+    (format!("http://127.0.0.1:{port}"), requests)
+}
+
+/// Short enough that a stall costs the suite milliseconds rather than the
+/// thirty seconds jerky ships, long enough that a loaded machine's loopback
+/// round trip is never mistaken for one.
+const STALL_DEADLINE: Duration = Duration::from_millis(250);
+
+/// A response head promising a body that `serve_stalling` never sends.
+const PROMISED_BODY: &str = "HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n";
+
+/// Generous by an order of magnitude over the three attempts and two backoffs
+/// a stall actually costs at `STALL_DEADLINE`. The claim is that the call
+/// *ends*, not how quickly, so the bound sits where only a hang fails it.
+const BOUNDED: Duration = Duration::from_secs(10);
+
+#[test]
+fn a_registry_that_accepts_and_then_says_nothing_is_an_error_rather_than_a_hang() {
+    let (base, _) = serve_stalling("");
+    let registry = HttpRegistry::with_deadline(base, STALL_DEADLINE);
+
+    let started = Instant::now();
+    let result = registry.version_metadata("lodash", "4.17.21");
+    let waited = started.elapsed();
+
+    assert!(
+        matches!(result, Err(RegistryError::Stalled { .. })),
+        "a connection that went quiet must end in an error, got {result:?}"
+    );
+    assert!(
+        waited < BOUNDED,
+        "gave up after {waited:?}, which is not a bound anyone would wait for"
+    );
+}
+
+#[test]
+fn a_stall_goes_back_through_the_retry_path() {
+    // The half a deadline alone would not give. A stalled connection is a
+    // transport failure like a reset or a 503, so a registry that goes quiet
+    // once costs the user a pause rather than an install.
+    let (base, requests) = serve_stalling("");
+    let registry = HttpRegistry::with_deadline(base, STALL_DEADLINE);
+
+    let _ = registry.version_metadata("lodash", "4.17.21");
+
+    assert_eq!(
+        requests.load(Ordering::Relaxed),
+        3,
+        "a stall must be retried on the transient schedule, like anything else \
+         that failed in transport"
+    );
+}
+
+#[test]
+fn a_tarball_body_that_stops_arriving_is_a_stall() {
+    // The other half of the hang, and the one a deadline on the response head
+    // does not reach: the registry answered, promised a thousand bytes, and
+    // then stopped. Nothing about that returns either.
+    let (base, _) = serve_stalling(PROMISED_BODY);
+    let registry = HttpRegistry::with_deadline(base.clone(), STALL_DEADLINE);
+
+    let started = Instant::now();
+    let result = registry.fetch_tarball(&format!("{base}/x.tgz"));
+    let waited = started.elapsed();
+
+    assert!(
+        matches!(result, Err(RegistryError::Stalled { .. })),
+        "a body that stopped arriving must end in an error, got {result:?}"
+    );
+    assert!(waited < BOUNDED, "gave up after {waited:?}");
+}
+
+#[test]
+fn a_metadata_body_that_stops_arriving_is_not_reported_as_malformed() {
+    // A body read that fails is usually the registry sending something jerky
+    // cannot use — past the size limit, or not UTF-8 — and both are reported
+    // as a malformed response. A stall is neither: the bytes that arrived were
+    // fine as far as they got, and blaming the registry's JSON sends the
+    // reader looking for the wrong thing entirely.
+    let (base, _) = serve_stalling(PROMISED_BODY);
+    let registry = HttpRegistry::with_deadline(base, STALL_DEADLINE);
+
+    let result = registry.packument("lodash", Freshness::MustBeCurrent);
+
+    assert!(
+        matches!(result, Err(RegistryError::Stalled { .. })),
+        "a stalled body must say so, got {result:?}"
+    );
+}
+
+#[test]
+fn a_stalled_request_names_the_url_it_stalled_on() {
+    // A hang and a slow registry are indistinguishable to the user, which is
+    // most of why #79 was hard to see at all. What ends that is an error
+    // saying which request gave up and which deadline ran out — the second
+    // carried by the cause underneath, the way every other registry error
+    // carries its own.
+    let (base, _) = serve_stalling("");
+    let registry = HttpRegistry::with_deadline(base.clone(), STALL_DEADLINE);
+
+    let err = registry.version_metadata("lodash", "4.17.21").unwrap_err();
+
+    let message = err.to_string();
+    assert!(
+        message.contains(&format!("{base}/lodash/4.17.21")),
+        "the error must name the request that stalled, got {message:?}"
+    );
+    let cause = std::error::Error::source(&err)
+        .expect("a stall carries the deadline that ran out")
+        .to_string();
+    assert!(
+        cause.contains("timeout"),
+        "the cause must say which deadline ran out, got {cause:?}"
     );
 }

@@ -366,6 +366,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- An install can no longer hang forever on a registry that accepts a
+  connection and then goes quiet. Every phase of a request now has a deadline:
+  ten seconds each to look up the host and to open the socket, thirty for the
+  response to start arriving, a minute for a metadata body and five for a
+  tarball's.
+  Before this, a stalled connection was the one failure retrying could not
+  help with — the retry loop runs again on an attempt that *returned*, and a
+  hang never does — so jerky would sit at zero CPU indefinitely while a `curl`
+  to the same registry answered in a tenth of a second. A stall is now a
+  transport failure like any other and gets the same three attempts, so a
+  registry that goes quiet once costs a pause rather than the install. When it
+  does not clear, the error names the URL that stalled and which deadline ran
+  out, rather than leaving a hang and a slow registry looking alike
+  ([#79](https://github.com/jerky-build/jerky/issues/79)).
+
 - Symlink targets are computed from where the link and its target diverge
   instead of assuming one shape, so links from nested importers and links
   between packages inside the virtual store now resolve. Previously only a
