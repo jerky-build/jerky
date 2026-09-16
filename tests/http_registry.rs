@@ -939,7 +939,11 @@ fn a_tarball_body_that_stops_arriving_is_a_stall() {
     // does not reach: the registry answered, promised a thousand bytes, and
     // then stopped. Nothing about that returns either.
     let (base, _) = serve_stalling(PROMISED_BODY);
-    let registry = HttpRegistry::with_deadline(base.clone(), STALL_DEADLINE);
+    // On a shorter base deadline than its neighbours, because the tarball body
+    // budget is a multiple of that base — see `Deadlines::short` — and three
+    // attempts at the shared one would spend three seconds of the suite
+    // proving what a fraction of it proves as well.
+    let registry = HttpRegistry::with_deadline(base.clone(), STALL_DEADLINE / 2);
 
     let started = Instant::now();
     let result = registry.fetch_tarball(&format!("{base}/x.tgz"));
@@ -970,6 +974,70 @@ fn a_metadata_body_that_stops_arriving_is_not_reported_as_malformed() {
     );
 }
 
+/// Answer with a complete response whose body arrives `after` the head, which
+/// is a slow link rather than a stall: every byte turns up, just late.
+///
+/// The distinction is the whole reason the two paths carry different body
+/// deadlines, and a fixture that only ever stalls cannot tell them apart.
+fn serve_delayed_body(after: Duration, body: &'static str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let Ok(peer) = stream.try_clone() else {
+                continue;
+            };
+            std::thread::spawn(move || {
+                let mut head = BufReader::new(peer);
+                while read_head(&mut head) {
+                    let sent = stream.write_all(
+                        format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len())
+                            .as_bytes(),
+                    );
+                    if sent.is_err() {
+                        return;
+                    }
+                    // The body deadline is measured from the head, so the
+                    // sleep lands inside the phase under test.
+                    std::thread::sleep(after);
+                    if stream.write_all(body.as_bytes()).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+
+    format!("http://127.0.0.1:{port}")
+}
+
+#[test]
+fn a_body_too_slow_for_the_metadata_budget_is_still_in_time_for_a_tarball() {
+    // The per-path body deadline, and the only test that can see it. A tarball
+    // is three orders of magnitude larger than a packument, so the budget that
+    // is generous for one would cut off the other part-way down — which is why
+    // the tarball path raises the agent's deadline for its own request. Delete
+    // that raise and the second half of this test fails; every other test in
+    // the file stays green, because a stall trips both budgets at once.
+    let delay = STALL_DEADLINE * 3 / 2;
+    let base = serve_delayed_body(delay, "tarball-bytes");
+    let registry = HttpRegistry::with_deadline(base.clone(), STALL_DEADLINE);
+
+    let tarball = registry.fetch_tarball(&format!("{base}/x.tgz"));
+    assert!(
+        matches!(&tarball, Ok(bytes) if bytes == b"tarball-bytes"),
+        "a slow tarball body is a slow download, not a stall, got {tarball:?}"
+    );
+
+    let metadata = registry.version_metadata("lodash", "4.17.21");
+    assert!(
+        matches!(metadata, Err(RegistryError::Stalled { .. })),
+        "the same delay is past what a packument is given, got {metadata:?}"
+    );
+}
+
 #[test]
 fn a_metadata_body_that_is_not_text_is_still_a_malformed_response() {
     // The other arm of the same classifier, and the one the stall carve-out
@@ -984,6 +1052,57 @@ fn a_metadata_body_that_is_not_text_is_still_a_malformed_response() {
     assert!(
         matches!(result, Err(RegistryError::MalformedResponse { .. })),
         "a body that is not text must still be a malformed response, got {result:?}"
+    );
+}
+
+/// 404 the first request and then go quiet, which is the shape of a stalled
+/// existence probe: `version_metadata` asks for a version, is told there is no
+/// such thing, and asks whether the package itself is there.
+fn serve_404_then_stalling() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        let mut answered = false;
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let Ok(peer) = stream.try_clone() else {
+                continue;
+            };
+            let mut head = BufReader::new(peer);
+            if !read_head(&mut head) {
+                continue;
+            }
+            if answered {
+                held.push(stream);
+                continue;
+            }
+            answered = true;
+            let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+            held.push(stream);
+        }
+    });
+
+    format!("http://127.0.0.1:{port}")
+}
+
+#[test]
+fn a_stalled_existence_probe_reports_rather_than_calling_the_package_missing() {
+    // The probe exists to split one 404 into "no such package" and "no such
+    // version", and it used to read every failure as the first of those. Once
+    // a stall is bounded rather than endless, that is what a stalled probe
+    // would become: a confident `PackageNotFound` for a package that is
+    // sitting right there, produced by a registry that never answered.
+    let base = serve_404_then_stalling();
+    let registry = HttpRegistry::with_deadline(base, STALL_DEADLINE);
+
+    let result = registry.version_metadata("lodash", "9.9.9");
+
+    assert!(
+        matches!(result, Err(RegistryError::Stalled { .. })),
+        "an unanswered probe must say so rather than name the package missing, \
+         got {result:?}"
     );
 }
 

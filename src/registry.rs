@@ -370,11 +370,21 @@ impl Deadlines {
     /// A stall retries like any other transport failure, so what a user waits
     /// is three attempts and the backoff between them. In practice that is one
     /// phase's deadline three times over — a stalled request dies in the phase
-    /// it stalled in and does not reach the next — and the upper bound, for an
-    /// adversary that spends nearly all of every phase and then stalls in the
-    /// last, is around seven minutes on a metadata request and nineteen on a
-    /// tarball. Those are the numbers to argue with if they prove too patient.
-    /// They are not infinity, which is what they were.
+    /// it stalled in and does not reach the next — and for a request that is
+    /// answered directly, the upper bound is around seven minutes on a
+    /// metadata request and nineteen on a tarball.
+    ///
+    /// A redirect multiplies the first of those. ureq restarts every phase
+    /// budget on each hop and leaves ten hops available, so a registry that
+    /// answers a tarball URL with a 302 to a CDN — which several do — can
+    /// spend the pre-body phases up to eleven times over before the body
+    /// starts. Still a bound, and still the thing this type exists to
+    /// establish, but an hour rather than nineteen minutes in the worst case.
+    /// `max_redirects` is the knob that shortens it, and it is left at ureq's
+    /// default because refusing a hop a real registry needs would break an
+    /// install to shorten a bound that only a hostile chain ever reaches.
+    ///
+    /// None of them are infinity, which is what they all were.
     const DEFAULT: Self = Self {
         connect: Duration::from_secs(10),
         response: Duration::from_secs(30),
@@ -382,13 +392,21 @@ impl Deadlines {
         tarball_body: Duration::from_secs(300),
     };
 
-    /// Every phase bounded by the same duration.
-    const fn uniform(deadline: Duration) -> Self {
+    /// Short deadlines for a test, in the production *shape*.
+    ///
+    /// Every phase but one takes `deadline`. The tarball body deliberately
+    /// does not: it takes a multiple, because a test cannot prove the two body
+    /// paths differ if the flattened version makes them the same. With one
+    /// number everywhere, the agent's own body deadline fires at the instant
+    /// the tarball path's raise would, so deleting the raise entirely leaves
+    /// every test green — which is exactly the regression the raise exists to
+    /// prevent.
+    const fn short(deadline: Duration) -> Self {
         Self {
             connect: deadline,
             response: deadline,
             metadata_body: deadline,
-            tarball_body: deadline,
+            tarball_body: Duration::from_millis(deadline.as_millis() as u64 * 4),
         }
     }
 }
@@ -448,7 +466,8 @@ impl HttpRegistry {
         Self::build(base_url, Deadlines::DEFAULT)
     }
 
-    /// A client whose every phase is bounded by one short duration.
+    /// A client on short deadlines, scaled from `deadline`. See
+    /// `Deadlines::short` for which phase is not simply `deadline` and why.
     ///
     /// Public because the tests that prove a stalled connection is given up on
     /// live in `tests/`, and a test that waited out `Deadlines::DEFAULT` would
@@ -457,7 +476,7 @@ impl HttpRegistry {
     /// flag reaches it, because how long to wait for a registry is jerky's
     /// answer to give rather than a knob to hand over.
     pub fn with_deadline(base_url: impl Into<String>, deadline: Duration) -> Self {
-        Self::build(base_url, Deadlines::uniform(deadline))
+        Self::build(base_url, Deadlines::short(deadline))
     }
 
     fn build(base_url: impl Into<String>, deadlines: Deadlines) -> Self {
@@ -734,12 +753,20 @@ impl HttpRegistry {
 
     /// Does this package exist at all? Used only on the error path, to turn a
     /// 404 into either `PackageNotFound` or `VersionNotFound`.
-    fn package_exists(&self, name: &str) -> bool {
+    ///
+    /// A probe that fails reports rather than answering. It used to collapse
+    /// every error into "no", which turned an unreachable registry into a
+    /// confident `PackageNotFound` for a package that was there all along —
+    /// and once a stall is bounded rather than endless, that is the shape a
+    /// stalled probe takes: jerky waits out the deadline and then says the
+    /// package does not exist. Naming a package that is not missing is worse
+    /// than admitting the question went unanswered.
+    fn package_exists(&self, name: &str) -> Result<bool, RegistryError> {
         let url = format!("{}/{}", self.base_url, Self::encode_name(name));
-        self.agent
-            .get(&url)
-            .call()
-            .is_ok_and(|response| response.status().is_success())
+        match self.agent.get(&url).call() {
+            Ok(response) => Ok(response.status().is_success()),
+            Err(source) => Err(Self::from_transport(&url, source).0),
+        }
     }
 }
 
@@ -753,15 +780,15 @@ impl RegistryClient for HttpRegistry {
 
         // A 404 here is ambiguous: the package may not exist, or it may exist
         // without this version. Only the error path pays for the distinction.
-        let body = self.get_json(&url, false, || {
-            if self.package_exists(name) {
-                RegistryError::VersionNotFound {
-                    name: name.to_string(),
-                    version: version.to_string(),
-                }
-            } else {
-                RegistryError::PackageNotFound(name.to_string())
-            }
+        let body = self.get_json(&url, false, || match self.package_exists(name) {
+            Ok(true) => RegistryError::VersionNotFound {
+                name: name.to_string(),
+                version: version.to_string(),
+            },
+            Ok(false) => RegistryError::PackageNotFound(name.to_string()),
+            // The probe could not say. Reporting why beats picking one of the
+            // two answers it was asked to choose between.
+            Err(err) => err,
         })?;
 
         serde_json::from_str(&body).map_err(|source| RegistryError::MalformedResponse {
