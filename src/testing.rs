@@ -413,7 +413,7 @@ impl FixtureRegistry {
     /// every call site would cost every existing fixture a `&[]`.
     ///
     /// Each entry is `(name, range, optional)`.
-    pub fn declaring_peers(
+    pub fn with_declared_peers(
         mut self,
         name: &str,
         version: &str,
@@ -435,19 +435,23 @@ impl FixtureRegistry {
         // Both copies, because `register` cloned the metadata into each and a
         // fixture that amended only one would resolve differently depending on
         // whether the packument or the version map was consulted.
-        if let Some(metadata) = self
+        //
+        // Panics on a name or version that is not registered, for the reason
+        // `with_dist_tag` does: silently amending nothing turns a typo into a
+        // peer-free fixture and a green test that proves the opposite of what
+        // it claims.
+        let metadata = self
             .versions
             .get_mut(&(name.to_string(), version.to_string()))
-        {
-            amend(metadata);
-        }
-        if let Some(metadata) = self
+            .unwrap_or_else(|| panic!("no `{name}` at `{version}` to declare peers on"));
+        amend(metadata);
+
+        let metadata = self
             .packuments
             .get_mut(name)
             .and_then(|packument| packument.versions.get_mut(version))
-        {
-            amend(metadata);
-        }
+            .unwrap_or_else(|| panic!("no packument entry for `{name}` at `{version}`"));
+        amend(metadata);
 
         self
     }

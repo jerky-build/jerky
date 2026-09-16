@@ -291,6 +291,27 @@ is therefore testable exactly the way `tests/resolve.rs` tests the walk — whic
 is the property `resolver.rs`'s module documentation names as the reason it is
 shaped this way.
 
+**It runs in three stages, and the split is what makes cycles safe.** First
+*discover*: find every instance — one per (package, the environment its subtree
+sees) — naming none of them. Then *identify*: give each instance its id, which
+depends on its dependencies' ids. Then *emit*: build the package map, mapping
+every edge through the ids just assigned.
+
+Doing this in one stage is the obvious implementation and it is wrong. A node's
+id is not known until its subtree is walked, so the edge that closes a peer
+cycle has to be handed *something* mid-walk — and whatever it is handed will not
+match the id the node ends up with. The result is an edge naming a node that is
+never emitted: a dangling reference in a graph whose own documentation claims it
+is reachable by construction. Splitting discovery from naming removes the
+question, because by the time any edge is written every instance already has its
+final id.
+
+A cycle still cannot be spelled out inside a name — a `PackageId` owns its
+context, so it is finite by construction. The edge that closes the cycle is
+therefore left out of the *name* while remaining in `dependencies`, which is the
+only honest split available: the name stays finite, and the edge still points at
+a node that exists.
+
 **Termination and identity share one key**, and getting it wrong is subtle. The
 pass memoizes each node and treats a repeat as a hit — the same novelty gate the
 main walk uses, `if self.packages.contains_key(&id) { return Ok(()) }` — so the
@@ -304,8 +325,14 @@ peers of its own has the same key in every context, so the first copy computed
 comes back for all of them and the duplication never happens. The key is
 `(node, the providers its whole subtree can see)` — every peer name reachable
 from the node, itself included, mapped to whoever currently provides it. Two
-visits agreeing on all of them must produce the same subtree; two differing
-anywhere must not share a node.
+visits agreeing on all of them must produce the same subtree, which is what
+makes the key sound.
+
+The converse does not hold, and the spec should not claim it: two visits that
+differ somewhere in that environment often still produce the *same* node, when
+the name they differ on is one the subtree always answers internally. The key is
+therefore finer than strictly necessary — it costs extra instances, never a
+missed duplication, which is the direction to err in.
 
 That set of names is a least fixed point over the peer-blind graph, computed
 once before the walk down. A fixed point rather than a recursive walk because
@@ -334,6 +361,13 @@ peers: BTreeMap<String, String>,
 #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
 declared_peers: BTreeMap<String, DeclaredPeer>,
 ```
+
+`ResolvedPackage` carries `peers` — what this node's own peers resolved to —
+alongside `declared_peers`. It is deliberately not derived from `id.context`,
+which *also* holds the dependencies folded in to keep two copies apart, and a
+name can legitimately appear in both. The lockfile records what a package
+resolved as a peer, so the graph has to keep the two apart rather than making
+this issue reconstruct one from the other.
 
 **Resolved peers are their own map, not extra entries in `dependencies`.**
 Merging them would leave the linker and the format untouched, which is
@@ -385,7 +419,18 @@ Warnings are deduped by `(dependent name@version, peer name)`. Without this the
 which turns a real signal into scroll. A bare summary count is unactionable, and
 hiding the lines behind `--verbose` reproduces the silence #34 was filed about.
 
-Optional peers never warn. That is the entire content of `optional: true`.
+An optional peer that is simply *absent* never warns. That is the entire
+content of `optional: true` — and it is narrower than "optional peers never
+warn", which is what an earlier draft of this section said, contradicting §6
+two pages earlier. A provider that is present but out of range warns whether
+the peer is optional or not: `optional` says the peer may be missing, not that
+any version of it will do.
+
+**An unsatisfied peer is left unlinked.** Whether it was missing or merely out
+of range, it does not enter the node's context and nothing is linked for it, so
+a package gets nothing rather than a version it explicitly rejected. An
+unparseable peer range fails the same way and is reported — treating nonsense
+as satisfied would silently record a resolution nobody asked for.
 
 ## 9. Testing
 

@@ -1031,6 +1031,7 @@ mod tests {
                 .map(|(link, target)| (link.to_string(), target.clone()))
                 .collect(),
             declared_peers: BTreeMap::new(),
+            peers: BTreeMap::new(),
         }
     }
 

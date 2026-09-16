@@ -383,6 +383,7 @@ pub fn load(project_dir: &Path) -> Result<Option<ResolvedGraph>, LockfileError> 
                 // then a reused graph simply has nothing for the peer pass to
                 // find, which is exactly what a peer-blind lockfile means.
                 declared_peers: BTreeMap::new(),
+                peers: BTreeMap::new(),
             },
         );
     }

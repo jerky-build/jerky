@@ -34,13 +34,42 @@ fn no_members() -> BTreeMap<String, ImporterPath> {
     BTreeMap::new()
 }
 
+/// Every edge names a node the graph holds.
+///
+/// Worth asserting rather than assuming: the first cut of the pass broke peer
+/// cycles by handing the back-edge an id it never went on to insert, and every
+/// test still passed because none of them looked.
+fn assert_no_dangling_edges(graph: &ResolvedGraph) {
+    for package in graph.packages.values() {
+        for (name, target) in &package.dependencies {
+            assert!(
+                graph.packages.contains_key(target),
+                "{} depends on {name} -> {target}, which the graph does not hold",
+                package.id
+            );
+        }
+    }
+
+    for (path, importer) in &graph.importers {
+        for (name, dependency) in &importer.dependencies {
+            if let Resolution::Registry(id) = &dependency.resolution {
+                assert!(
+                    graph.packages.contains_key(id),
+                    "importer {path} links {name} -> {id}, which the graph does not hold"
+                );
+            }
+        }
+    }
+}
+
 /// Every key in the graph, rendered, so a test can state the tree it expects.
 fn keys(graph: &ResolvedGraph) -> Vec<String> {
     graph.packages.keys().map(|id| id.to_string()).collect()
 }
 
-/// The context of the one node with this name, rendered.
-fn context_of(graph: &ResolvedGraph, name: &str) -> Vec<String> {
+/// Every node of this package, rendered — one entry per copy the duplication
+/// produced.
+fn keys_named(graph: &ResolvedGraph, name: &str) -> Vec<String> {
     graph
         .packages
         .keys()
@@ -54,7 +83,7 @@ fn a_peer_is_satisfied_by_the_importers_own_dependency() {
     // The base case: the consumer is the project itself.
     let registry = FixtureRegistry::new()
         .with_tree(&[("react-dom", "18.2.0", &[]), ("react", "18.2.0", &[])])
-        .declaring_peers("react-dom", "18.2.0", &[("react", "^18.0.0", false)]);
+        .with_declared_peers("react-dom", "18.2.0", &[("react", "^18.0.0", false)]);
 
     let graph = resolve(
         &registry,
@@ -65,8 +94,9 @@ fn a_peer_is_satisfied_by_the_importers_own_dependency() {
     let (graph, unsatisfied) = resolve_peers(graph);
 
     assert!(unsatisfied.is_empty(), "{unsatisfied:?}");
+    assert_no_dangling_edges(&graph);
     assert_eq!(
-        context_of(&graph, "react-dom"),
+        keys_named(&graph, "react-dom"),
         ["react-dom@18.2.0(react@18.2.0)"]
     );
 }
@@ -83,7 +113,7 @@ fn a_peer_takes_the_nearest_provider_not_merely_any() {
             ("react", "17.0.0", &[]),
             ("react", "18.2.0", &[]),
         ])
-        .declaring_peers("leaf", "1.0.0", &[("react", ">=17", false)]);
+        .with_declared_peers("leaf", "1.0.0", &[("react", ">=17", false)]);
 
     let graph = resolve(
         &registry,
@@ -95,7 +125,7 @@ fn a_peer_takes_the_nearest_provider_not_merely_any() {
 
     assert!(unsatisfied.is_empty(), "{unsatisfied:?}");
     assert_eq!(
-        context_of(&graph, "leaf"),
+        keys_named(&graph, "leaf"),
         ["leaf@1.0.0(react@17.0.0)"],
         "the root's react@18.2.0 is further away than mid's react@17.0.0"
     );
@@ -112,7 +142,7 @@ fn a_packages_own_dependency_satisfies_its_own_peer() {
             ("react", "17.0.0", &[]),
             ("react", "18.2.0", &[]),
         ])
-        .declaring_peers("tool", "1.0.0", &[("react", ">=17", false)]);
+        .with_declared_peers("tool", "1.0.0", &[("react", ">=17", false)]);
 
     let graph = resolve(
         &registry,
@@ -123,7 +153,7 @@ fn a_packages_own_dependency_satisfies_its_own_peer() {
     let (graph, unsatisfied) = resolve_peers(graph);
 
     assert!(unsatisfied.is_empty(), "{unsatisfied:?}");
-    assert_eq!(context_of(&graph, "tool"), ["tool@1.0.0(react@17.0.0)"]);
+    assert_eq!(keys_named(&graph, "tool"), ["tool@1.0.0(react@17.0.0)"]);
 }
 
 #[test]
@@ -134,7 +164,7 @@ fn two_importers_disagreeing_give_one_package_two_nodes() {
             ("react", "17.0.0", &[]),
             ("react", "18.2.0", &[]),
         ])
-        .declaring_peers("plugin", "1.0.0", &[("react", ">=17", false)]);
+        .with_declared_peers("plugin", "1.0.0", &[("react", ">=17", false)]);
 
     let roots = BTreeMap::from([
         (
@@ -151,8 +181,9 @@ fn two_importers_disagreeing_give_one_package_two_nodes() {
     let (graph, unsatisfied) = resolve_peers(graph);
 
     assert!(unsatisfied.is_empty(), "{unsatisfied:?}");
+    assert_no_dangling_edges(&graph);
     assert_eq!(
-        context_of(&graph, "plugin"),
+        keys_named(&graph, "plugin"),
         ["plugin@1.0.0(react@17.0.0)", "plugin@1.0.0(react@18.2.0)"],
         "one published version, two peer resolutions, two nodes"
     );
@@ -180,7 +211,7 @@ fn duplication_reaches_an_intermediate_that_declares_no_peers_itself() {
             ("react", "17.0.0", &[]),
             ("react", "18.2.0", &[]),
         ])
-        .declaring_peers("plugin", "1.0.0", &[("react", ">=17", false)]);
+        .with_declared_peers("plugin", "1.0.0", &[("react", ">=17", false)]);
 
     let graph = resolve(
         &registry,
@@ -191,8 +222,9 @@ fn duplication_reaches_an_intermediate_that_declares_no_peers_itself() {
     let (graph, unsatisfied) = resolve_peers(graph);
 
     assert!(unsatisfied.is_empty(), "{unsatisfied:?}");
+    assert_no_dangling_edges(&graph);
     assert_eq!(
-        context_of(&graph, "wrapper"),
+        keys_named(&graph, "wrapper"),
         [
             "wrapper@1.0.0(plugin@1.0.0(react@17.0.0))",
             "wrapper@1.0.0(plugin@1.0.0(react@18.2.0))",
@@ -200,23 +232,26 @@ fn duplication_reaches_an_intermediate_that_declares_no_peers_itself() {
         "a peer-less intermediate is duplicated by the subtree beneath it"
     );
     assert_eq!(
-        context_of(&graph, "plugin").len(),
+        keys_named(&graph, "plugin").len(),
         2,
         "and the plugin it wraps is duplicated too"
     );
 }
 
 #[test]
-fn a_peer_cycle_terminates() {
-    // `a` peers `b` and `b` peers `a`, both provided by the root. The pass
-    // must not chase the loop forever.
+fn a_peer_cycle_terminates_without_dangling_edges() {
+    // `a` peers `b` and `b` peers `a`, each also depending on the other. The
+    // pass must not chase the loop forever — and, the part that is easy to get
+    // wrong, the edge that closes the cycle must still name a node that exists.
+    // A name is finite and owns its parts, so the cycle cannot be spelled out
+    // inside one; what it must not do is invent an id nothing emits.
     let registry = FixtureRegistry::new()
         .with_tree(&[
             ("a", "1.0.0", &[("b", "^1.0.0")]),
             ("b", "1.0.0", &[("a", "^1.0.0")]),
         ])
-        .declaring_peers("a", "1.0.0", &[("b", "^1.0.0", false)])
-        .declaring_peers("b", "1.0.0", &[("a", "^1.0.0", false)]);
+        .with_declared_peers("a", "1.0.0", &[("b", "^1.0.0", false)])
+        .with_declared_peers("b", "1.0.0", &[("a", "^1.0.0", false)]);
 
     let graph = resolve(
         &registry,
@@ -224,11 +259,14 @@ fn a_peer_cycle_terminates() {
         &no_members(),
     )
     .unwrap();
-    let (graph, _) = resolve_peers(graph);
+    let (graph, unsatisfied) = resolve_peers(graph);
 
-    assert!(
-        !keys(&graph).is_empty(),
-        "the pass returned a graph rather than hanging"
+    assert!(unsatisfied.is_empty(), "{unsatisfied:?}");
+    assert_no_dangling_edges(&graph);
+    assert_eq!(
+        keys_named(&graph, "a").len(),
+        1,
+        "one `a` reached, however many times the loop was entered"
     );
 }
 
@@ -236,7 +274,7 @@ fn a_peer_cycle_terminates() {
 fn an_unsatisfied_optional_peer_is_silent() {
     let registry = FixtureRegistry::new()
         .with_tree(&[("vite", "5.0.0", &[])])
-        .declaring_peers("vite", "5.0.0", &[("terser", "^5.4.0", true)]);
+        .with_declared_peers("vite", "5.0.0", &[("terser", "^5.4.0", true)]);
 
     let graph = resolve(&registry, &roots(&[("vite", "^5.0.0")]), &no_members()).unwrap();
     let (graph, unsatisfied) = resolve_peers(graph);
@@ -246,7 +284,7 @@ fn an_unsatisfied_optional_peer_is_silent() {
         "an optional peer with no provider says nothing: {unsatisfied:?}"
     );
     assert_eq!(
-        context_of(&graph, "vite"),
+        keys_named(&graph, "vite"),
         ["vite@5.0.0"],
         "and leaves the node undisturbed"
     );
@@ -260,8 +298,8 @@ fn a_missing_required_peer_is_distinct_from_one_out_of_range() {
             ("needs-newer", "1.0.0", &[]),
             ("react", "17.0.0", &[]),
         ])
-        .declaring_peers("needs-missing", "1.0.0", &[("vue", "^3.0.0", false)])
-        .declaring_peers("needs-newer", "1.0.0", &[("react", "^18.0.0", false)]);
+        .with_declared_peers("needs-missing", "1.0.0", &[("vue", "^3.0.0", false)])
+        .with_declared_peers("needs-newer", "1.0.0", &[("react", "^18.0.0", false)]);
 
     let graph = resolve(
         &registry,
@@ -310,6 +348,20 @@ fn a_tree_with_no_peers_comes_out_unchanged() {
     assert!(unsatisfied.is_empty());
     assert_eq!(keys(&graph), before, "no peers, no change");
     assert_eq!(before, ["a@1.0.0", "b@1.0.0", "c@1.0.0", "d@1.0.0"]);
+    assert_no_dangling_edges(&graph);
+    let a = graph
+        .packages
+        .values()
+        .find(|package| package.id.name == "a")
+        .expect("a is in the graph");
+    assert_eq!(
+        a.dependencies
+            .values()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>(),
+        ["b@1.0.0", "c@1.0.0"],
+        "edges are preserved, not only keys"
+    );
 }
 
 #[test]
@@ -318,7 +370,7 @@ fn an_importer_points_at_the_duplicated_node() {
     // map — otherwise `node_modules` links at a key the graph no longer holds.
     let registry = FixtureRegistry::new()
         .with_tree(&[("plugin", "1.0.0", &[]), ("react", "18.2.0", &[])])
-        .declaring_peers("plugin", "1.0.0", &[("react", "^18.0.0", false)]);
+        .with_declared_peers("plugin", "1.0.0", &[("react", "^18.0.0", false)]);
 
     let graph = resolve(
         &registry,
