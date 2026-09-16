@@ -1276,3 +1276,97 @@ fn a_cycle_closed_by_a_peer_edge_reads_back_under_the_keys_it_was_written_with()
 
     assert_eq!(read(&again), read(&dir));
 }
+
+#[test]
+fn bins_round_trip_and_an_entry_without_them_loads_as_a_package_with_none() {
+    // §1 of `docs/specs/2026-09-16-bin-linking-design.md`: the lockfile records
+    // each package's bins so that an install which resolves nothing still knows
+    // which shims to write. That makes the round trip a property of the format
+    // rather than a detail — and makes an absent `bin` key the common case,
+    // since most packages publish none.
+    let registry = FixtureRegistry::new()
+        .with_tree(&[("a", "1.0.0", &[("b", "^1.0.0")]), ("b", "1.0.0", &[])])
+        .with_bins("a", "1.0.0", &[("aye", "bin/a.js"), ("ay", "bin/a2.js")]);
+    let dir = TempDir::new().unwrap();
+
+    let graph = resolve(&registry, &roots(&[("a", "^1.0.0")]), &no_members()).unwrap();
+    lockfile::save(&graph, dir.path()).unwrap();
+
+    let raw = read(&dir);
+    assert!(
+        raw.contains(r#""bin""#),
+        "the bins were not recorded: {raw}"
+    );
+    assert!(
+        !raw.contains(r#""b@1.0.0""#)
+            || !raw[raw.find("b@1.0.0").unwrap()..].starts_with(r#""bin""#),
+        "a package with no bins wrote an empty block"
+    );
+
+    let loaded = lockfile::load(dir.path()).unwrap().unwrap();
+    let by_name = |want: &str| {
+        loaded
+            .packages
+            .iter()
+            .find(|(id, _)| id.name == want)
+            .map(|(_, package)| package.bins.clone())
+            .unwrap_or_else(|| panic!("no `{want}` in the loaded graph"))
+    };
+
+    assert_eq!(
+        by_name("a"),
+        BTreeMap::from([
+            ("ay".to_string(), "bin/a2.js".to_string()),
+            ("aye".to_string(), "bin/a.js".to_string()),
+        ])
+    );
+    assert!(
+        by_name("b").is_empty(),
+        "a package that declares no bins did not load as one"
+    );
+
+    // And the file the loaded graph writes is the file it was read from, which
+    // is what keeps a `jerky install` on an unchanged tree out of the diff.
+    let reread = TempDir::new().unwrap();
+    lockfile::save(&loaded, reread.path()).unwrap();
+    assert_eq!(read(&reread), raw);
+}
+
+#[test]
+fn a_bin_the_lockfile_should_not_be_able_to_spell_does_not_survive_loading() {
+    // §4: this file is checked in and arrives through pull requests, so it is
+    // as untrusted as a packument — and §1 makes it the *primary* source of
+    // bins, since an install whose importers all match reads nothing else.
+    // Trusted on load, the first of these plants a link outside `.bin` and the
+    // second aims one at a file the package does not own.
+    let registry = small_tree();
+    let dir = TempDir::new().unwrap();
+
+    let graph = resolve(&registry, &roots(&[("a", "^1.0.0")]), &no_members()).unwrap();
+    lockfile::save(&graph, dir.path()).unwrap();
+
+    let path = dir.path().join(LOCKFILE_NAME);
+    let raw = std::fs::read_to_string(&path).unwrap();
+    let edited = raw.replace(
+        r#""version": "1.0.0""#,
+        r#""version": "1.0.0", "bin": { "../../evil": "x.js", "out": "../../../etc/x", "fine": "bin/f.js" }"#,
+    );
+    assert_ne!(raw, edited, "the fixture did not give us an entry to edit");
+    std::fs::write(&path, edited).unwrap();
+
+    let loaded = lockfile::load(dir.path()).unwrap().unwrap();
+    // Every entry in the fixture carries that version string, so both packages
+    // were edited. Collected as a set: what is under test is which spellings
+    // survive, not how many packages happened to be given them.
+    let survived: BTreeMap<String, String> = loaded
+        .packages
+        .values()
+        .flat_map(|package| package.bins.clone())
+        .collect();
+
+    assert_eq!(
+        survived,
+        BTreeMap::from([("fine".to_string(), "bin/f.js".to_string())]),
+        "a lockfile spelled a bin a packument could not"
+    );
+}

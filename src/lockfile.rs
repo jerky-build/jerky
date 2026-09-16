@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::binaries::Declared;
 use crate::integrity::Integrity;
 use crate::platform::PlatformSupport;
 use crate::resolver::{
@@ -222,6 +223,29 @@ struct Entry {
     /// The architectures, same rule as `os`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     cpu: Vec<String>,
+    /// The CLI entry points the package publishes, as validated names and
+    /// package-relative paths.
+    ///
+    /// Recorded for the reason `declaredPeers` and the two blocks above are:
+    /// an install whose importers all still match resolves nothing and builds
+    /// its graph out of this file alone, so a file that did not name each
+    /// package's bins would write no shims at all on the most common install
+    /// there is. `declaredPeers` makes a *warning* survive a cache hit; this
+    /// makes `node_modules/.bin` survive one.
+    ///
+    /// Written post-validation and **validated again on the way back in**,
+    /// which is the point worth being careful about. This file is checked in
+    /// and arrives through pull requests, so it is exactly as untrusted as a
+    /// packument — and §1 makes it the *primary* source of bins rather than a
+    /// secondary one, since an install whose importers all still match reads
+    /// nothing else. A `bin` block trusted on load would let a hand-edited
+    /// lockfile spell `{"../../../evil": "x"}` and plant a link outside
+    /// `.bin`, or aim one at `/etc/cron.daily/x` and have jerky raise the
+    /// execute bit on it. `load` therefore re-runs the same check `named_for`
+    /// applies to a packument. See
+    /// `docs/specs/2026-09-16-bin-linking-design.md` §4.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    bin: BTreeMap<String, String>,
     /// What this node's own peers resolved to: the name it declared each under
     /// -> the key of the node that answered.
     ///
@@ -391,6 +415,7 @@ pub fn save(graph: &ResolvedGraph, project_dir: &Path) -> Result<(), LockfileErr
                         .collect(),
                     os: package.supports.os.clone(),
                     cpu: package.supports.cpu.clone(),
+                    bin: package.bins.clone(),
                     peers: package
                         .peers
                         .iter()
@@ -806,6 +831,11 @@ pub fn load(project_dir: &Path) -> Result<Option<ResolvedGraph>, LockfileError> 
             os: entry.os.clone(),
             cpu: entry.cpu.clone(),
         };
+        // Re-validated rather than taken as written, for the reason the field's
+        // own doc gives: this file is checked in, arrives through pull
+        // requests, and is the only thing a cache-hit install reads. Ahead of
+        // the initializer because `id` is moved into it.
+        let bins = Declared::Many(entry.bin).named_for(&id.name);
 
         packages.insert(
             id.clone(),
@@ -816,6 +846,7 @@ pub fn load(project_dir: &Path) -> Result<Option<ResolvedGraph>, LockfileError> 
                 dependencies,
                 optional_dependencies,
                 supports,
+                bins,
                 peers: entry
                     .peers
                     .iter()

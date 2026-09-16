@@ -5,7 +5,7 @@ use clap::Parser;
 use jerky::cli::{Cli, Command};
 use jerky::commands::install::{Mode, Skipped};
 use jerky::error::JerkyError;
-use jerky::linker::{Unowned, UnownedReason};
+use jerky::linker::{BinCollision, Unowned, UnownedReason};
 use jerky::platform::Platform;
 use jerky::resolver::{ImporterPath, Kind, UnsatisfiedPeer};
 use jerky::workspace::{Warning, Workspace};
@@ -86,6 +86,7 @@ fn run(cli: Cli) -> Result<(), JerkyError> {
                     )?;
                     report_unowned(&outcome.left_alone);
                     report_unsatisfied_peers(&outcome.unsatisfied_peers);
+                    report_bin_collisions(&outcome.bin_collisions);
                     report_skipped(&outcome.skipped, &outcome.platform);
                     let added = outcome
                         .recorded
@@ -105,6 +106,7 @@ fn run(cli: Cli) -> Result<(), JerkyError> {
                         jerky::commands::install::sync(&workspace, &store, &registry, None, mode)?;
                     report_unowned(&outcome.left_alone);
                     report_unsatisfied_peers(&outcome.unsatisfied_peers);
+                    report_bin_collisions(&outcome.bin_collisions);
                     report_skipped(&outcome.skipped, &outcome.platform);
                     // The packages, not the links: two importers on one version
                     // share a store entry, and reporting the link count would
@@ -141,6 +143,31 @@ fn report_unowned(entries: &[Unowned]) {
                 eprintln!("warning: left {path} alone — it links outside this workspace");
             }
         }
+    }
+}
+
+/// Say which bin names two dependencies both wanted.
+///
+/// Beside the others, for the same division: the linker knows which name it
+/// had to give away and this is the layer that knows a terminal is reading.
+///
+/// One line each rather than a count, because the point of saying anything is
+/// that the reader can act on it — the fix is to call the loser through its
+/// package rather than through `.bin`, and that needs both names.
+fn report_bin_collisions(collisions: &[BinCollision]) {
+    for collision in collisions {
+        let BinCollision {
+            bin_dir,
+            name,
+            winner,
+            loser,
+        } = collision;
+
+        eprintln!(
+            "warning: {winner} and {loser} both publish a `{name}` binary — \
+             {} links {winner}'s",
+            bin_dir.display()
+        );
     }
 }
 

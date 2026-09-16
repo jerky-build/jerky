@@ -1,3 +1,4 @@
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
@@ -12,6 +13,11 @@ use crate::staging::{STAGING_DIR, StagingDir};
 const EXDEV: i32 = 18;
 
 const VIRTUAL_STORE_DIR: &str = ".jerky";
+
+/// Where a `node_modules` keeps the CLI entry points of the packages beside
+/// it. npm's name, because every tool that puts this directory on `PATH`
+/// expects it — `npm run`, `npx`, and whatever a user has in their shell.
+const BIN_DIR: &str = ".bin";
 
 #[derive(Debug, Error)]
 pub enum LinkError {
@@ -62,13 +68,21 @@ pub(crate) struct Plan {
     /// The workspace root. The one virtual store hangs below it, and every
     /// importer link's climb is measured against it.
     workspace_root: PathBuf,
-    /// Every member's own directory, absolute.
+    /// Every member's own directory, absolute, and the bins it publishes.
     ///
     /// Deliberately not derived from the links below, though every local link
     /// points at one. Convergence needs the full set to recognise a link at a
     /// member that is *no longer* depended on as jerky's own — and a link the
-    /// plan no longer names is exactly the one that is missing from it.
-    members: BTreeSet<PathBuf>,
+    /// plan no longer names is exactly the one that is missing from it. The
+    /// bins are here for the sharper version of the same problem: a shim for a
+    /// member nothing depends on any more is still one jerky wrote, and
+    /// [`Provable::owns_shim_to`] can only say so by comparing against the
+    /// files a member actually publishes.
+    ///
+    /// Every member, not only the ones something depends on, for that reason
+    /// exactly — and it is why [`ImporterTarget::Member`] carries a bare
+    /// directory: a member's bins have one home, which is here.
+    members: BTreeMap<PathBuf, BTreeMap<String, String>>,
     /// The virtual store, keyed by the entry's directory name — which is the
     /// package's `name@version`, and its identity on disk.
     entries: BTreeMap<String, VirtualStoreEntry>,
@@ -106,6 +120,15 @@ pub(crate) struct VirtualStoreEntry {
     /// alias — a package declaring `npm:string-width@^4.0.0` under `width-cjs`
     /// calls it `width-cjs` and must land on `string-width`'s entry.
     pub edges: BTreeMap<String, VirtualStoreRef>,
+    /// The CLI entry points this package publishes: the name each takes inside
+    /// a `.bin` directory -> the file inside the package it points at.
+    ///
+    /// What the *package* declares, not where its links go. Which `.bin`
+    /// directories end up holding one is derived in [`Plan::apply`] from the
+    /// edges that reach this entry, for the same reason the prune derives its
+    /// input from `entries`: a plan that named both could name them
+    /// differently.
+    pub bins: BTreeMap<String, String>,
 }
 
 /// Which virtual store entry a link points at: the entry directory, and the
@@ -143,7 +166,10 @@ pub(crate) enum ImporterTarget {
 
 impl Plan {
     /// An empty plan for `workspace_root`, whose members are at `members`.
-    pub(crate) fn new(workspace_root: &Path, members: BTreeSet<PathBuf>) -> Self {
+    pub(crate) fn new(
+        workspace_root: &Path,
+        members: BTreeMap<PathBuf, BTreeMap<String, String>>,
+    ) -> Self {
         Plan {
             workspace_root: workspace_root.to_path_buf(),
             members,
@@ -237,7 +263,7 @@ impl Plan {
     /// written down because "the same way every run" is a property worth
     /// keeping, and the next person to compare a trace against an old one
     /// deserves to know which sort they are looking at.
-    pub(crate) fn apply(&self) -> Result<Vec<Unowned>, LinkError> {
+    pub(crate) fn apply(&self) -> Result<Applied, LinkError> {
         self.apply_across(materialise_workers())
     }
 
@@ -250,8 +276,9 @@ impl Plan {
     /// `available_parallelism` answers one and the pool runs the work list
     /// serially. What is under test there is what the report says when several
     /// entries fail at once, which is a question only a real fan-out asks.
-    fn apply_across(&self, workers: usize) -> Result<Vec<Unowned>, LinkError> {
+    fn apply_across(&self, workers: usize) -> Result<Applied, LinkError> {
         let node_modules = self.workspace_root.join("node_modules");
+        let virtual_store = node_modules.join(VIRTUAL_STORE_DIR);
 
         // Each entry is hard-linked out of the content store independently of
         // every other — no entry's contents mention another, and the links
@@ -273,13 +300,49 @@ impl Plan {
         // entry down, which a pool worker cannot do. It is the one definition
         // of where an entry lives, and `symlink_into_store` finds the store by
         // climbing out of it.
+        let mut bin_collisions = Vec::new();
+
+        // The one statement of what a link jerky wrote may point at, built
+        // once and shared by every importer's convergence.
+        let provable = Provable {
+            virtual_store: virtual_store.clone(),
+            members: &self.members,
+        };
+
         for entry in &entries {
             let owner = entry_dir(&node_modules, &entry.dir_name);
             for (link_name, target) in &entry.edges {
                 symlink_into_store(&owner, link_name, target)?;
             }
+
+            // A package's own dependencies' bins, in its own private `.bin`.
+            // With no ambient hoisting there is nowhere else for a package
+            // that shells out to a dependency's CLI to find it, and it is what
+            // #23 will put on `PATH` for a lifecycle script.
+            //
+            // Immediately after the edges rather than in a pass of its own,
+            // because it is the same question one level along: an edge says a
+            // package is visible, a shim says its CLI is runnable.
+            // Deliberately not `bin_collisions`. A collision in here is real —
+            // two of this package's own dependencies publishing one name — but
+            // it is not something the person running the install can act on:
+            // they chose neither dependency, and the directory the report would
+            // name is a `.jerky/...` path they have no reason to open. The
+            // resolution is still deterministic; only the telling is dropped.
+            let mut unreported = Vec::new();
+            self.fill_bin_dir(
+                &owner.join("node_modules").join(BIN_DIR),
+                entry.edges.iter().map(|(link_name, target)| ShimSource {
+                    declared_by: link_name,
+                    bins: self.bins_of(target),
+                    package_dir: target.path_under(&virtual_store),
+                    provenance: Provenance::Unpacked,
+                }),
+                &mut unreported,
+            )?;
         }
 
+        let mut left_alone = Vec::new();
         for (importer, links) in &self.importers {
             for (link_name, target) in links {
                 match target {
@@ -289,16 +352,38 @@ impl Plan {
                     ImporterTarget::Member(member) => symlink_local(importer, link_name, member)?,
                 }
             }
-        }
 
-        let mut left_alone = Vec::new();
-        for (importer, links) in &self.importers {
-            let expected: BTreeSet<String> = links.keys().cloned().collect();
+            // Direct dependencies only, which is what `links` already holds:
+            // a transitive dependency's CLI is not something this importer
+            // declared and not something it should be able to call by name.
+            let shims = self.fill_bin_dir(
+                &importer.join("node_modules").join(BIN_DIR),
+                links.iter().map(|(link_name, target)| match target {
+                    ImporterTarget::Entry(entry) => ShimSource {
+                        declared_by: link_name,
+                        bins: self.bins_of(entry),
+                        package_dir: entry.path_under(&virtual_store),
+                        provenance: Provenance::Unpacked,
+                    },
+                    ImporterTarget::Member(member) => ShimSource {
+                        declared_by: link_name,
+                        bins: self.bins_at(member),
+                        package_dir: member.clone(),
+                        provenance: Provenance::CheckedIn,
+                    },
+                }),
+                &mut bin_collisions,
+            )?;
+
+            // Both derived from what was just written rather than gathered
+            // beside it, for the reason the prune's input is: a converge that
+            // could disagree with the write is a converge that deletes a link
+            // this very install created.
             left_alone.extend(converge(
                 importer,
-                &self.workspace_root,
-                &self.members,
-                &expected,
+                &provable,
+                &links.keys().cloned().collect(),
+                &shims.keys().cloned().collect(),
             )?);
         }
 
@@ -308,7 +393,249 @@ impl Plan {
         let named: BTreeSet<String> = self.entries.keys().cloned().collect();
         prune_virtual_store(&node_modules, &named)?;
 
-        Ok(left_alone)
+        Ok(Applied {
+            left_alone,
+            bin_collisions,
+        })
+    }
+
+    /// Resolve one `.bin` directory's contents and write them, returning what
+    /// it should hold.
+    ///
+    /// The two callers differ only in how they build a [`ShimSource`] — one
+    /// walks a store entry's edges, the other an importer's links — and the
+    /// pair of calls below was the same two lines twice. Returning the
+    /// resolved map is what lets the importer pass hand convergence exactly
+    /// what was written rather than recomputing it.
+    fn fill_bin_dir<'a>(
+        &self,
+        bin_dir: &Path,
+        sources: impl Iterator<Item = ShimSource<'a>>,
+        collisions: &mut Vec<BinCollision>,
+    ) -> Result<BTreeMap<String, Shim>, LinkError> {
+        let shims = resolve_shims(bin_dir, sources, collisions);
+        write_shims(bin_dir, &shims)?;
+
+        Ok(shims)
+    }
+
+    /// The bins the member at `dir` publishes.
+    ///
+    /// The member arm of [`Self::bins_of`], answering from the same map
+    /// convergence proves shim ownership against — so a shim jerky writes and
+    /// a shim jerky recognises cannot be computed from two different ideas of
+    /// what a member publishes.
+    fn bins_at(&self, dir: &Path) -> &BTreeMap<String, String> {
+        static NO_BINS: BTreeMap<String, String> = BTreeMap::new();
+
+        self.members.get(dir).unwrap_or(&NO_BINS)
+    }
+
+    /// The bins of the entry a reference names.
+    ///
+    /// Every edge in a plan points at an entry the same plan holds, so the
+    /// miss is unreachable — but answering it with "no bins" rather than a
+    /// panic keeps a plan built by hand in a test from having to be complete
+    /// to be useful, and an entry that really were missing is already a link
+    /// resolving to nothing, which the prune and the next install deal with.
+    fn bins_of(&self, reference: &VirtualStoreRef) -> &BTreeMap<String, String> {
+        static NO_BINS: BTreeMap<String, String> = BTreeMap::new();
+
+        self.entries
+            .get(&reference.dir_name)
+            .map_or(&NO_BINS, |entry| &entry.bins)
+    }
+}
+
+/// What [`Plan::apply`] found that it could not simply do.
+///
+/// Neither half is an error and neither stops an install. They travel up
+/// through the install's outcome to whoever knows a terminal is reading, which
+/// is the same division `Workspace::warnings()` draws.
+#[derive(Debug)]
+pub struct Applied {
+    /// Entries convergence left where it found them, with the reason.
+    pub left_alone: Vec<Unowned>,
+    /// Bin names two dependencies both wanted, with the one that got it.
+    pub bin_collisions: Vec<BinCollision>,
+}
+
+/// Two dependencies of one importer, or of one package, publishing a bin under
+/// the same name.
+///
+/// A `.bin` directory is a flat namespace and npm's answer is whichever link
+/// was written last, which makes the tree a function of iteration order. jerky
+/// gives the name to the alphabetically first dependency that declares it, so
+/// the answer is at least the same one on every machine — and says so, because
+/// a `tsc` that is not the `tsc` you expected is otherwise a long afternoon.
+#[derive(Debug, Clone)]
+pub struct BinCollision {
+    /// The `.bin` directory both wanted a link in.
+    pub bin_dir: PathBuf,
+    /// The bin name they both declared.
+    pub name: String,
+    /// The dependency whose bin is linked, by the name its dependent calls it.
+    pub winner: String,
+    /// The dependency whose bin is not.
+    pub loser: String,
+}
+
+/// Who owns the file a shim points at, which is what decides whether jerky may
+/// make it executable.
+///
+/// An enum rather than a `bool`, because the answer is not a property of the
+/// shim but of where the bytes came from — and the reason is what a reader
+/// needs. See [`ensure_executable`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Provenance {
+    /// Unpacked into the content store from a tarball. jerky may raise the
+    /// execute bit: everyone sharing the entry has the same package at the
+    /// same version and declares the same bins.
+    Unpacked,
+    /// A file in the user's own repository, under version control. jerky links
+    /// it and leaves its mode exactly as it found it.
+    CheckedIn,
+}
+
+/// One dependency's contribution to a `.bin` directory.
+struct ShimSource<'a> {
+    /// The name the dependent calls this dependency, which is what a collision
+    /// report names and what decides who wins one.
+    declared_by: &'a str,
+    /// What that dependency publishes.
+    bins: &'a BTreeMap<String, String>,
+    /// Its own directory, which its bin paths are relative to.
+    package_dir: PathBuf,
+    provenance: Provenance,
+}
+
+/// One link a `.bin` directory should hold.
+struct Shim {
+    /// The file the link points at, absolute.
+    file: PathBuf,
+    /// Who declared it, kept only so a collision can name the winner.
+    declared_by: String,
+    provenance: Provenance,
+}
+
+/// What a `.bin` directory should hold, given everything visible beside it.
+///
+/// **The first declaring dependency wins a contested name.** Callers pass a
+/// `BTreeMap`'s iteration order, so "first" is "alphabetically first by the
+/// name the dependent calls it" — a property of the plan rather than of which
+/// entry the loop reached first, which is what makes the resulting tree the
+/// same on every machine.
+fn resolve_shims<'a>(
+    bin_dir: &Path,
+    sources: impl Iterator<Item = ShimSource<'a>>,
+    collisions: &mut Vec<BinCollision>,
+) -> BTreeMap<String, Shim> {
+    let mut shims: BTreeMap<String, Shim> = BTreeMap::new();
+
+    for source in sources {
+        for (name, target) in source.bins {
+            match shims.entry(name.clone()) {
+                Entry::Vacant(slot) => {
+                    slot.insert(Shim {
+                        file: source.package_dir.join(target),
+                        declared_by: source.declared_by.to_string(),
+                        provenance: source.provenance,
+                    });
+                }
+                Entry::Occupied(taken) => collisions.push(BinCollision {
+                    bin_dir: bin_dir.to_path_buf(),
+                    name: name.clone(),
+                    winner: taken.get().declared_by.clone(),
+                    loser: source.declared_by.to_string(),
+                }),
+            }
+        }
+    }
+
+    shims
+}
+
+/// Write one `.bin` directory's links, making each target runnable first.
+///
+/// The chmod happens before the link rather than after, so a `.bin` entry
+/// never exists pointing at a file that is not yet executable — the same
+/// ordering `Plan::apply` uses one level up, where an entry exists before
+/// anything links to it.
+///
+/// `bin_dir` itself is created by [`place_symlink`], through
+/// [`crate::directory`] like every other directory jerky makes, and so is not
+/// created at all when there are no shims to write.
+fn write_shims(bin_dir: &Path, shims: &BTreeMap<String, Shim>) -> Result<(), LinkError> {
+    for (name, shim) in shims {
+        if shim.provenance == Provenance::Unpacked {
+            ensure_executable(&shim.file)?;
+        }
+
+        place_symlink(bin_dir.join(name), relative_path(bin_dir, &shim.file))?;
+    }
+
+    Ok(())
+}
+
+/// Raise the execute bits on a bin target, through the hard link into the
+/// content store.
+///
+/// npm packages routinely ship their `bin` targets at `0o644` and rely on the
+/// package manager to fix it at install time. jerky's virtual store is hard
+/// links, so the file chmodded here shares an inode with the machine-global
+/// store entry and with every other project holding that package. Doing it
+/// anyway is the conclusion of
+/// `docs/research/2026-09-14-pnpm-bin-executability.md`: everyone sharing a
+/// jerky store entry has the same package at the same version and therefore
+/// declares the same bins, so this is a property every consumer already agrees
+/// on rather than shared state being violated.
+///
+/// Three properties, each load-bearing:
+///
+/// - **Raise, never set.** `| 0o111`, not `= 0o755`, so the operation is
+///   monotonic and two concurrent installs cannot disagree about the result.
+/// - **Read before writing**, which makes the warm case one `stat` instead of
+///   a `stat` and a `chmod` — and this runs on every install, for every bin.
+/// - **`NotFound` is not an error.** Nothing serializes bin linking across
+///   concurrent installs, so another process may have taken the package away
+///   between materialising and linking; it writes an equivalent file and
+///   chmods it in turn. pnpm tolerates it for the same reason.
+///
+/// **A workspace member's own files are never chmodded**, which is why callers
+/// pass a [`Provenance`] rather than this deciding for itself. A member's bin
+/// is a file in the user's repository under version control, where a raised
+/// execute bit is a change git reports and a reviewer has to explain. The
+/// store argument does not reach it either: nobody else shares that file. A
+/// member shipping a non-executable bin gets a shim that reports `EACCES`,
+/// and `chmod +x` on it is the repository's own to make.
+fn ensure_executable(target: &Path) -> Result<(), LinkError> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    // `metadata` rather than `symlink_metadata`: a bin target is an ordinary
+    // file reached through ordinary directories, and the mode being asked
+    // about is the file's.
+    let mode = match std::fs::metadata(target) {
+        Ok(metadata) => metadata.permissions().mode(),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(LinkError::Access {
+                path: target.to_path_buf(),
+                source,
+            });
+        }
+    };
+
+    if mode & 0o111 == 0o111 {
+        return Ok(());
+    }
+
+    match std::fs::set_permissions(target, std::fs::Permissions::from_mode(mode | 0o111)) {
+        Ok(()) => Ok(()),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(LinkError::Access {
+            path: target.to_path_buf(),
+            source,
+        }),
     }
 }
 
@@ -800,16 +1127,28 @@ enum Ownership {
 /// repository that has seen npm must not be a destructive surprise.
 fn converge(
     importer_dir: &Path,
-    workspace_root: &Path,
-    members: &BTreeSet<PathBuf>,
+    provable: &Provable<'_>,
     expected: &BTreeSet<String>,
+    expected_bins: &BTreeSet<String>,
 ) -> Result<Vec<Unowned>, LinkError> {
     let node_modules = importer_dir.join("node_modules");
-    let virtual_store = workspace_root.join("node_modules").join(VIRTUAL_STORE_DIR);
     let mut left_alone = Vec::new();
 
     for path in entries(&node_modules)? {
         let name = file_name(&path);
+
+        // `.bin` is jerky's too, and holds links rather than packages — so it
+        // is converged against the shims the plan named for this importer
+        // rather than against its dependencies, and falling through would
+        // report a directory jerky just wrote as one it declined to touch.
+        //
+        // Only a real directory takes this path. Something else called `.bin`
+        // is an ordinary entry and is judged as one, which is the honest
+        // answer: jerky did not write it.
+        if name == BIN_DIR && is_real_dir(&path)? {
+            converge_bin_dir(&path, expected_bins, provable, &mut left_alone)?;
+            continue;
+        }
 
         // The virtual store is jerky's, not an importer's dependency, and what
         // belongs in it is a question `prune_virtual_store` answers with the
@@ -835,14 +1174,7 @@ fn converge(
             let mut emptied_it = false;
             for child in entries(&path)? {
                 let scoped = format!("{name}/{}", file_name(&child));
-                emptied_it |= converge_entry(
-                    &child,
-                    &scoped,
-                    &virtual_store,
-                    members,
-                    expected,
-                    &mut left_alone,
-                )?;
+                emptied_it |= converge_entry(&child, &scoped, provable, expected, &mut left_alone)?;
             }
 
             // A scope directory exists only to hold packages, so one this
@@ -868,14 +1200,7 @@ fn converge(
             continue;
         }
 
-        converge_entry(
-            &path,
-            &name,
-            &virtual_store,
-            members,
-            expected,
-            &mut left_alone,
-        )?;
+        converge_entry(&path, &name, provable, expected, &mut left_alone)?;
     }
 
     Ok(left_alone)
@@ -896,8 +1221,7 @@ fn converge(
 fn converge_entry(
     path: &Path,
     name: &str,
-    virtual_store: &Path,
-    members: &BTreeSet<PathBuf>,
+    provable: &Provable<'_>,
     expected: &BTreeSet<String>,
     left_alone: &mut Vec<Unowned>,
 ) -> Result<bool, LinkError> {
@@ -905,7 +1229,7 @@ fn converge_entry(
         return Ok(false);
     }
 
-    match ownership(path, virtual_store, members)? {
+    match ownership(path, |resolved| provable.owns_link_to(resolved))? {
         // `remove_file` on a symlink removes the link and never the directory
         // it names, which is the whole reason a dependency can be unlinked from
         // one importer while another goes on using it.
@@ -926,12 +1250,60 @@ fn converge_entry(
     }
 }
 
-/// Can jerky prove it wrote this entry?
-fn ownership(
-    path: &Path,
-    virtual_store: &Path,
-    members: &BTreeSet<PathBuf>,
-) -> Result<Ownership, LinkError> {
+/// Remove the shims in one `.bin` that `expected` does not account for.
+///
+/// The same shape as [`converge`] one level down, and the same reason: a
+/// dependency dropped from a `package.json` must lose its shim, or `tsc` goes
+/// on resolving to a package the project no longer declares.
+///
+/// A `.bin` this emptied is removed, on the reasoning that removes an emptied
+/// scope directory: jerky never creates one it does not immediately fill, so
+/// one it has just taken the last link out of is provably its own debris. One
+/// that still holds something — a shim another tool wrote, most likely — is
+/// left, and so is the directory holding it.
+fn converge_bin_dir(
+    bin_dir: &Path,
+    expected: &BTreeSet<String>,
+    provable: &Provable<'_>,
+    left_alone: &mut Vec<Unowned>,
+) -> Result<(), LinkError> {
+    let mut emptied_it = false;
+
+    for path in entries(bin_dir)? {
+        if expected.contains(&file_name(&path)) {
+            continue;
+        }
+
+        match ownership(&path, |resolved| provable.owns_shim_to(resolved))? {
+            Ownership::Jerkys => {
+                std::fs::remove_file(&path).map_err(|source| LinkError::Access {
+                    path: path.clone(),
+                    source,
+                })?;
+                emptied_it = true;
+            }
+            Ownership::Unowned(reason) => left_alone.push(Unowned { path, reason }),
+        }
+    }
+
+    if emptied_it && entries(bin_dir)?.is_empty() {
+        std::fs::remove_dir(bin_dir).map_err(|source| LinkError::Access {
+            path: bin_dir.to_path_buf(),
+            source,
+        })?;
+    }
+
+    Ok(())
+}
+
+/// Where an entry points, normalized lexically, or `None` when it is not a
+/// symlink at all.
+///
+/// Shared by the two ownership tests so that "judged as a link rather than as
+/// whatever it points at", "a dangling link is seen rather than reported
+/// missing" and "an absolute target is judged where it actually points" are
+/// decided once instead of twice.
+fn link_destination(path: &Path) -> Result<Option<PathBuf>, LinkError> {
     // symlink_metadata rather than metadata, so a link is judged as a link
     // rather than as whatever it happens to point at — and so a dangling one is
     // seen at all instead of reported as missing.
@@ -940,7 +1312,7 @@ fn ownership(
         source,
     })?;
     if !metadata.file_type().is_symlink() {
-        return Ok(Ownership::Unowned(UnownedReason::NotASymlink));
+        return Ok(None);
     }
 
     let target = std::fs::read_link(path).map_err(|source| LinkError::Access {
@@ -950,17 +1322,92 @@ fn ownership(
     let parent = path
         .parent()
         .expect("an entry read out of a directory has that directory as its parent");
+
     // `join` takes an absolute target as-is, so a hand-written absolute link is
     // judged where it actually points rather than somewhere under the importer.
-    let resolved = normalize(&parent.join(target));
+    Ok(Some(normalize(&parent.join(target))))
+}
 
-    Ok(
-        if resolved.starts_with(virtual_store) || members.contains(&resolved) {
-            Ownership::Jerkys
-        } else {
-            Ownership::Unowned(UnownedReason::PointsOutside)
-        },
-    )
+/// The two places a link jerky wrote may point: the workspace's one virtual
+/// store, and its members.
+///
+/// A type rather than two parameters because every ownership question needs
+/// both, neither means anything alone, and they had begun travelling together
+/// through four functions. Gathering them also puts the two ownership rules
+/// side by side, which is where they need to be read: they differ, and the
+/// difference is the subtlest thing in this module.
+struct Provable<'a> {
+    /// `<workspace_root>/node_modules/.jerky`.
+    virtual_store: PathBuf,
+    /// Every member's own directory, and the bins it publishes.
+    members: &'a BTreeMap<PathBuf, BTreeMap<String, String>>,
+}
+
+impl Provable<'_> {
+    /// Can jerky prove it wrote a `node_modules` entry pointing at `resolved`?
+    ///
+    /// **Exactly** a member, not inside one. A `node_modules` link points at a
+    /// package directory, and [`symlink_local`] aims at the member itself — so
+    /// a link into a member's *subdirectory* is someone else's idea of where a
+    /// package lives, and is not jerky's to remove.
+    fn owns_link_to(&self, resolved: &Path) -> bool {
+        resolved.starts_with(&self.virtual_store) || self.members.contains_key(resolved)
+    }
+
+    /// Can jerky prove it wrote a `.bin` entry pointing at `resolved`?
+    ///
+    /// A near miss of [`Self::owns_link_to`], and deliberately so: a shim
+    /// points at a *file inside* a package where a `node_modules` link points
+    /// at the package itself. Requiring the target to be exactly a member
+    /// would disown every shim jerky writes for a local dependency and leave
+    /// each one behind forever, reported on every install.
+    ///
+    /// So the member arm compares against the **exact files the members
+    /// publish** — `<member>/<declared bin target>` — rather than against a
+    /// path prefix. A prefix test is the version that first suggests itself
+    /// and it is unsound in the direction that costs the most: the workspace
+    /// root is itself a member, so "inside a member" means "anywhere in the
+    /// repository", and a hand-written `.bin/lint -> ../../scripts/lint.sh`
+    /// would be deleted by an install that never wrote it. Excluding paths
+    /// that pass through a `node_modules` narrows that but does not fix it —
+    /// `scripts/lint.sh` passes through none.
+    ///
+    /// The finite set is available because [`Plan::members`] carries every
+    /// member's bins, not only those of the members something currently
+    /// depends on — which is what lets this still recognise the shim of a
+    /// member dependency that has just been dropped.
+    ///
+    /// The residual leak is narrow and is the honest direction: a member that
+    /// *stops publishing* a bin leaves its shim behind, reported rather than
+    /// removed, because at that point nothing on disk distinguishes it from a
+    /// link somebody wrote by hand.
+    fn owns_shim_to(&self, resolved: &Path) -> bool {
+        if resolved.starts_with(&self.virtual_store) {
+            return true;
+        }
+
+        self.members
+            .iter()
+            .any(|(dir, bins)| bins.values().any(|target| dir.join(target) == resolved))
+    }
+}
+
+/// Can jerky prove it wrote this entry, by whichever rule applies to it?
+///
+/// The rule is a parameter because the two callers need different ones and
+/// everything around it — a non-symlink is never jerky's, a dangling link is
+/// still judged, an absolute target is judged where it points — is the same
+/// for both. See [`Provable::owns_link_to`] and [`Provable::owns_shim_to`].
+fn ownership(path: &Path, is_ours: impl Fn(&Path) -> bool) -> Result<Ownership, LinkError> {
+    let Some(resolved) = link_destination(path)? else {
+        return Ok(Ownership::Unowned(UnownedReason::NotASymlink));
+    };
+
+    Ok(if is_ours(&resolved) {
+        Ownership::Jerkys
+    } else {
+        Ownership::Unowned(UnownedReason::PointsOutside)
+    })
 }
 
 /// Resolve `.` and `..` away without touching the filesystem.
@@ -1138,7 +1585,7 @@ mod tests {
     /// Deliberately not derived from `dir_name`: deriving it would mean these
     /// tests agree with themselves about how the two relate rather than with
     /// the caller, and that pairing is exactly what an alias breaks.
-    fn entry(dir_name: &str, pkg_name: &str) -> VirtualStoreRef {
+    pub(super) fn entry(dir_name: &str, pkg_name: &str) -> VirtualStoreRef {
         VirtualStoreRef {
             dir_name: dir_name.to_string(),
             pkg_name: pkg_name.to_string(),
@@ -1173,6 +1620,7 @@ mod tests {
             pkg_name: pkg_name.to_string(),
             content_store_path: store.to_path_buf(),
             edges: BTreeMap::new(),
+            bins: BTreeMap::new(),
         }
     }
 
@@ -1649,8 +2097,22 @@ mod tests {
     /// Does anything at all still sit at `path`? `exists` follows links and so
     /// answers `false` for a dangling one, which is precisely the entry these
     /// tests are about.
-    fn still_there(path: &Path) -> bool {
+    pub(super) fn still_there(path: &Path) -> bool {
         std::fs::symlink_metadata(path).is_ok()
+    }
+
+    /// The ownership proof, built the way `apply` builds it.
+    ///
+    /// A helper rather than a literal at each call site so these tests and
+    /// `apply` cannot end up with two ideas of where the virtual store is.
+    fn provable<'a>(
+        workspace_root: &Path,
+        members: &'a BTreeMap<PathBuf, BTreeMap<String, String>>,
+    ) -> Provable<'a> {
+        Provable {
+            virtual_store: workspace_root.join("node_modules").join(VIRTUAL_STORE_DIR),
+            members,
+        }
     }
 
     fn names(expected: &[&str]) -> BTreeSet<String> {
@@ -1676,7 +2138,7 @@ mod tests {
 
         let left_alone = converge(
             &workspace_root,
-            &workspace_root,
+            &provable(&workspace_root, &BTreeMap::new()),
             &BTreeSet::new(),
             &BTreeSet::new(),
         )
@@ -1707,14 +2169,19 @@ mod tests {
         std::fs::write(member_dir.join("package.json"), r#"{"name":"ui"}"#).unwrap();
 
         symlink_local(&importer_dir, "ui", &member_dir).unwrap();
-        let members = BTreeSet::from([
-            workspace_root.clone(),
-            importer_dir.clone(),
-            member_dir.clone(),
+        let members = BTreeMap::from([
+            (workspace_root.clone(), BTreeMap::new()),
+            (importer_dir.clone(), BTreeMap::new()),
+            (member_dir.clone(), BTreeMap::new()),
         ]);
 
-        let left_alone =
-            converge(&importer_dir, &workspace_root, &members, &BTreeSet::new()).unwrap();
+        let left_alone = converge(
+            &importer_dir,
+            &provable(&workspace_root, &members),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        )
+        .unwrap();
 
         assert!(
             left_alone.is_empty(),
@@ -1757,9 +2224,9 @@ mod tests {
 
         let left_alone = converge(
             &workspace_root,
-            &workspace_root,
-            &BTreeSet::new(),
+            &provable(&workspace_root, &BTreeMap::new()),
             &names(&["@scope/live"]),
+            &BTreeSet::new(),
         )
         .unwrap();
 
@@ -1872,7 +2339,7 @@ mod tests {
 
         let left_alone = converge(
             &workspace_root,
-            &workspace_root,
+            &provable(&workspace_root, &BTreeMap::new()),
             &BTreeSet::new(),
             &BTreeSet::new(),
         )
@@ -1889,7 +2356,7 @@ mod tests {
 
     /// A store entry for one package, recording where it came from so a link
     /// followed to it says which entry it actually landed on.
-    fn store_tree(root: &Path, dir_name: &str, pkg_name: &str) -> PathBuf {
+    pub(super) fn store_tree(root: &Path, dir_name: &str, pkg_name: &str) -> PathBuf {
         let entry = root.join("store").join(dir_name);
         std::fs::create_dir_all(&entry).unwrap();
         std::fs::write(
@@ -1909,12 +2376,13 @@ mod tests {
         parsed["from"].as_str().unwrap().to_string()
     }
 
-    fn leaf(root: &Path, dir_name: &str, pkg_name: &str) -> VirtualStoreEntry {
+    pub(super) fn leaf(root: &Path, dir_name: &str, pkg_name: &str) -> VirtualStoreEntry {
         VirtualStoreEntry {
             dir_name: dir_name.to_string(),
             pkg_name: pkg_name.to_string(),
             content_store_path: store_tree(root, dir_name, pkg_name),
             edges: BTreeMap::new(),
+            bins: BTreeMap::new(),
         }
     }
 
@@ -1928,13 +2396,19 @@ mod tests {
         let ws = root.path().join("ws");
         let ui = ws.join("packages/ui");
 
-        let mut forwards = Plan::new(&ws, BTreeSet::from([ws.clone(), ui.clone()]));
+        let mut forwards = Plan::new(
+            &ws,
+            BTreeMap::from([(ws.clone(), BTreeMap::new()), (ui.clone(), BTreeMap::new())]),
+        );
         forwards.add_entry(leaf(root.path(), "alpha@1.0.0", "alpha"));
         forwards.add_entry(leaf(root.path(), "beta@2.0.0", "beta"));
         forwards.add_importer(&ws, BTreeMap::new());
         forwards.add_importer(&ui, BTreeMap::new());
 
-        let mut backwards = Plan::new(&ws, BTreeSet::from([ws.clone(), ui.clone()]));
+        let mut backwards = Plan::new(
+            &ws,
+            BTreeMap::from([(ws.clone(), BTreeMap::new()), (ui.clone(), BTreeMap::new())]),
+        );
         backwards.add_importer(&ui, BTreeMap::new());
         backwards.add_importer(&ws, BTreeMap::new());
         backwards.add_entry(leaf(root.path(), "beta@2.0.0", "beta"));
@@ -1957,7 +2431,7 @@ mod tests {
         let root = TempDir::new().unwrap();
         let ws = root.path().join("ws");
 
-        let mut plan = Plan::new(&ws, BTreeSet::new());
+        let mut plan = Plan::new(&ws, BTreeMap::new());
         plan.add_entry(leaf(root.path(), "alpha@1.0.0", "alpha"));
         plan.add_entry(leaf(root.path(), "alpha@1.0.0", "alpha"));
     }
@@ -1984,7 +2458,10 @@ mod tests {
         populate_virtual_store(&leaf(root.path(), "gone@0.1.0", "gone"), &node_modules).unwrap();
         symlink_dependency_from(&ws, &ws, "gone", &entry("gone@0.1.0", "gone")).unwrap();
 
-        let mut plan = Plan::new(&ws, BTreeSet::from([ws.clone(), ui.clone()]));
+        let mut plan = Plan::new(
+            &ws,
+            BTreeMap::from([(ws.clone(), BTreeMap::new()), (ui.clone(), BTreeMap::new())]),
+        );
 
         plan.add_importer(
             &ws,
@@ -2009,10 +2486,11 @@ mod tests {
             pkg_name: "alpha".to_string(),
             content_store_path: store_tree(root.path(), "alpha@1.0.0", "alpha"),
             edges: BTreeMap::from([("beta".to_string(), entry("beta@2.0.0", "beta"))]),
+            bins: BTreeMap::new(),
         });
         plan.add_entry(leaf(root.path(), "beta@2.0.0", "beta"));
 
-        let left_alone = plan.apply().unwrap();
+        let left_alone = plan.apply().unwrap().left_alone;
         assert!(left_alone.is_empty(), "{left_alone:?}");
 
         // Every entry the plan names survived the very pass that created it.
@@ -2066,7 +2544,7 @@ mod tests {
         populate_virtual_store(&leaf(root.path(), "alpha@0.9.0", "alpha"), &node_modules).unwrap();
         symlink_dependency_from(&ws, &ws, "alpha", &entry("alpha@0.9.0", "alpha")).unwrap();
 
-        let mut plan = Plan::new(&ws, BTreeSet::from([ws.clone()]));
+        let mut plan = Plan::new(&ws, BTreeMap::from([(ws.clone(), BTreeMap::new())]));
         plan.add_entry(leaf(root.path(), "alpha@1.0.0", "alpha"));
         plan.add_importer(
             &ws,
@@ -2076,7 +2554,7 @@ mod tests {
             )]),
         );
 
-        assert!(plan.apply().unwrap().is_empty());
+        assert!(plan.apply().unwrap().left_alone.is_empty());
 
         assert_eq!(
             resolves_to(&ws.join("node_modules/alpha")),
@@ -2129,12 +2607,16 @@ mod tests {
         let ui = ws.join("packages/ui");
         std::fs::create_dir_all(&ui).unwrap();
 
-        let mut plan = Plan::new(&ws, BTreeSet::from([ws.clone(), ui.clone()]));
+        let mut plan = Plan::new(
+            &ws,
+            BTreeMap::from([(ws.clone(), BTreeMap::new()), (ui.clone(), BTreeMap::new())]),
+        );
         plan.add_entry(VirtualStoreEntry {
             dir_name: "alpha@1.0.0".to_string(),
             pkg_name: "alpha".to_string(),
             content_store_path: store_tree(root.path(), "alpha@1.0.0", "alpha"),
             edges: BTreeMap::from([("beta".to_string(), entry("beta@2.0.0", "beta"))]),
+            bins: BTreeMap::new(),
         });
         plan.add_entry(leaf(root.path(), "beta@2.0.0", "beta"));
         plan.add_entry(leaf(root.path(), "@types/node@20.0.0", "@types/node"));
@@ -2156,7 +2638,7 @@ mod tests {
             ]),
         );
 
-        assert!(plan.apply().unwrap().is_empty());
+        assert!(plan.apply().unwrap().left_alone.is_empty());
         let before = tree_fingerprint(&ws);
 
         let symlinks = before
@@ -2173,7 +2655,7 @@ mod tests {
             "the tree this compares has to contain the links whose rewriting is the point"
         );
 
-        assert!(plan.apply().unwrap().is_empty());
+        assert!(plan.apply().unwrap().left_alone.is_empty());
 
         assert_eq!(
             tree_fingerprint(&ws),
@@ -2203,7 +2685,7 @@ mod tests {
             let ws = root.path().join("ws");
             std::fs::create_dir_all(&ws).unwrap();
 
-            let mut plan = Plan::new(&ws, BTreeSet::from([ws.clone()]));
+            let mut plan = Plan::new(&ws, BTreeMap::from([(ws.clone(), BTreeMap::new())]));
             plan.add_importer(&ws, BTreeMap::new());
             for name in ["a", "b", "c", "d", "e", "f", "g", "h"] {
                 let dir_name = format!("{name}@1.0.0");
@@ -2218,6 +2700,7 @@ mod tests {
                     pkg_name: name.to_string(),
                     content_store_path,
                     edges: BTreeMap::new(),
+                    bins: BTreeMap::new(),
                 });
             }
 
@@ -2248,7 +2731,7 @@ mod tests {
         let ws = root.path().join("ws");
         std::fs::create_dir_all(&ws).unwrap();
 
-        let mut plan = Plan::new(&ws, BTreeSet::from([ws.clone()]));
+        let mut plan = Plan::new(&ws, BTreeMap::from([(ws.clone(), BTreeMap::new())]));
         let mut links = BTreeMap::new();
         for n in 0..64 {
             let pkg_name = format!("@types/p{n}");
@@ -2295,14 +2778,437 @@ mod tests {
         let node_modules = ws.join("node_modules");
         std::fs::create_dir_all(node_modules.join("from-npm")).unwrap();
 
-        let mut plan = Plan::new(&ws, BTreeSet::from([ws.clone()]));
+        let mut plan = Plan::new(&ws, BTreeMap::from([(ws.clone(), BTreeMap::new())]));
         plan.add_importer(&ws, BTreeMap::new());
 
-        let left_alone = plan.apply().unwrap();
+        let left_alone = plan.apply().unwrap().left_alone;
 
         assert_eq!(left_alone.len(), 1, "{left_alone:?}");
         assert_eq!(left_alone[0].path, node_modules.join("from-npm"));
         assert!(matches!(left_alone[0].reason, UnownedReason::NotASymlink));
         assert!(still_there(&node_modules.join("from-npm")));
+    }
+}
+
+/// `.bin`: the shims that make a locally-installed tool runnable.
+///
+/// Every test here is a claim from
+/// `docs/specs/2026-09-16-bin-linking-design.md` rather than coverage for its
+/// own sake — where a shim goes, what it is allowed to point at, whose
+/// execute bit jerky raises, and what convergence may take away again.
+#[cfg(test)]
+mod bin_tests {
+    use super::*;
+
+    // The helpers the rest of the linker's tests already build plans with.
+    // Shared rather than reimplemented so a change to how a store tree is laid
+    // out cannot leave these two suites disagreeing about it.
+    use super::tests::{entry, leaf, still_there, store_tree};
+    // The one definition of "the mode a path carries", masked the one way.
+    // A second copy here would be a second chance to mask differently, which
+    // is what its own doc comment says it exists to prevent.
+    use crate::testing::mode_of;
+
+    use tempfile::TempDir;
+
+    /// [`store_tree`] with a bin file added at `bin/<pkg_name>`, carrying the
+    /// mode a publisher gave it.
+    ///
+    /// Built on the shared layout rather than beside it, so a change to what a
+    /// store tree contains cannot leave this suite and the linker's other one
+    /// disagreeing about it.
+    fn store_tree_with_bin(root: &Path, dir_name: &str, pkg_name: &str, mode: u32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let entry = store_tree(root, dir_name, pkg_name);
+        std::fs::create_dir_all(entry.join("bin")).unwrap();
+
+        let bin = entry.join("bin").join(pkg_name);
+        std::fs::write(&bin, "#!/bin/sh\necho hello\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(mode)).unwrap();
+
+        entry
+    }
+
+    /// An entry publishing one bin named after the package, at `bin/<name>`.
+    fn publisher(root: &Path, dir_name: &str, pkg_name: &str, mode: u32) -> VirtualStoreEntry {
+        VirtualStoreEntry {
+            dir_name: dir_name.to_string(),
+            pkg_name: pkg_name.to_string(),
+            content_store_path: store_tree_with_bin(root, dir_name, pkg_name, mode),
+            edges: BTreeMap::new(),
+            bins: BTreeMap::from([(pkg_name.to_string(), format!("bin/{pkg_name}"))]),
+        }
+    }
+
+    #[test]
+    fn a_direct_dependencys_bin_is_linked_into_the_importers_bin_and_resolves() {
+        let root = TempDir::new().unwrap();
+        let ws = root.path().join("ws");
+
+        let mut plan = Plan::new(&ws, BTreeMap::from([(ws.clone(), BTreeMap::new())]));
+        plan.add_entry(publisher(root.path(), "tsc-pkg@1.0.0", "tsc", 0o755));
+        plan.add_importer(
+            &ws,
+            BTreeMap::from([(
+                "tsc".to_string(),
+                ImporterTarget::Entry(entry("tsc-pkg@1.0.0", "tsc")),
+            )]),
+        );
+
+        plan.apply().unwrap();
+
+        // Following the link is the assertion. A shim that exists and resolves
+        // to nothing is exactly the bug a presence check would pass.
+        let shim = ws.join("node_modules/.bin/tsc");
+        assert_eq!(
+            std::fs::read_to_string(&shim).unwrap(),
+            "#!/bin/sh\necho hello\n",
+            "the shim does not resolve to the package's bin file"
+        );
+        assert!(
+            std::fs::symlink_metadata(&shim)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "a shim is a symlink, not a generated script"
+        );
+
+        // Through `directory`, like every other directory jerky makes.
+        assert_eq!(mode_of(&ws.join("node_modules/.bin")), 0o755);
+    }
+
+    #[test]
+    fn a_transitive_dependencys_bin_is_not_in_the_importers_bin() {
+        // npm's rule and pnpm's: a CLI the project did not declare is not one
+        // it should be able to call by name. The importer links `app`, and
+        // `app` is what depends on `tsc`.
+        let root = TempDir::new().unwrap();
+        let ws = root.path().join("ws");
+
+        let mut plan = Plan::new(&ws, BTreeMap::from([(ws.clone(), BTreeMap::new())]));
+        plan.add_entry(VirtualStoreEntry {
+            edges: BTreeMap::from([("tsc".to_string(), entry("tsc-pkg@1.0.0", "tsc"))]),
+            ..leaf(root.path(), "app@1.0.0", "app")
+        });
+        plan.add_entry(publisher(root.path(), "tsc-pkg@1.0.0", "tsc", 0o755));
+        plan.add_importer(
+            &ws,
+            BTreeMap::from([(
+                "app".to_string(),
+                ImporterTarget::Entry(entry("app@1.0.0", "app")),
+            )]),
+        );
+
+        plan.apply().unwrap();
+
+        assert!(
+            !still_there(&ws.join("node_modules/.bin/tsc")),
+            "a transitive dependency's bin reached the importer's .bin"
+        );
+
+        // It is in `app`'s own private `.bin`, which is the only place a
+        // package with no ambient hoisting can find a dependency's CLI.
+        let private = ws.join("node_modules/.jerky/app@1.0.0/node_modules/.bin/tsc");
+        assert_eq!(
+            std::fs::read_to_string(&private).unwrap(),
+            "#!/bin/sh\necho hello\n",
+            "a package cannot reach its own dependency's CLI"
+        );
+    }
+
+    #[test]
+    fn a_bin_shipped_non_executable_is_made_executable_through_the_store() {
+        // The case the whole of §3 is about: npm packages routinely publish a
+        // `bin` target at 0o644 and rely on the installer to fix it.
+        let root = TempDir::new().unwrap();
+        let ws = root.path().join("ws");
+        let store_entry = root.path().join("store/tsc-pkg@1.0.0");
+
+        let mut plan = Plan::new(&ws, BTreeMap::from([(ws.clone(), BTreeMap::new())]));
+        plan.add_entry(publisher(root.path(), "tsc-pkg@1.0.0", "tsc", 0o644));
+        plan.add_importer(
+            &ws,
+            BTreeMap::from([(
+                "tsc".to_string(),
+                ImporterTarget::Entry(entry("tsc-pkg@1.0.0", "tsc")),
+            )]),
+        );
+
+        plan.apply().unwrap();
+
+        let linked = ws.join("node_modules/.jerky/tsc-pkg@1.0.0/node_modules/tsc/bin/tsc");
+        assert_eq!(
+            mode_of(&linked),
+            0o755,
+            "the bin target was left unrunnable"
+        );
+
+        // And the store entry with it, necessarily: the two share an inode.
+        // Asserted rather than left implied, because it is the consequence
+        // the research note had to argue for before this was allowed.
+        assert_eq!(mode_of(&store_entry.join("bin/tsc")), 0o755);
+    }
+
+    #[test]
+    fn raising_the_bit_only_ever_adds_and_leaves_other_bits_alone() {
+        // `| 0o111`, not `= 0o755`. Monotonic so two concurrent installs
+        // cannot disagree, and narrow so a mode jerky did not choose survives.
+        let root = TempDir::new().unwrap();
+        let ws = root.path().join("ws");
+
+        let mut plan = Plan::new(&ws, BTreeMap::from([(ws.clone(), BTreeMap::new())]));
+        plan.add_entry(publisher(root.path(), "tsc-pkg@1.0.0", "tsc", 0o600));
+        plan.add_importer(
+            &ws,
+            BTreeMap::from([(
+                "tsc".to_string(),
+                ImporterTarget::Entry(entry("tsc-pkg@1.0.0", "tsc")),
+            )]),
+        );
+
+        plan.apply().unwrap();
+
+        assert_eq!(
+            mode_of(&root.path().join("store/tsc-pkg@1.0.0/bin/tsc")),
+            0o711,
+            "the mode was replaced rather than raised"
+        );
+    }
+
+    #[test]
+    fn a_second_apply_writes_nothing_and_changes_nothing() {
+        // Idempotence, which for the chmod is what makes it safe to run on
+        // every install for every bin: a target that already has the bits is
+        // one `stat` and no write at all.
+        let root = TempDir::new().unwrap();
+        let ws = root.path().join("ws");
+
+        let mut plan = Plan::new(&ws, BTreeMap::from([(ws.clone(), BTreeMap::new())]));
+        plan.add_entry(publisher(root.path(), "tsc-pkg@1.0.0", "tsc", 0o644));
+        plan.add_importer(
+            &ws,
+            BTreeMap::from([(
+                "tsc".to_string(),
+                ImporterTarget::Entry(entry("tsc-pkg@1.0.0", "tsc")),
+            )]),
+        );
+
+        plan.apply().unwrap();
+        let shim = ws.join("node_modules/.bin/tsc");
+        let first = std::fs::symlink_metadata(&shim).unwrap();
+
+        plan.apply().unwrap();
+        let second = std::fs::symlink_metadata(&shim).unwrap();
+
+        use std::os::unix::fs::MetadataExt as _;
+        assert_eq!(
+            (first.ino(), first.mtime()),
+            (second.ino(), second.mtime()),
+            "an apply that found the shim already right rewrote it anyway"
+        );
+    }
+
+    #[test]
+    fn a_workspace_members_own_file_is_linked_but_never_chmodded() {
+        // A member's bin is a file in the user's repository under version
+        // control, where a raised execute bit is a change git reports. The
+        // store argument does not reach it: nobody else shares that file.
+        let root = TempDir::new().unwrap();
+        let ws = root.path().join("ws");
+        let cli = ws.join("packages/cli");
+        let app = ws.join("apps/app");
+
+        std::fs::create_dir_all(cli.join("bin")).unwrap();
+        std::fs::create_dir_all(&app).unwrap();
+        let target = cli.join("bin/cli.js");
+        std::fs::write(&target, "console.log('hi')").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        let mut plan = Plan::new(
+            &ws,
+            BTreeMap::from([
+                (ws.clone(), BTreeMap::new()),
+                // A member's bins live on the plan's member map, not on the
+                // link that points at it — which is what lets convergence
+                // recognise the shim of a member nothing depends on any more.
+                (
+                    cli.clone(),
+                    BTreeMap::from([("cli".to_string(), "bin/cli.js".to_string())]),
+                ),
+                (app.clone(), BTreeMap::new()),
+            ]),
+        );
+        plan.add_importer(&ws, BTreeMap::new());
+        plan.add_importer(&cli, BTreeMap::new());
+        plan.add_importer(
+            &app,
+            BTreeMap::from([("cli".to_string(), ImporterTarget::Member(cli.clone()))]),
+        );
+
+        plan.apply().unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(app.join("node_modules/.bin/cli")).unwrap(),
+            "console.log('hi')",
+            "a member's bin was not linked into its dependent's .bin"
+        );
+        assert_eq!(
+            mode_of(&target),
+            0o644,
+            "jerky chmodded a file in the user's own repository"
+        );
+    }
+
+    #[test]
+    fn a_shim_for_a_dropped_dependency_is_converged_away_with_its_bin_directory() {
+        // "Nothing stays on disk that is no longer recorded", applied to a
+        // shim: a `tsc` that still runs after `typescript` left the manifest
+        // is the tree disagreeing with it.
+        let root = TempDir::new().unwrap();
+        let ws = root.path().join("ws");
+
+        let mut plan = Plan::new(&ws, BTreeMap::from([(ws.clone(), BTreeMap::new())]));
+        plan.add_entry(publisher(root.path(), "tsc-pkg@1.0.0", "tsc", 0o755));
+        plan.add_importer(
+            &ws,
+            BTreeMap::from([(
+                "tsc".to_string(),
+                ImporterTarget::Entry(entry("tsc-pkg@1.0.0", "tsc")),
+            )]),
+        );
+        plan.apply().unwrap();
+        assert!(still_there(&ws.join("node_modules/.bin/tsc")));
+
+        // The same workspace with the dependency gone.
+        let mut dropped = Plan::new(&ws, BTreeMap::from([(ws.clone(), BTreeMap::new())]));
+        dropped.add_importer(&ws, BTreeMap::new());
+        let left_alone = dropped.apply().unwrap().left_alone;
+
+        assert!(left_alone.is_empty(), "{left_alone:?}");
+        assert!(
+            !still_there(&ws.join("node_modules/.bin/tsc")),
+            "a dropped dependency's shim outlived it"
+        );
+        assert!(
+            !still_there(&ws.join("node_modules/.bin")),
+            "the `.bin` this pass emptied was left behind"
+        );
+    }
+
+    #[test]
+    fn a_shim_another_tool_wrote_is_left_alone_and_reported() {
+        // The first `jerky install` in a repository that has seen npm must not
+        // be a destructive surprise. npm's shims point into
+        // `node_modules/<pkg>`, which is inside the importer but is not one of
+        // the importer's own files — which is the whole of the distinction
+        // `shim_ownership` draws.
+        let root = TempDir::new().unwrap();
+        let ws = root.path().join("ws");
+        let npm_package = ws.join("node_modules/from-npm/bin");
+
+        std::fs::create_dir_all(&npm_package).unwrap();
+        std::fs::create_dir_all(ws.join("node_modules/.bin")).unwrap();
+        std::fs::write(npm_package.join("x.js"), "npm's").unwrap();
+        std::os::unix::fs::symlink(
+            "../from-npm/bin/x.js",
+            ws.join("node_modules/.bin/from-npm"),
+        )
+        .unwrap();
+
+        let mut plan = Plan::new(&ws, BTreeMap::from([(ws.clone(), BTreeMap::new())]));
+        plan.add_importer(&ws, BTreeMap::new());
+        let left_alone = plan.apply().unwrap().left_alone;
+
+        assert!(
+            still_there(&ws.join("node_modules/.bin/from-npm")),
+            "convergence deleted a shim another tool wrote"
+        );
+        assert!(
+            left_alone
+                .iter()
+                .any(|entry| entry.path == ws.join("node_modules/.bin/from-npm")
+                    && matches!(entry.reason, UnownedReason::PointsOutside)),
+            "the shim jerky kept was not reported: {left_alone:?}"
+        );
+    }
+
+    #[test]
+    fn two_dependencies_publishing_one_name_resolve_the_same_way_every_run() {
+        // A `.bin` is a flat namespace, so one of them loses. npm's answer is
+        // whichever link was written last; this one is a property of the plan.
+        let root = TempDir::new().unwrap();
+        let ws = root.path().join("ws");
+
+        let mut plan = Plan::new(&ws, BTreeMap::from([(ws.clone(), BTreeMap::new())]));
+        for (dir_name, pkg_name) in [("alpha@1.0.0", "alpha"), ("zeta@1.0.0", "zeta")] {
+            plan.add_entry(VirtualStoreEntry {
+                // Both publish `fmt`, from files that say which is which.
+                bins: BTreeMap::from([("fmt".to_string(), format!("bin/{pkg_name}"))]),
+                ..publisher(root.path(), dir_name, pkg_name, 0o755)
+            });
+        }
+        plan.add_importer(
+            &ws,
+            BTreeMap::from([
+                (
+                    "zeta".to_string(),
+                    ImporterTarget::Entry(entry("zeta@1.0.0", "zeta")),
+                ),
+                (
+                    "alpha".to_string(),
+                    ImporterTarget::Entry(entry("alpha@1.0.0", "alpha")),
+                ),
+            ]),
+        );
+
+        let applied = plan.apply().unwrap();
+
+        assert!(
+            std::fs::read_link(ws.join("node_modules/.bin/fmt"))
+                .unwrap()
+                .to_string_lossy()
+                .contains("alpha@1.0.0"),
+            "the contested name did not go to the alphabetically first dependency"
+        );
+
+        let collision = &applied.bin_collisions[0];
+        assert_eq!(
+            (
+                collision.name.as_str(),
+                collision.winner.as_str(),
+                collision.loser.as_str()
+            ),
+            ("fmt", "alpha", "zeta"),
+            "the loser was overwritten without saying so"
+        );
+    }
+
+    #[test]
+    fn a_package_that_publishes_no_bin_makes_no_bin_directory() {
+        // The common case by a wide margin, and the one an empty `.bin` in
+        // every `node_modules` would be noise in.
+        let root = TempDir::new().unwrap();
+        let ws = root.path().join("ws");
+
+        let mut plan = Plan::new(&ws, BTreeMap::from([(ws.clone(), BTreeMap::new())]));
+        plan.add_entry(leaf(root.path(), "quiet@1.0.0", "quiet"));
+        plan.add_importer(
+            &ws,
+            BTreeMap::from([(
+                "quiet".to_string(),
+                ImporterTarget::Entry(entry("quiet@1.0.0", "quiet")),
+            )]),
+        );
+
+        plan.apply().unwrap();
+
+        assert!(!still_there(&ws.join("node_modules/.bin")));
+        assert!(!still_there(
+            &ws.join("node_modules/.jerky/quiet@1.0.0/node_modules/.bin")
+        ));
     }
 }

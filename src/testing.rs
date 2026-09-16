@@ -193,6 +193,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
+use crate::binaries::Declared;
 use crate::integrity::Integrity;
 use crate::registry::{
     Dist, Fetched, Freshness, Packument, PeerMeta, RegistryClient, RegistryError, VersionMetadata,
@@ -401,6 +402,7 @@ impl FixtureRegistry {
             cpu: Vec::new(),
             peer_dependencies: BTreeMap::new(),
             peer_dependencies_meta: BTreeMap::new(),
+            bin: None,
         };
 
         self.tarballs.insert(url, tarball);
@@ -473,6 +475,21 @@ impl FixtureRegistry {
         self.amend(name, version, |metadata| {
             metadata.os = os.iter().map(|value| value.to_string()).collect();
             metadata.cpu = cpu.iter().map(|value| value.to_string()).collect();
+        })
+    }
+
+    /// Declare `bin` on a version that is already registered.
+    ///
+    /// The object form, which is what the registry serves — the string form is
+    /// a parsing question rather than an installing one, and is covered where
+    /// it is parsed.
+    pub fn with_bins(self, name: &str, version: &str, bins: &[(&str, &str)]) -> Self {
+        self.amend(name, version, |metadata| {
+            metadata.bin = Some(Declared::Many(
+                bins.iter()
+                    .map(|(bin, target)| (bin.to_string(), target.to_string()))
+                    .collect(),
+            ));
         })
     }
 
@@ -597,6 +614,7 @@ impl FixtureRegistry {
             cpu: Vec::new(),
             peer_dependencies: BTreeMap::new(),
             peer_dependencies_meta: BTreeMap::new(),
+            bin: None,
         };
 
         (metadata, tarball)
@@ -701,6 +719,7 @@ impl FixtureRegistry {
             cpu: Vec::new(),
             peer_dependencies: BTreeMap::new(),
             peer_dependencies_meta: BTreeMap::new(),
+            bin: None,
         };
 
         self.tarballs.insert(url, tarball);

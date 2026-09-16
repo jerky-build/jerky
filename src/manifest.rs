@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value};
 use thiserror::Error;
 
+use crate::binaries::{Bins, Declared};
 use crate::resolver::Kind;
 
 /// The manifest section a `Kind` names.
@@ -157,6 +158,35 @@ impl Manifest {
     /// resolver wants both, and a production install wants only the first.
     pub fn dev_dependencies(&self) -> BTreeMap<String, String> {
         self.section("devDependencies")
+    }
+
+    /// The CLI entry points this member publishes, validated and keyed by the
+    /// name each takes in a `.bin` directory.
+    ///
+    /// A member's bins come from here rather than from a packument because a
+    /// member has neither: it is linked in place from the repository, with no
+    /// tarball to fetch and no registry entry to read. This is the local half
+    /// of what `VersionMetadata::bins` answers for a registry package, and
+    /// both go through `crate::binaries` so a member cannot spell a bin a
+    /// published package could not.
+    ///
+    /// A shape jerky does not recognise reads as no bins, matching how the
+    /// same field is read off a packument — the difference being that here a
+    /// human can be told, and the manifest is theirs to fix.
+    ///
+    /// A member with no `name` is handed the empty one rather than refused
+    /// early. Only the *string* form needs a name, and `named_for` already
+    /// rejects an empty one through the same validation everything else goes
+    /// through — so an unnamed member's `{"cli": "bin/cli.js"}` is read, and
+    /// its bare `"bin/cli.js"` is not, which is exactly the split. Refusing
+    /// both would be wider than the reason for refusing either.
+    pub fn bins(&self) -> Bins {
+        self.value
+            .get("bin")
+            .cloned()
+            .and_then(|declared| serde_json::from_value::<Declared>(declared).ok())
+            .map(|declared| declared.named_for(self.name().unwrap_or_default()))
+            .unwrap_or_default()
     }
 
     /// One `name -> specifier` section of the manifest, or nothing when the

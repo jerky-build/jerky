@@ -105,6 +105,49 @@ this runs, since `preserve_permissions` defaults to false. That is the tar
 crate's behaviour and not jerky's, so it is pinned by a test rather than relied
 upon — a crate bump would otherwise reopen it in silence.
 
+## Binaries
+
+**`archive` owns a store entry's permissions; the linker may only add the
+execute bit to a declared `bin`.** Two modules now write to the same bytes, so
+the split is written down rather than inferred. `archive::normalise_mode`
+*replaces* a mode and decides every file's; `linker::ensure_executable` may
+only ever `| 0o111`, only on a file some package's `bin` field names, and never
+sets a mode. The reason the second is allowed at all is that a jerky store
+entry is keyed by the tarball's integrity, so everyone sharing one has the same
+package at the same version and declares the same bins — the argument is
+`docs/research/2026-09-14-pnpm-bin-executability.md`. A third writer, or a
+linker that set a mode rather than raising bits, breaks that argument.
+
+**A workspace member's own files are never chmodded.** The store argument does
+not reach them: nobody else shares the inode, and the file is in the user's
+repository under version control, where a raised execute bit is a change git
+reports and a reviewer has to explain. A member shipping a non-executable bin
+gets a shim that reports `EACCES`, which is the repository's to fix.
+
+**A `bin` is validated wherever it enters, which is three places and not one.**
+Both halves of every entry become a path and neither is jerky's: a name that is
+not a single path component escapes `.bin`, and a target that climbs out of the
+package names a file the package does not own — which jerky then raises the
+execute bit on. `crate::binaries` owns the check, and everything reaches it
+through `Declared::named_for`. A packument is the obvious entry point; a
+**workspace member's manifest** is the second; the **lockfile** is the third
+and the one that is easy to miss, because it looks like jerky's own output. It
+is not — it is checked in, it arrives through pull requests, and it is the
+*only* thing a cache-hit install reads — so `lockfile::load` re-validates
+rather than trusting what it parsed. A rejected entry is dropped and the
+package's other bins survive, matching how a malformed version is handled.
+
+**Convergence proves a shim by the files members publish, never by a path
+prefix.** A `.bin` entry points at a file *inside* a package where a
+`node_modules` link points at the package itself, so the ownership test has to
+be different — and the obvious difference is wrong. "Inside a member" reduces
+to "anywhere in the repository", because the workspace root is itself a member;
+an install would then delete a hand-written `.bin/lint -> ../../scripts/lint.sh`
+it never wrote. Excluding paths through a `node_modules` narrows it and does not
+fix it. `Provable::owns_shim_to` compares against `<member>/<declared bin
+target>` over every member — which is why `Plan::members` carries every
+member's bins and not only those of the members something currently depends on.
+
 ## Writing to disk
 
 **Nothing is recorded that is not already true on disk.** The manifest and the
@@ -191,5 +234,18 @@ Then, against the diff:
 - No `#[cfg(windows)]` or `#[cfg(not(unix))]`. jerky targets WSL, Linux and
   macOS; a fallback for a platform nothing runs on is a second definition to
   keep in agreement with the first, for nobody.
+- `grep -rn 'set_permissions' src/` outside `#[cfg(test)]` finds five sites,
+  and exactly one of them touches a *file inside a content store entry* after
+  extraction: `linker::ensure_executable`, which ORs `0o111` and never
+  assigns. The other four are `archive::normalise_mode` (which owns a file's
+  mode at extraction), `directory` (directories), `linker::reproduce_dir_mode`
+  (a directory's mode, copied when a tree is recreated) and `metadata_cache`
+  (its own cache files, which are not store entries). A second writer to a
+  store entry's file mode, or an assignment where the OR is, is the bug this
+  rule exists to prevent.
+- `grep -rn 'named_for' src/` finds the three entry points named above —
+  `registry.rs`, `manifest.rs`, `lockfile.rs` — plus `binaries.rs` itself. A
+  fourth source of bins that skipped it would be a link written outside
+  `.bin`.
 - Any user-visible behaviour change is noted in `CHANGELOG.md`, under
   `## [Unreleased]`.
