@@ -180,7 +180,14 @@ fn first_difference(actual: &str, expected: &str) -> Option<String> {
 fn a_linked_workspace_has_the_shape_it_has_always_had() {
     let home = TempDir::new().unwrap();
     let work = TempDir::new().unwrap();
-    let root = work.path();
+    // Canonical, because `discover` canonicalizes its root and the paths that
+    // come back out of `sync` are therefore canonical too. On macOS the temp
+    // directory lands under `/var`, a symlink to `/private/var`, so the
+    // uncanonicalized path is not a prefix of them and rendering an `Unowned`
+    // relative to it fails outright. Taken once here so that every path in the
+    // rendering — the ones this test builds and the ones jerky hands back —
+    // is measured from the same base.
+    let root = &work.path().canonicalize().unwrap();
     let store = Store::new(home.path().join("store"));
 
     // Four importers, because a suite that only ever sees `.` is not testing
