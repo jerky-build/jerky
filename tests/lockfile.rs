@@ -1244,3 +1244,35 @@ fn a_cycle_through_a_peer_keyed_node_reads_back_under_the_keys_it_was_written_wi
 
     assert_eq!(read(&again), read(&dir));
 }
+
+#[test]
+fn a_cycle_closed_by_a_peer_edge_reads_back_under_the_keys_it_was_written_with() {
+    // The sibling of the test above, and a different cut. There the loop is
+    // closed by a *dependency* edge, which the pass leaves out of the name
+    // altogether — a bare id folds into no context, so reading it back bare
+    // agrees by accident as much as by design. Here `lib` peers back on the
+    // `host` that depends on it, and a peer edge is named after the provider
+    // spelled over its own stack, cut at the second visit rather than the
+    // first. Answer it bare and the rebuilt key is one unrolling shorter than
+    // the one on disk, so `load` refuses the file `save` has just written and
+    // every install after the first fails on a tree that installed fine.
+    let registry = FixtureRegistry::new()
+        .with_tree(&[
+            ("host", "1.0.0", &[("lib", "^1.0.0")]),
+            ("lib", "1.0.0", &[]),
+        ])
+        .with_declared_peers("lib", "1.0.0", &[("host", "^1.0.0", false)]);
+
+    let dir = TempDir::new().unwrap();
+    let graph = resolve(&registry, &roots(&[("host", "^1.0.0")]), &no_members()).unwrap();
+    let (graph, _) = jerky::resolver::resolve_peers(graph);
+    lockfile::save(&graph, dir.path()).unwrap();
+
+    // The load is the assertion as much as the comparison is: a key that does
+    // not rebuild to itself is refused outright rather than read wrongly.
+    let back = lockfile::load(dir.path()).unwrap().unwrap();
+    let again = TempDir::new().unwrap();
+    lockfile::save(&back, again.path()).unwrap();
+
+    assert_eq!(read(&again), read(&dir));
+}

@@ -814,6 +814,11 @@ pub struct UnsatisfiedPeer {
 ///
 /// Takes the graph by value so no caller is left holding the peer-blind one,
 /// which is a different graph with confusingly similar contents.
+///
+/// The diagnostics are read off the *finished* graph by
+/// [`unsatisfied_peers`] rather than collected while resolving, so that the
+/// complaint an install prints has one definition whether it resolved anything
+/// or reloaded a lockfile — see that function for why the difference matters.
 pub fn resolve_peers(graph: ResolvedGraph) -> (ResolvedGraph, Vec<UnsatisfiedPeer>) {
     let mut pass = PeerPass {
         source: &graph,
@@ -822,7 +827,6 @@ pub fn resolve_peers(graph: ResolvedGraph) -> (ResolvedGraph, Vec<UnsatisfiedPee
         identities: BTreeMap::new(),
         identifying: BTreeSet::new(),
         cutting: BTreeSet::new(),
-        unsatisfied: BTreeMap::new(),
     };
 
     // Stage one: discover which *instances* exist — one per (package, the
@@ -871,15 +875,134 @@ pub fn resolve_peers(graph: ResolvedGraph) -> (ResolvedGraph, Vec<UnsatisfiedPee
         }
     }
 
-    let unsatisfied = pass.unsatisfied.into_values().collect();
+    let resolved = ResolvedGraph {
+        importers,
+        packages,
+    };
+    let unsatisfied = unsatisfied_peers(&resolved);
 
-    (
-        ResolvedGraph {
-            importers,
-            packages,
-        },
-        unsatisfied,
-    )
+    (resolved, unsatisfied)
+}
+
+/// Every required peer a finished graph leaves unanswered.
+///
+/// A function of the graph alone, which is what makes a warning survive a
+/// cache hit. An install whose importers all still match resolves nothing at
+/// all, so there is no pass running to notice anything — the only thing left
+/// to read is what the lockfile recorded, and `declared_peers` is on every
+/// entry precisely so this can be recomputed from it. Install therefore asks
+/// this of whatever graph it ends up with, re-resolved or reloaded, and gets
+/// the same answer either way.
+///
+/// It is also why [`resolve_peers`] does not report as it goes, though it has
+/// every answer to hand. Two producers of one complaint are two readings of
+/// "unsatisfied" to keep in agreement forever, and the half nobody exercises
+/// is the half that drifts. The rule itself lives in [`provider_of`] and
+/// [`satisfies`], which both callers share; what this adds is the walk down.
+pub fn unsatisfied_peers(graph: &ResolvedGraph) -> Vec<UnsatisfiedPeer> {
+    let mut complaints = BTreeMap::new();
+    let mut visited = BTreeSet::new();
+
+    for importer in graph.importers.values() {
+        // The importer's own dependencies are the outermost frame: the last
+        // place a peer looks, and the only one a top-level package has. A
+        // `Resolution::Local` is a workspace member, which is linked in place
+        // and has no node to walk into.
+        let provided: BTreeMap<String, PackageId> = importer
+            .dependencies
+            .iter()
+            .filter_map(|(name, dependency)| match &dependency.resolution {
+                Resolution::Registry(id) => Some((name.clone(), id.clone())),
+                Resolution::Local(_) => None,
+            })
+            .collect();
+
+        for id in provided.values() {
+            complain(graph, id, &[&provided], &mut visited, &mut complaints);
+        }
+    }
+
+    complaints.into_values().collect()
+}
+
+/// Walk one node and everything below it, complaining about peers as it goes.
+///
+/// `chain` runs outermost-first, so appending this node's own dependencies
+/// makes "own dependencies, then nearest ancestor, then the importer" a walk
+/// backwards through it — the same reading [`PeerPass::own_peers`] does over
+/// the same two helpers.
+///
+/// `visited` is on the node's id rather than on the path that reached it,
+/// which is what makes this terminate on a dependency cycle and is sound
+/// because the id *is* the copy: a peer-resolved node carries what it resolved
+/// against, so two routes to one key are two routes to one environment and
+/// cannot disagree about who provides what.
+///
+/// Over a graph that was never peer-resolved — a lockfile an older jerky wrote
+/// — the key is coarser than that, and a node two paths reach differently is
+/// judged by whichever arrived first. The direction that errs in is silence,
+/// which is the tolerable one here: such a file is regenerated the moment
+/// anything about it is stale, and the install after that says everything.
+fn complain<'a>(
+    graph: &'a ResolvedGraph,
+    id: &PackageId,
+    chain: &[&'a BTreeMap<String, PackageId>],
+    visited: &mut BTreeSet<PackageId>,
+    complaints: &mut BTreeMap<(PackageId, String), UnsatisfiedPeer>,
+) {
+    // Nothing a walk produces, but a hand-written lockfile can name an edge it
+    // does not record. Left to the lockfile's own validation to report.
+    let Some(package) = graph.packages.get(id) else {
+        return;
+    };
+    if !visited.insert(id.clone()) {
+        return;
+    }
+
+    let mut chain: Vec<&BTreeMap<String, PackageId>> = chain.to_vec();
+    chain.push(&package.dependencies);
+
+    let dependent = published(id);
+    for (name, declared) in &package.declared_peers {
+        let found = match provider_of(name, &chain) {
+            // The whole content of `optional`, and it is narrower than
+            // "optional peers never warn": it says the peer may be *absent*,
+            // not that any version of it will do, so the out-of-range arm
+            // below does not check it.
+            None if declared.optional => continue,
+            None => None,
+            Some((_, provider)) if satisfies(&provider.version, &declared.range) => continue,
+            Some((_, provider)) => Some(provider.version),
+        };
+
+        complaints
+            .entry((dependent.clone(), name.clone()))
+            .or_insert_with(|| UnsatisfiedPeer {
+                dependent: dependent.clone(),
+                peer: name.clone(),
+                range: declared.range.clone(),
+                found,
+            });
+    }
+
+    for dependency in package.dependencies.values() {
+        complain(graph, dependency, &chain, visited, complaints);
+    }
+}
+
+/// A node's id with its peer context dropped: the package as published.
+///
+/// What a complaint is keyed and named by, so that the §6 duplication does not
+/// multiply one published fact by the number of copies it landed in. A reader
+/// looking at `plugin@1.0.0 wants peer vue@^3.0.0` has a `package.json` to go
+/// and read; `plugin@1.0.0(react@17.0.0)` names a directory instead, eleven
+/// times over on a tree that duplicated eleven ways.
+fn published(id: &PackageId) -> PackageId {
+    PackageId {
+        name: id.name.clone(),
+        version: id.version.clone(),
+        context: BTreeMap::new(),
+    }
 }
 
 /// One copy of a package: the version the walk selected, plus the environment
@@ -950,9 +1073,6 @@ struct PeerPass<'a> {
     /// Instances whose *cut* name is being computed, which is a second and
     /// separate loop to break — see [`PeerPass::cut_name`].
     cutting: BTreeSet<Instance>,
-    /// Keyed by what a reader would consider one complaint, so a package
-    /// duplicated eleven ways reports its unmet peer once.
-    unsatisfied: BTreeMap<(PackageId, String), UnsatisfiedPeer>,
 }
 
 impl PeerPass<'_> {
@@ -1181,8 +1301,12 @@ impl PeerPass<'_> {
     /// declaring the same name in both `dependencies` and `peerDependencies` is
     /// saying "I will take yours, but I ship a fallback", and its own copy is
     /// the one it gets.
+    ///
+    /// Only what a peer *resolved to* is decided here. Whether an unanswered
+    /// one is worth saying out loud is [`unsatisfied_peers`]'s question, asked
+    /// of the graph this ends up building.
     fn own_peers(
-        &mut self,
+        &self,
         package: &ResolvedPackage,
         chain: &[&BTreeMap<String, PackageId>],
     ) -> BTreeMap<String, Instance> {
@@ -1190,27 +1314,19 @@ impl PeerPass<'_> {
 
         for (name, declared) in &package.declared_peers {
             let Some((frame, provider)) = provider_of(name, chain) else {
-                if !declared.optional {
-                    self.report(package, name, declared, None);
-                }
                 continue;
             };
 
+            // A provider outside the range is left out exactly as a missing
+            // one is, optional or not, so the package links nothing rather
+            // than linking a version it explicitly rejected.
             if satisfies(&provider.version, &declared.range) {
                 // Truncated at the frame that named it, because that is what
                 // was above the provider when the walk reached it. Slicing
                 // here rather than passing the index down keeps the cut beside
                 // the chain it cuts — the two are meaningless apart.
                 own.insert(name.clone(), self.instance_of(&provider, &chain[..=frame]));
-                continue;
             }
-
-            // Out of range is a complaint even for an optional peer: `optional`
-            // says the peer may be *absent*, not that any version of it will
-            // do. The peer is also left out of `own`, so the package links
-            // nothing rather than linking a version it rejected.
-            let found = provider.version.clone();
-            self.report(package, name, declared, Some(found));
         }
 
         own
@@ -1293,23 +1409,6 @@ impl PeerPass<'_> {
             package: id.clone(),
             environment,
         }
-    }
-
-    fn report(
-        &mut self,
-        package: &ResolvedPackage,
-        peer: &str,
-        declared: &DeclaredPeer,
-        found: Option<String>,
-    ) {
-        self.unsatisfied
-            .entry((package.id.clone(), peer.to_string()))
-            .or_insert_with(|| UnsatisfiedPeer {
-                dependent: package.id.clone(),
-                peer: peer.to_string(),
-                range: declared.range.clone(),
-                found,
-            });
     }
 }
 

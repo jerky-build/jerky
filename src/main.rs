@@ -6,7 +6,7 @@ use jerky::cli::{Cli, Command};
 use jerky::commands::install::Mode;
 use jerky::error::JerkyError;
 use jerky::linker::{Unowned, UnownedReason};
-use jerky::resolver::{ImporterPath, Kind};
+use jerky::resolver::{ImporterPath, Kind, UnsatisfiedPeer};
 use jerky::workspace::{Warning, Workspace};
 
 fn main() -> ExitCode {
@@ -84,6 +84,7 @@ fn run(cli: Cli) -> Result<(), JerkyError> {
                         &workspace, &importer, &store, &registry, &spec, kind,
                     )?;
                     report_unowned(&outcome.left_alone);
+                    report_unsatisfied_peers(&outcome.unsatisfied_peers);
                     let added = outcome
                         .recorded
                         .expect("an install always reports what it recorded");
@@ -101,6 +102,7 @@ fn run(cli: Cli) -> Result<(), JerkyError> {
                     let outcome =
                         jerky::commands::install::sync(&workspace, &store, &registry, None, mode)?;
                     report_unowned(&outcome.left_alone);
+                    report_unsatisfied_peers(&outcome.unsatisfied_peers);
                     // The packages, not the links: two importers on one version
                     // share a store entry, and reporting the link count would
                     // make the same install read differently in a monorepo.
@@ -136,6 +138,54 @@ fn report_unowned(entries: &[Unowned]) {
                 eprintln!("warning: left {path} alone — it links outside this workspace");
             }
         }
+    }
+}
+
+/// Say which required peers the tree does not answer.
+///
+/// One line each, to stderr, on every install — not behind `--verbose`, which
+/// would reproduce the silence this was filed about, and not collapsed into a
+/// count, which names a number nobody can act on. Standing beside
+/// [`report_unowned`] for the same reason it is here rather than in the
+/// resolver: the pass knows what it found, and this is the layer that knows a
+/// terminal is reading.
+///
+/// The install has already succeeded by the time these print. An unsatisfied
+/// peer is a warning because peer ranges across the live ecosystem routinely
+/// lag a major release, and a package manager that refused those trees would
+/// be unable to install most of npm.
+fn report_unsatisfied_peers(peers: &[UnsatisfiedPeer]) {
+    for peer in peers {
+        eprintln!("warning: {}", peer_warning(peer));
+    }
+}
+
+/// One unmet peer as the sentence to print.
+///
+/// Missing and out-of-range read differently on purpose. They are different
+/// problems with different fixes — install the package, or reconcile two
+/// versions of it — and a shared wording would leave the reader to work out
+/// which they have. Naming the version that *was* found is the whole of what
+/// makes the second one actionable.
+///
+/// The dependent is rendered by its own `Display`, which for a package with no
+/// peer context — which is what a complaint always carries — is exactly
+/// `name@version`. That is the spelling a reader can go and find in a
+/// `package.json`, where a store directory name is not.
+fn peer_warning(peer: &UnsatisfiedPeer) -> String {
+    let UnsatisfiedPeer {
+        dependent,
+        peer: name,
+        range,
+        found,
+    } = peer;
+
+    match found {
+        Some(version) => format!(
+            "{dependent} wants peer {name}@{range}, \
+             but the nearest provider has {name}@{version}"
+        ),
+        None => format!("{dependent} wants peer {name}@{range}, which nothing provides"),
     }
 }
 
@@ -305,6 +355,33 @@ mod tests {
 
         let importer = importer_for(&workspace, &root.join("tools/scripts")).unwrap();
         assert!(importer.is_root());
+    }
+
+    #[test]
+    fn a_missing_peer_and_an_out_of_range_one_read_differently() {
+        // The two are different problems — install the package, or reconcile
+        // two versions of it — and one wording for both would leave the reader
+        // to work out which they have.
+        let unmet = |peer: &str, range: &str, found: Option<&str>| UnsatisfiedPeer {
+            dependent: jerky::resolver::PackageId {
+                name: "react-dom".to_string(),
+                version: "18.2.0".to_string(),
+                context: Default::default(),
+            },
+            peer: peer.to_string(),
+            range: range.to_string(),
+            found: found.map(str::to_string),
+        };
+
+        assert_eq!(
+            peer_warning(&unmet("react", "^18.2.0", Some("17.0.2"))),
+            "react-dom@18.2.0 wants peer react@^18.2.0, \
+             but the nearest provider has react@17.0.2"
+        );
+        assert_eq!(
+            peer_warning(&unmet("react", "^18.2.0", None)),
+            "react-dom@18.2.0 wants peer react@^18.2.0, which nothing provides"
+        );
     }
 
     #[test]

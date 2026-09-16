@@ -351,14 +351,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   which is pnpm's spelling, and an edge pointing at one carries the same
   suffix. Such a package is linked with its peers beside its dependencies in
   its own `node_modules`, which is what makes a peer importable at all when
-  nothing is hoisted.
+  nothing is hoisted
+  ([#103](https://github.com/jerky-build/jerky/issues/103)).
 
-  **Only the refusal is observable yet.** Peer resolution does not run during
-  an install until unsatisfied peers are reported
-  ([#105](https://github.com/jerky-build/jerky/issues/105)), so today jerky
-  writes no `peers` block for any tree — this is the format arriving ahead of
-  the pass that fills it
-  ([#103](https://github.com/jerky-build/jerky/issues/103))
+- **Peer dependencies are resolved during an install, and a required peer
+  nothing answers is warned about.** One line per complaint, on stderr,
+  distinguishing the two things that can go wrong:
+
+  ```
+  warning: react-dom@18.2.0 wants peer react@^18.2.0, but the nearest provider has react@17.0.2
+  warning: @testing-library/react@14.0.0 wants peer react-dom@^18.0.0, which nothing provides
+  ```
+
+  **The install succeeds, and exits 0.** Peer ranges across the live ecosystem
+  routinely lag a major release, and a package manager that refused those trees
+  would be unable to install most of npm — refusing a tree that works is not a
+  stricter kind of correct. A `--strict-peers` that does refuse is policy on
+  top of this and will arrive with
+  [#41](https://github.com/jerky-build/jerky/issues/41)'s configuration
+  surface.
+
+  **It warns on every install, not only the first.** An install whose
+  `package.json` files still match the lockfile resolves nothing at all, so the
+  ranges each package published are recorded in `declaredPeers` and the warning
+  is recomputed from the file. A project does not go quiet with nothing about
+  it having changed.
+
+  An optional peer — one the package marked `optional` in
+  `peerDependenciesMeta` — says nothing when it is simply absent. A provider
+  that is *present but out of range* warns whether the peer is optional or
+  not: `optional` says the peer may be missing, not that any version of it
+  will do. Either way the peer is left unlinked, so a package gets nothing
+  rather than a version it explicitly rejected.
+
+  One complaint is printed once however many copies of the package the peer
+  duplication produced, and is named after the package as published —
+  `react-dom@18.2.0`, which you can go and find in a `package.json`, rather
+  than the store directory it landed in.
+
+  **`--production` reports a peer that only a devDependency answered.** It
+  installs `dependencies` only, so a `react` declared under `devDependencies`
+  is not there to satisfy a `react-dom` that is — the peer is left unlinked and
+  warned about, exactly as any other unanswered one is, rather than linked at a
+  package the production tree does not contain
+  ([#105](https://github.com/jerky-build/jerky/issues/105)).
 
 ### Removed
 

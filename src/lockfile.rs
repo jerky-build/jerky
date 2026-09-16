@@ -423,6 +423,9 @@ struct Identities<'a> {
     /// a context owns its values, so it is a finite tree and a cycle cannot be
     /// spelled inside one.
     naming: BTreeSet<String>,
+    /// Keys whose *cut* identity is being built, which is a second and
+    /// separate loop to break — see [`Identities::cut`].
+    cutting: BTreeSet<String>,
 }
 
 impl<'a> Identities<'a> {
@@ -450,6 +453,7 @@ impl<'a> Identities<'a> {
             decoded,
             named: BTreeMap::new(),
             naming: BTreeSet::new(),
+            cutting: BTreeSet::new(),
         };
 
         for importer in importers.values() {
@@ -505,7 +509,18 @@ impl<'a> Identities<'a> {
 
         let mut own = BTreeMap::new();
         for (declared, provider) in &entry.peers {
-            own.insert(declared.clone(), self.of(provider));
+            // A peer pointing back at a key still being built is the loop the
+            // pass cuts with a *cut name* rather than a bare one, and this has
+            // to cut it in the same place or the key it rebuilds is not the
+            // key it read. A dependency edge that closes a loop needs no such
+            // branch: `of` answers it bare, and `context_of` drops a
+            // context-free id, which is exactly the omission the pass makes.
+            let id = if self.naming.contains(provider) {
+                self.cut(provider)
+            } else {
+                self.of(provider)
+            };
+            own.insert(declared.clone(), id);
         }
         let mut dependencies = Vec::with_capacity(entry.dependencies.len());
         for (declared, recorded) in &entry.dependencies {
@@ -523,6 +538,54 @@ impl<'a> Identities<'a> {
         self.naming.remove(key);
         self.named.insert(key.to_string(), id.clone());
         id
+    }
+
+    /// One key's identity, cut where it would ask for the one being built.
+    ///
+    /// `PeerPass::cut_name`'s half of the rebuild, and it exists for the same
+    /// reason `of` does: the pass names a peer that points back up at an
+    /// ancestor after the provider spelled over its own stack, so everything
+    /// short of the loop — the provider's own peers, and the contexts its
+    /// dependencies carry — is inside the name before anything is dropped.
+    /// Answering such an edge with a bare `name@version` instead leaves the
+    /// rebuilt key one unrolling shorter than the one on disk, and `load`
+    /// refuses the file it just wrote.
+    ///
+    /// The cut falls at the *second* visit here too. That is not a detail to
+    /// round off: a first-visit cut spells two copies of a provider
+    /// identically, which is the under-fragmentation #110 records, and a cut
+    /// anywhere else spells a key the pass never wrote.
+    fn cut(&mut self, key: &str) -> PackageId {
+        if let Some(id) = self.named.get(key) {
+            return id.clone();
+        }
+
+        let (entries, decoded) = (self.entries, self.decoded);
+        let entry = &entries[key];
+        let name = decoded[key].name.clone();
+
+        // The second visit. `insert` reports whether it was the first, which
+        // is the check and the mark in one call.
+        if !self.cutting.insert(key.to_string()) {
+            return PackageId::plain(name, entry.version.clone());
+        }
+
+        let mut own = BTreeMap::new();
+        for (declared, provider) in &entry.peers {
+            own.insert(declared.clone(), self.cut(provider));
+        }
+        let mut dependencies = Vec::with_capacity(entry.dependencies.len());
+        for (declared, recorded) in &entry.dependencies {
+            dependencies.push((declared.clone(), self.cut(&edge_key(declared, recorded))));
+        }
+
+        self.cutting.remove(key);
+
+        PackageId {
+            name,
+            version: entry.version.clone(),
+            context: context_of(own, dependencies),
+        }
     }
 }
 
