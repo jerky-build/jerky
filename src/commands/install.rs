@@ -6,7 +6,7 @@ use thiserror::Error;
 use crate::archive::{self, ArchiveError};
 use crate::cli::{PackageSpec, VersionSpec};
 use crate::integrity::{Integrity, IntegrityError};
-use crate::linker::{self, LinkError, Unowned};
+use crate::linker::{self, BinCollision, LinkError, Unowned};
 use crate::lockfile::{self, LockfileError};
 use crate::manifest::{Manifest, ManifestError};
 use crate::platform::Platform;
@@ -209,6 +209,15 @@ pub struct Outcome {
     /// is not a stricter kind of correct. `--strict-peers` is a policy on top
     /// of this and belongs with #41's configuration surface.
     pub unsatisfied_peers: Vec<UnsatisfiedPeer>,
+    /// Bin names two dependencies of one importer — or of one package — both
+    /// declared, with the one that got the name.
+    ///
+    /// Carried for the reason `left_alone` is. A `.bin` directory is a flat
+    /// namespace with no way to spell both, so one of them has to lose; what
+    /// makes this worth saying rather than silently resolving is that the
+    /// loser is invisible on disk, and a `tsc` that is not the `tsc` you
+    /// expected is otherwise a long afternoon.
+    pub bin_collisions: Vec<BinCollision>,
     /// Present only when there was a request to record.
     pub recorded: Option<Recorded>,
     /// Optional dependencies this machine does not satisfy, left out of the
@@ -537,7 +546,7 @@ pub fn sync(
     // linking, the prune last — is a property of `apply` rather than of
     // anything written here. This used to be five loops with a comment above
     // each one saying what must not be moved.
-    let left_alone = plan_for(&installable, workspace, store).apply()?;
+    let applied = plan_for(&installable, workspace, store).apply()?;
 
     // The lockfile records what the manifest declares, so the specifier it
     // carries for this request is the one about to be written rather than the
@@ -584,7 +593,8 @@ pub fn sync(
             .into_iter()
             .map(|(name, version)| Installed { name, version })
             .collect(),
-        left_alone,
+        left_alone: applied.left_alone,
+        bin_collisions: applied.bin_collisions,
         unsatisfied_peers,
         recorded,
         skipped: skipped
@@ -832,14 +842,21 @@ fn fetch_one(
 /// and the importer that just lost its last one has no links to write and
 /// everything to remove.
 fn plan_for(graph: &ResolvedGraph, workspace: &Workspace, store: &Store) -> linker::Plan {
-    // Every member's directory, so that a link at one is recognised as jerky's.
-    // A local link points straight at the member rather than into the virtual
-    // store, and an ownership test that knew only about the store would delete
-    // every local link on the install after it was created.
-    let members: BTreeSet<PathBuf> = workspace
+    // Every member's directory and the bins it publishes, so that a link at one
+    // is recognised as jerky's. A local link points straight at the member
+    // rather than into the virtual store, and an ownership test that knew only
+    // about the store would delete every local link on the install after it was
+    // created.
+    //
+    // Every member, not only the ones something depends on: convergence has to
+    // recognise the link — and the shim — of a member dependency that has just
+    // been dropped, which is precisely the one the plan no longer names. The
+    // bins come off each member's own manifest, since a member has no packument
+    // to read one from.
+    let members: BTreeMap<PathBuf, BTreeMap<String, String>> = workspace
         .members()
         .values()
-        .map(|member| member.path.clone())
+        .map(|member| (member.path.clone(), member.manifest.bins()))
         .collect();
 
     // The virtual store sits at the workspace root, which is the whole reason
@@ -871,6 +888,10 @@ fn plan_for(graph: &ResolvedGraph, workspace: &Workspace, store: &Store) -> link
                 .chain(&package.peers)
                 .map(|(name, dep_id)| (name.clone(), virtual_store_ref(dep_id)))
                 .collect(),
+            // What the package published, carried through the lockfile so an
+            // install that resolves nothing still knows which shims to write.
+            // Where they go is the linker's to derive from the edges.
+            bins: package.bins.clone(),
         });
     }
 
@@ -1188,8 +1209,25 @@ mod tests {
                 .collect(),
             optional_dependencies: BTreeSet::new(),
             supports: PlatformSupport::default(),
+            bins: BTreeMap::new(),
             declared_peers: BTreeMap::new(),
             peers: BTreeMap::new(),
+        }
+    }
+
+    /// [`package`], publishing a bin apiece.
+    fn package_with_bins(
+        name: &str,
+        version: &str,
+        dependencies: &[(&str, PackageId)],
+        bins: &[(&str, &str)],
+    ) -> ResolvedPackage {
+        ResolvedPackage {
+            bins: bins
+                .iter()
+                .map(|(bin, target)| (bin.to_string(), target.to_string()))
+                .collect(),
+            ..package(name, version, dependencies)
         }
     }
 
@@ -1300,10 +1338,10 @@ mod tests {
 
         let mut expected = Plan::new(
             &root,
-            BTreeSet::from([
-                root.clone(),
-                root.join("packages/ui"),
-                root.join("packages/empty"),
+            BTreeMap::from([
+                (root.clone(), BTreeMap::new()),
+                (root.join("packages/ui"), BTreeMap::new()),
+                (root.join("packages/empty"), BTreeMap::new()),
             ]),
         );
         expected.add_entry(VirtualStoreEntry {
@@ -1317,18 +1355,21 @@ mod tests {
                     at_entry("string-width@4.2.3", "string-width"),
                 ),
             ]),
+            bins: BTreeMap::new(),
         });
         expected.add_entry(VirtualStoreEntry {
             dir_name: "beta@2.0.0".to_string(),
             pkg_name: "beta".to_string(),
             content_store_path: store.entry_path(&integrity("beta@2.0.0")),
             edges: BTreeMap::new(),
+            bins: BTreeMap::new(),
         });
         expected.add_entry(VirtualStoreEntry {
             dir_name: "string-width@4.2.3".to_string(),
             pkg_name: "string-width".to_string(),
             content_store_path: store.entry_path(&integrity("string-width@4.2.3")),
             edges: BTreeMap::new(),
+            bins: BTreeMap::new(),
         });
         expected.add_importer(
             &root,
@@ -1355,6 +1396,88 @@ mod tests {
             ]),
         );
         expected.add_importer(&root.join("packages/empty"), BTreeMap::new());
+
+        assert_eq!(plan_for(&graph, &workspace, &store), expected);
+    }
+
+    #[test]
+    fn a_plan_carries_what_each_package_and_each_member_publishes_as_bins() {
+        // The orchestrator's half of bin linking, and the whole of it: which
+        // `.bin` directories end up holding a shim is derived inside `apply`
+        // from the edges, so the only thing that has to arrive here is what
+        // each package published. Two sources, because a member has neither a
+        // tarball nor a packument and reads its own manifest instead.
+        let home = TempDir::new().unwrap();
+        let work = TempDir::new().unwrap();
+
+        write_manifest(
+            work.path(),
+            r#"{"name":"ws","workspaces":["packages/*"],"dependencies":{"alpha":"^1.0.0"}}"#,
+        );
+        write_manifest(
+            &work.path().join("packages/cli"),
+            r#"{"name":"cli","version":"1.0.0","bin":{"cli":"bin/cli.js"}}"#,
+        );
+        let workspace = Workspace::discover(work.path()).unwrap();
+        let store = Store::new(home.path().join("store"));
+        let root = workspace.root().to_path_buf();
+
+        let graph = ResolvedGraph {
+            importers: BTreeMap::from([
+                (
+                    at("."),
+                    importer(&[
+                        (
+                            "alpha",
+                            dependency("^1.0.0", Resolution::Registry(id("alpha", "1.0.0"))),
+                        ),
+                        (
+                            "cli",
+                            dependency("workspace:*", Resolution::Local("packages/cli".into())),
+                        ),
+                    ]),
+                ),
+                (at("packages/cli"), importer(&[])),
+            ]),
+            packages: BTreeMap::from([(
+                id("alpha", "1.0.0"),
+                package_with_bins("alpha", "1.0.0", &[], &[("a", "bin/a.js")]),
+            )]),
+        };
+
+        let mut expected = Plan::new(
+            &root,
+            BTreeMap::from([
+                (root.clone(), BTreeMap::new()),
+                (
+                    root.join("packages/cli"),
+                    // Off the member's own manifest, and the one place a
+                    // member's bins live: the linker looks them up here.
+                    BTreeMap::from([("cli".to_string(), "bin/cli.js".to_string())]),
+                ),
+            ]),
+        );
+        expected.add_entry(VirtualStoreEntry {
+            dir_name: "alpha@1.0.0".to_string(),
+            pkg_name: "alpha".to_string(),
+            content_store_path: store.entry_path(&integrity("alpha@1.0.0")),
+            edges: BTreeMap::new(),
+            bins: BTreeMap::from([("a".to_string(), "bin/a.js".to_string())]),
+        });
+        expected.add_importer(
+            &root,
+            BTreeMap::from([
+                (
+                    "alpha".to_string(),
+                    ImporterTarget::Entry(at_entry("alpha@1.0.0", "alpha")),
+                ),
+                (
+                    "cli".to_string(),
+                    ImporterTarget::Member(root.join("packages/cli")),
+                ),
+            ]),
+        );
+        expected.add_importer(&root.join("packages/cli"), BTreeMap::new());
 
         assert_eq!(plan_for(&graph, &workspace, &store), expected);
     }
@@ -1412,10 +1535,10 @@ mod tests {
 
         let mut expected = Plan::new(
             &root,
-            BTreeSet::from([
-                root.clone(),
-                root.join("packages/ui"),
-                root.join("packages/empty"),
+            BTreeMap::from([
+                (root.clone(), BTreeMap::new()),
+                (root.join("packages/ui"), BTreeMap::new()),
+                (root.join("packages/empty"), BTreeMap::new()),
             ]),
         );
         expected.add_entry(VirtualStoreEntry {
@@ -1426,12 +1549,14 @@ mod tests {
             pkg_name: "plugin".to_string(),
             content_store_path: store.entry_path(&integrity("plugin@1.0.0")),
             edges: BTreeMap::from([("react".to_string(), at_entry("react@18.2.0", "react"))]),
+            bins: BTreeMap::new(),
         });
         expected.add_entry(VirtualStoreEntry {
             dir_name: "react@18.2.0".to_string(),
             pkg_name: "react".to_string(),
             content_store_path: store.entry_path(&integrity("react@18.2.0")),
             edges: BTreeMap::new(),
+            bins: BTreeMap::new(),
         });
         expected.add_importer(
             &root,

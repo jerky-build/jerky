@@ -1,4 +1,5 @@
 pub mod archive;
+pub mod binaries;
 pub mod cli;
 pub mod commands;
 mod directory;

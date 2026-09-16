@@ -10,6 +10,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- A package's binaries are linked into `node_modules/.bin`, so a
+  locally-installed tool actually runs. `jerky install typescript` now leaves
+  you a `tsc` you can execute, where before it left a `node_modules` in which
+  nothing was runnable at all. Bins are read off the abbreviated packument —
+  the same response dependencies and `os` already come from, so no extra
+  request — and both shapes npm documents are accepted, the object and the bare
+  string that takes the package's own name.
+
+  **Direct dependencies only**, matching npm and pnpm: a transitive
+  dependency's CLI is not something the project declared. Each package also
+  gets its dependencies' bins in its *own* private `.bin` inside the virtual
+  store, because with no ambient hoisting there is nowhere else for a package
+  that shells out to a dependency's CLI to look. Workspace members publish
+  their bins to the members that depend on them, read from their own
+  `package.json` since a member has no packument.
+
+  **A bin that ships non-executable is made executable.** npm packages
+  routinely publish their `bin` target at `0o644` and rely on the installer to
+  fix it. jerky raises the execute bits — `| 0o111`, never a mode replacement —
+  on the target itself, which because the virtual store is hard links means on
+  the shared store entry too. That is deliberate and argued in
+  `docs/research/2026-09-14-pnpm-bin-executability.md`: everyone sharing a
+  jerky store entry has the same package at the same version and so declares
+  the same bins. The one exception is a **workspace member's own file**, which
+  is never chmodded — it is in your repository under version control, where a
+  raised execute bit is a change `git status` reports.
+
+  **A `bin` jerky will not spell is dropped rather than fatal.** `bin` is
+  published by whoever published the package and both halves of every entry
+  become a path, so a name that is not a single path component and a target
+  that climbs out of the package are refused — the rest of that package's bins
+  install normally.
+
+  **Two dependencies publishing one name** is resolved in favour of the
+  alphabetically first, so the tree is the same on every machine, and jerky
+  says which one got the name rather than leaving you to find out:
+
+  ```
+  warning: alpha and zeta both publish a `fmt` binary — …/.bin links alpha's
+  ```
+
+  Shims are converged like every other link: one whose dependency left the
+  manifest is removed, along with a `.bin` jerky empties, while a shim npm or
+  yarn wrote for a package you no longer depend on is reported and left where
+  it was found.
+
+  **Migrating from yarn classic needs a clean `node_modules`.** yarn writes
+  shell scripts into `.bin` where npm and jerky write symlinks, and jerky will
+  not overwrite a file it cannot prove it wrote — so an install that has to put
+  a shim exactly where one of those scripts sits stops and names it rather than
+  deleting it. `rm -rf node_modules` and install again
+  ([#20](https://github.com/jerky-build/jerky/issues/20)).
+
+  **If you have a lockfile from before this change**, it records no `bin` for
+  anything, and nothing distinguishes that from a package that declares none —
+  so no shims are written until the project re-resolves. Touch a `package.json`
+  or delete `jerky-lock.json` to pick them up. Pre-1.0, on-disk formats change
+  in place rather than carrying a migration.
+
 - `optionalDependencies` are resolved, and the ones this machine cannot run are
   skipped. A package declaring an `os` or `cpu` that rules out the machine —
   every `@esbuild/*`, `@rollup/rollup-*` and `@napi-rs/*` platform variant, and

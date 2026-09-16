@@ -313,6 +313,7 @@ impl jerky::registry::RegistryClient for HandBuilt {
                         cpu: Vec::new(),
                         peer_dependencies: BTreeMap::new(),
                         peer_dependencies_meta: BTreeMap::new(),
+                        bin: None,
                     },
                 )
             })

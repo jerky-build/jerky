@@ -46,6 +46,7 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use thiserror::Error;
 
+use crate::binaries::Bins;
 use crate::integrity::{Integrity, IntegrityError};
 use crate::platform::{Platform, PlatformSupport};
 use crate::pool;
@@ -384,6 +385,18 @@ pub struct ResolvedPackage {
     /// graph, and a lockfile that recorded one machine's answer would be a
     /// different file on every platform.
     pub supports: PlatformSupport,
+    /// The CLI entry points this package publishes: the name each takes inside
+    /// a `.bin` directory -> the file inside the package it points at.
+    ///
+    /// Carried for the reason `supports` and `declared_peers` are — it is a
+    /// fact about the publish, and the lockfile has to record it so an install
+    /// that resolves nothing still knows which shims to write. See
+    /// `docs/specs/2026-09-16-bin-linking-design.md` §1.
+    ///
+    /// Already validated: a name that is not one path component and a target
+    /// that leaves the package are dropped on the way in, by
+    /// [`crate::binaries`], so nothing downstream has to ask.
+    pub bins: Bins,
     /// What this package requires of its consumer, exactly as published.
     ///
     /// Carried rather than resolved by the walk, because a peer is not an edge
@@ -1434,13 +1447,15 @@ impl PeerPass<'_> {
                     resolved: source.resolved.clone(),
                     integrity: source.integrity.clone(),
                     dependencies,
-                    // Both carried straight across. Peer duplication makes
-                    // copies of one published version, and a copy declares
-                    // what the version declared: which of its edges were
-                    // optional, and which machines it runs on, are properties
-                    // of the publish and not of which peers answered.
+                    // All three carried straight across. Peer duplication
+                    // makes copies of one published version, and a copy
+                    // declares what the version declared: which of its edges
+                    // were optional, which machines it runs on, and which
+                    // bins it ships are properties of the publish and not of
+                    // which peers answered.
                     optional_dependencies: source.optional_dependencies.clone(),
                     supports: source.supports.clone(),
+                    bins: source.bins.clone(),
                     declared_peers: source.declared_peers.clone(),
                     peers: copy
                         .own
@@ -2114,6 +2129,7 @@ impl<'a> Walk<'a> {
                     os: metadata.os.clone(),
                     cpu: metadata.cpu.clone(),
                 },
+                bins: metadata.bins(),
                 declared_peers: declared_peers(metadata),
                 // Filled by the peer pass. The walk is peer-blind by design.
                 peers: BTreeMap::new(),

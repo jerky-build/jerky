@@ -4,6 +4,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::binaries::{Bins, Declared};
 use crate::integrity::{Integrity, IntegrityError};
 use crate::range::Version;
 
@@ -134,6 +135,41 @@ pub struct VersionMetadata {
     /// meaningless rather than malformed, and is simply never read.
     #[serde(default, rename = "peerDependenciesMeta")]
     pub peer_dependencies_meta: BTreeMap<String, PeerMeta>,
+    /// The CLI entry points this package publishes, in whichever of npm's two
+    /// shapes it published them.
+    ///
+    /// Read from here rather than from the package's own `package.json` in the
+    /// content store, and the reason is not the saved read: registry metadata
+    /// is the manifest as npm's publish-time normalization left it, which is
+    /// what expands the string form and folds in the legacy `directories.bin`.
+    /// The tarball carries whatever the publisher wrote. See
+    /// `docs/specs/2026-09-16-bin-linking-design.md` §1.
+    ///
+    /// `Option` rather than a defaulted [`Bins`], because the two shapes are
+    /// only distinguishable before they are interpreted and interpreting needs
+    /// the package's name — which [`Declared::named_for`] takes and serde
+    /// cannot supply.
+    #[serde(
+        default,
+        deserialize_with = "crate::binaries::deserialize_lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub bin: Option<Declared>,
+}
+
+impl VersionMetadata {
+    /// The bins this version publishes, validated and keyed by the name each
+    /// takes in a `.bin` directory.
+    ///
+    /// The one place the two published shapes stop being two things, so no
+    /// caller downstream has to hold an `Option<Declared>` or know that the
+    /// string form takes the package's name.
+    pub fn bins(&self) -> Bins {
+        self.bin
+            .as_ref()
+            .map(|declared| declared.named_for(&self.name))
+            .unwrap_or_default()
+    }
 }
 
 /// One peer's flags, as `peerDependenciesMeta` carries them.
@@ -1021,6 +1057,83 @@ mod tests {
         assert!(metadata.os.is_empty());
         assert!(metadata.cpu.is_empty());
         assert!(metadata.optional_dependencies.is_empty());
+    }
+
+    #[test]
+    fn bins_are_read_off_the_abbreviated_packument_in_either_published_shape() {
+        // Verified against the live registry on 2026-09-16: `bin` rides in the
+        // abbreviated form jerky already asks for, so this needs no second
+        // request for a full packument.
+        //
+        //   curl -H 'Accept: application/vnd.npm.install-v1+json' \
+        //        https://registry.npmjs.org/typescript | jq '.versions["5.3.3"].bin'
+        //   { "tsc": "bin/tsc", "tsserver": "bin/tsserver" }
+        let raw = r#"{
+            "name": "typescript", "version": "5.3.3",
+            "dist": { "tarball": "https://r.test/a.tgz" },
+            "bin": { "tsc": "bin/tsc", "tsserver": "bin/tsserver" }
+        }"#;
+
+        let metadata: VersionMetadata = serde_json::from_str(raw).unwrap();
+        assert_eq!(metadata.bins()["tsc"], "bin/tsc");
+        assert_eq!(metadata.bins()["tsserver"], "bin/tsserver");
+
+        // The string form, which npm documents and the registry appears to
+        // normalize away. Parsed anyway because `Packument::versions` is a map:
+        // one version serde refuses takes every version of the package with it.
+        let raw = r#"{
+            "name": "@babel/cli", "version": "8.0.5",
+            "dist": { "tarball": "https://r.test/b.tgz" },
+            "bin": "./bin/babel.js"
+        }"#;
+
+        let metadata: VersionMetadata = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            metadata.bins(),
+            [("cli".to_string(), "bin/babel.js".to_string())].into(),
+            "the string form takes the package name with its scope stripped"
+        );
+
+        // Most packages publish no bin at all, and arrive with none rather
+        // than with a shape to interpret.
+        let raw = r#"{
+            "name": "a", "version": "1.0.0",
+            "dist": { "tarball": "https://r.test/c.tgz" }
+        }"#;
+
+        let metadata: VersionMetadata = serde_json::from_str(raw).unwrap();
+        assert!(metadata.bin.is_none());
+        assert!(metadata.bins().is_empty());
+    }
+
+    #[test]
+    fn a_packument_survives_a_version_whose_bin_is_a_shape_jerky_does_not_accept() {
+        // The failure this guards is total rather than local: every version
+        // lives in one `BTreeMap`, so a version serde cannot parse makes the
+        // package unresolvable at *any* version. An array is not a shape npm
+        // documents, and the registry has accumulated genuinely malformed
+        // entries — so the question is what one costs, not whether one exists.
+        let raw = r#"{
+            "name": "p",
+            "versions": {
+                "1.0.0": {
+                    "name": "p", "version": "1.0.0",
+                    "dist": { "tarball": "https://r.test/a.tgz" },
+                    "bin": ["cli.js"]
+                },
+                "1.1.0": {
+                    "name": "p", "version": "1.1.0",
+                    "dist": { "tarball": "https://r.test/b.tgz" },
+                    "bin": { "p": "cli.js" }
+                }
+            }
+        }"#;
+
+        let packument: Packument =
+            serde_json::from_str(raw).expect("one unparseable `bin` must not lose the package");
+
+        assert!(packument.versions["1.0.0"].bins().is_empty());
+        assert_eq!(packument.versions["1.1.0"].bins()["p"], "cli.js");
     }
 
     #[test]
