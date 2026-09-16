@@ -4,7 +4,7 @@
 //! ordering, minimal diff noise, a format version field from day one, and an
 //! integrity hash per package.
 //!
-//! Version 2 adds a fifth, from #103: a node is identified by what it records
+//! Peers add a fifth, from #103: a node is identified by what it records
 //! rather than by the key it is recorded under. The key carries a peer suffix
 //! now, and a suffix that can be a hash is one nothing can parse back — so the
 //! tests that matter most here are the ones asking whether two keys can land
@@ -219,7 +219,7 @@ fn an_unusable_integrity_hash_is_refused() {
     let dir = TempDir::new().unwrap();
     std::fs::write(
         dir.path().join(LOCKFILE_NAME),
-        r#"{"lockfileVersion": 2, "importers": {},
+        r#"{"lockfileVersion": 1, "importers": {},
             "packages": { "a@1.0.0": {
                 "version": "1.0.0",
                 "resolved": "https://r.test/a.tgz",
@@ -239,7 +239,7 @@ fn a_key_that_is_not_name_at_version_is_refused() {
     let dir = TempDir::new().unwrap();
     std::fs::write(
         dir.path().join(LOCKFILE_NAME),
-        r#"{"lockfileVersion": 2, "importers": {},
+        r#"{"lockfileVersion": 1, "importers": {},
             "packages": { "no-at-sign": {
                 "version": "1.0.0",
                 "resolved": "https://r.test/a.tgz",
@@ -262,7 +262,7 @@ fn a_scoped_package_key_splits_on_the_last_at() {
     let dir = TempDir::new().unwrap();
     std::fs::write(
         dir.path().join(LOCKFILE_NAME),
-        r#"{"lockfileVersion": 2, "importers": {},
+        r#"{"lockfileVersion": 1, "importers": {},
             "packages": { "@types/node@20.1.0": {
                 "version": "20.1.0",
                 "resolved": "https://r.test/n.tgz",
@@ -328,7 +328,7 @@ fn a_key_disagreeing_with_its_entry_is_refused() {
     write_raw(
         &dir,
         &format!(
-            r#"{{"lockfileVersion":2,"importers":{{}},"packages":{{
+            r#"{{"lockfileVersion":1,"importers":{{}},"packages":{{
                 "b@1.0.0": {{"version":"1.0.0","resolved":"https://r.test/u1.tgz","integrity":"{HASH}"}},
                 "b@2.0.0": {{"version":"1.0.0","resolved":"https://r.test/u2.tgz","integrity":"{HASH}"}}
             }}}}"#
@@ -349,7 +349,7 @@ fn an_edge_pointing_at_nothing_is_refused() {
     write_raw(
         &dir,
         &format!(
-            r#"{{"lockfileVersion":2,"importers":{{}},"packages":{{
+            r#"{{"lockfileVersion":1,"importers":{{}},"packages":{{
                 "a@1.0.0": {{"version":"1.0.0","resolved":"https://r.test/a.tgz","integrity":"{HASH}",
                              "dependencies":{{"ghost":"9.9.9"}}}}
             }}}}"#
@@ -375,7 +375,7 @@ fn an_edge_resolved_later_in_the_file_is_accepted() {
     write_raw(
         &dir,
         &format!(
-            r#"{{"lockfileVersion":2,"importers":{{}},"packages":{{
+            r#"{{"lockfileVersion":1,"importers":{{}},"packages":{{
                 "a@1.0.0": {{"version":"1.0.0","resolved":"https://r.test/a.tgz","integrity":"{HASH}",
                              "dependencies":{{"b":"1.0.0"}}}},
                 "b@1.0.0": {{"version":"1.0.0","resolved":"https://r.test/b.tgz","integrity":"{HASH}"}}
@@ -594,7 +594,7 @@ fn an_importer_path_escaping_the_workspace_is_refused() {
     let dir = TempDir::new().unwrap();
     write_raw(
         &dir,
-        r#"{"lockfileVersion":2,"importers":{"../escape":{}},"packages":{}}"#,
+        r#"{"lockfileVersion":1,"importers":{"../escape":{}},"packages":{}}"#,
     );
 
     assert!(matches!(
@@ -608,7 +608,7 @@ fn an_absolute_importer_path_is_refused() {
     let dir = TempDir::new().unwrap();
     write_raw(
         &dir,
-        r#"{"lockfileVersion":2,"importers":{"/etc":{}},"packages":{}}"#,
+        r#"{"lockfileVersion":1,"importers":{"/etc":{}},"packages":{}}"#,
     );
 
     assert!(matches!(
@@ -625,7 +625,7 @@ fn an_importer_dependency_naming_no_package_is_refused() {
     write_raw(
         &dir,
         &format!(
-            r#"{{"lockfileVersion":2,
+            r#"{{"lockfileVersion":1,
                 "importers":{{".":{{"dependencies":{{"ghost":{{"specifier":"^1.0.0","version":"9.9.9"}}}}}}}},
                 "packages":{{"a@1.0.0":{{"version":"1.0.0","resolved":"https://r.test/a.tgz","integrity":"{HASH}"}}}}}}"#
         ),
@@ -649,7 +649,7 @@ fn an_alias_round_trips() {
     write_raw(
         &dir,
         &format!(
-            r#"{{"lockfileVersion":2,
+            r#"{{"lockfileVersion":1,
                 "importers":{{".":{{"dependencies":{{"execa":{{"specifier":"npm:safe-execa@0.3.0","version":"safe-execa@0.3.0"}}}}}}}},
                 "packages":{{"safe-execa@0.3.0":{{"version":"0.3.0","resolved":"https://r.test/se.tgz","integrity":"{HASH}"}}}}}}"#
         ),
@@ -733,7 +733,7 @@ fn a_link_target_leaving_the_workspace_is_refused() {
     let dir = TempDir::new().unwrap();
     write_raw(
         &dir,
-        r#"{"lockfileVersion":2,
+        r#"{"lockfileVersion":1,
             "importers":{".":{"dependencies":{"evil":{"specifier":"workspace:*","version":"link:../../../etc"}}}},
             "packages":{}}"#,
     );
@@ -752,7 +752,7 @@ fn a_link_target_climbing_within_the_workspace_is_accepted() {
     let dir = TempDir::new().unwrap();
     write_raw(
         &dir,
-        r#"{"lockfileVersion":2,
+        r#"{"lockfileVersion":1,
             "importers":{"apps/web":{"dependencies":{"ui":{"specifier":"workspace:*","version":"link:../../packages/ui"}}}},
             "packages":{}}"#,
     );
@@ -887,11 +887,11 @@ fn an_importers_alias_survives_the_round_trip() {
 
 /// What version 1 wrote for [`small_tree`], character for character.
 ///
-/// Embedded rather than generated, because the claim is about a format that no
-/// longer exists to generate from: a graph with no peers in it must write under
-/// version 2 exactly what it wrote under version 1. Peers are a change to the
-/// file for the packages that have them and to nothing else, and every package
-/// that has none — which is nearly all of them — must diff as one line.
+/// Embedded rather than generated, because the claim is about a shape that no
+/// longer exists to generate from: a graph with no peers in it must write
+/// exactly the bytes it wrote before peers existed. Peers change the file for
+/// the packages that have them and for nothing else, and every package that has
+/// none — which is nearly all of them — must not move at all.
 const VERSION_ONE_SMALL_TREE: &str = r#"{
   "lockfileVersion": 1,
   "importers": {
@@ -923,15 +923,17 @@ const VERSION_ONE_SMALL_TREE: &str = r#"{
 "#;
 
 #[test]
-fn a_tree_with_no_peers_writes_what_version_one_wrote() {
+fn a_tree_with_no_peers_writes_exactly_what_it_wrote_before() {
     let registry = small_tree();
     let dir = TempDir::new().unwrap();
     let graph = resolve(&registry, &roots(&[("a", "^1.0.0")]), &no_members()).unwrap();
     lockfile::save(&graph, dir.path()).unwrap();
 
-    let expected =
-        VERSION_ONE_SMALL_TREE.replace(r#""lockfileVersion": 1"#, r#""lockfileVersion": 2"#);
-    assert_eq!(read(&dir), expected);
+    // Byte-identical, version number included. Peers added two fields to the
+    // format and changed nothing for the packages that declare none — which is
+    // nearly all of them — so a tree without peers must still write exactly
+    // what it wrote before.
+    assert_eq!(read(&dir), VERSION_ONE_SMALL_TREE);
 }
 
 /// The peer keys this fixture produces, spelled out so a test asserting on one
@@ -1080,7 +1082,8 @@ fn a_dependency_on_a_duplicated_node_keeps_its_peer_suffix() {
 
 #[test]
 fn one_version_under_two_peer_contexts_is_two_packages() {
-    // The hazard version 2 exists to close, and the reason identity is rebuilt
+    // The hazard the recorded peers exist to close, and the reason identity is
+    // rebuilt
     // from the recorded peers rather than parsed out of the key. Both keys
     // here split to `plugin` and `1.0.0`; only what they record tells them
     // apart, and a peer-free identity taken from the key would land them both
@@ -1089,7 +1092,7 @@ fn one_version_under_two_peer_contexts_is_two_packages() {
     write_raw(
         &dir,
         &format!(
-            r#"{{"lockfileVersion":2,"importers":{{}},"packages":{{
+            r#"{{"lockfileVersion":1,"importers":{{}},"packages":{{
                 "react@17.0.2": {{"version":"17.0.2","resolved":"https://r.test/r17.tgz","integrity":"{HASH}"}},
                 "react@18.2.0": {{"version":"18.2.0","resolved":"https://r.test/r18.tgz","integrity":"{HASH}"}},
                 "plugin@1.0.0(react@17.0.2)": {{"version":"1.0.0","resolved":"https://r.test/p.tgz","integrity":"{HASH}",
@@ -1133,7 +1136,7 @@ fn a_peer_pointing_at_nothing_is_refused() {
     write_raw(
         &dir,
         &format!(
-            r#"{{"lockfileVersion":2,"importers":{{}},"packages":{{
+            r#"{{"lockfileVersion":1,"importers":{{}},"packages":{{
                 "plugin@1.0.0(react@18.2.0)": {{"version":"1.0.0","resolved":"https://r.test/p.tgz","integrity":"{HASH}",
                     "peers":{{"react":"react@18.2.0"}}}}
             }}}}"#
@@ -1160,7 +1163,7 @@ fn a_key_whose_suffix_swallowed_the_version_is_refused() {
     write_raw(
         &dir,
         &format!(
-            r#"{{"lockfileVersion":2,"importers":{{}},"packages":{{
+            r#"{{"lockfileVersion":1,"importers":{{}},"packages":{{
                 "plugin(react@18.2.0)": {{"version":"1.0.0","resolved":"https://r.test/p.tgz","integrity":"{HASH}"}}
             }}}}"#
         ),
@@ -1184,7 +1187,7 @@ fn a_key_disagreeing_with_the_peers_it_records_is_refused() {
     write_raw(
         &dir,
         &format!(
-            r#"{{"lockfileVersion":2,"importers":{{}},"packages":{{
+            r#"{{"lockfileVersion":1,"importers":{{}},"packages":{{
                 "react@18.2.0": {{"version":"18.2.0","resolved":"https://r.test/r18.tgz","integrity":"{HASH}"}},
                 "plugin@1.0.0(react@17.0.2)": {{"version":"1.0.0","resolved":"https://r.test/p.tgz","integrity":"{HASH}",
                     "peers":{{"react":"react@18.2.0"}}}},
@@ -1204,25 +1207,6 @@ fn a_key_disagreeing_with_the_peers_it_records_is_refused() {
         }
         other => panic!("expected a key/identity mismatch, got {other:?}"),
     }
-}
-
-#[test]
-fn a_version_one_lockfile_is_refused_rather_than_migrated() {
-    // #104 was closed as unnecessary rather than deferred: jerky has shipped
-    // no MVP, so nobody holds a version 1 file and a migration has nobody to
-    // serve. The upgrade message it already falls through to is the whole
-    // answer, and this test is what stops a migration being written later
-    // under the impression one is missing.
-    let dir = TempDir::new().unwrap();
-    write_raw(
-        &dir,
-        r#"{"lockfileVersion":1,"importers":{},"packages":{}}"#,
-    );
-
-    assert!(matches!(
-        lockfile::load(dir.path()),
-        Err(LockfileError::UnsupportedVersion { found: 1, .. })
-    ));
 }
 
 #[test]

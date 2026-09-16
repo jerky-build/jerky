@@ -24,12 +24,13 @@ pub const LOCKFILE_NAME: &str = "jerky-lock.json";
 /// Present from the first release because a committed format without one has
 /// no migration path: there is no way to tell an old file from a corrupt one.
 ///
-/// Version 2 records peers — what each node resolved against, and what it
-/// published — and with them keys that carry a peer suffix. A version 1 file
-/// is refused rather than upgraded: jerky has shipped no MVP, so a migration
-/// has nobody to serve, and `UnsupportedVersion` already says the one useful
-/// thing there is to say about a file this jerky will not read.
-pub const LOCKFILE_VERSION: u32 = 2;
+/// Deliberately still `1` after peers were added, and after the shape change
+/// before that. jerky has not shipped a 1.0, so there is no population of
+/// committed lockfiles for a version number to tell apart — the format simply
+/// changes, and a stale file is regenerated. Spending the version now would
+/// buy nothing and leave a number in the file's history that never
+/// distinguished anything.
+pub const LOCKFILE_VERSION: u32 = 1;
 
 #[derive(Debug, Error)]
 pub enum LockfileError {
@@ -398,7 +399,8 @@ struct DecodedEntry {
 /// Rebuild every node's [`PackageId`] from what its entry records, rather than
 /// from the key it is recorded under.
 ///
-/// This is the whole reason version 2 is not version 1 with two more fields.
+/// This is the whole reason the two are recorded separately rather than one
+/// being derived from the other.
 /// A key carries the peer context too, but reading it back out is not
 /// available: a context long enough to collapse is a hash, and a hash does not
 /// decode. Version 1 built a [`PackageId::plain`] from the key and dropped

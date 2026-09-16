@@ -162,7 +162,7 @@ link apps/web/node_modules/ui -> ../../../packages/ui
      resolves=true is_dir=true
 --- lockfile ---
 {
-  "lockfileVersion": 2,
+  "lockfileVersion": 1,
   "importers": {
     ".": {
       "dependencies": {
