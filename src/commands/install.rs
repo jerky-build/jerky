@@ -1186,7 +1186,7 @@ mod tests {
                 .iter()
                 .map(|(link, target)| (link.to_string(), target.clone()))
                 .collect(),
-            optional: BTreeSet::new(),
+            optional_dependencies: BTreeSet::new(),
             supports: PlatformSupport::default(),
             declared_peers: BTreeMap::new(),
             peers: BTreeMap::new(),

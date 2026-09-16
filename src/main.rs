@@ -89,7 +89,6 @@ fn run(cli: Cli) -> Result<(), JerkyError> {
                     report_skipped(&outcome.skipped, &outcome.platform);
                     let added = outcome
                         .recorded
-                        .as_ref()
                         .expect("an install always reports what it recorded");
                     println!("added {}@{} to {importer}", added.name, added.version);
                 }

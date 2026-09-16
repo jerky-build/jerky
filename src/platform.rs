@@ -37,9 +37,14 @@ impl Platform {
         )
     }
 
-    /// A named machine, for the tests that have to be about a machine other
-    /// than the one they are running on.
-    pub fn new(os: impl Into<String>, cpu: impl Into<String>) -> Self {
+    /// A named machine.
+    ///
+    /// Private: the only machine anything outside this module has a question
+    /// about is the one it is running on, and the tests that need to ask about
+    /// another are in here. A public constructor would invite a caller to
+    /// decide what platform an install is for, which is not a decision jerky
+    /// offers.
+    fn new(os: impl Into<String>, cpu: impl Into<String>) -> Self {
         Platform {
             os: os.into(),
             cpu: cpu.into(),
@@ -57,29 +62,31 @@ impl std::fmt::Display for Platform {
 
 /// Rust's platform name in Node's spelling.
 ///
-/// Only the names that actually differ are listed; anything else passes
-/// through, which is correct for `linux`, `freebsd`, `openbsd`, `netbsd` and
-/// `android` — they agree already — and is the only honest answer for a name
-/// neither side has heard of. The value is compared for equality and nothing
-/// else, so an unmapped name matches a package that names it and matches
-/// nothing else, which is what an unknown platform should do.
+/// Only the names that both differ *and* can occur on a platform jerky
+/// targets. `linux` is already the same word on both sides, so WSL and Linux
+/// need no arm at all and `macos` is the whole of the list. An arm for
+/// `windows` or `solaris` would be a second definition to keep in agreement
+/// with the first, for a platform nothing runs on — the same thing the
+/// `#[cfg(windows)]` invariant refuses, spelled as a match arm.
+///
+/// Anything unlisted passes through, which is the only honest answer for a
+/// name neither side has heard of: the value is compared for equality and
+/// nothing else, so it matches a package that names it and matches nothing
+/// else.
 fn node_os(rust: &str) -> &str {
     match rust {
         "macos" => "darwin",
-        "windows" => "win32",
-        "solaris" => "sunos",
         other => other,
     }
 }
 
-/// Rust's architecture name in Node's spelling. Same rule as [`node_os`].
+/// Rust's architecture name in Node's spelling. Same rule as [`node_os`],
+/// applied to the architectures those platforms actually ship on.
 fn node_cpu(rust: &str) -> &str {
     match rust {
         "x86_64" => "x64",
         "aarch64" => "arm64",
         "x86" => "ia32",
-        "powerpc" => "ppc",
-        "powerpc64" => "ppc64",
         other => other,
     }
 }
@@ -220,11 +227,14 @@ mod tests {
     #[test]
     fn rust_platform_names_are_translated_into_nodes() {
         assert_eq!(node_os("macos"), "darwin");
-        assert_eq!(node_os("windows"), "win32");
         assert_eq!(node_os("linux"), "linux");
         assert_eq!(node_cpu("x86_64"), "x64");
         assert_eq!(node_cpu("aarch64"), "arm64");
-        assert_eq!(node_cpu("s390x"), "s390x");
+        assert_eq!(
+            node_cpu("s390x"),
+            "s390x",
+            "an unlisted name passes through rather than becoming nothing"
+        );
     }
 
     #[test]

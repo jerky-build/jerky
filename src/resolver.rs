@@ -358,9 +358,15 @@ pub struct ResolvedPackage {
     /// What this package calls a dependency -> the node it resolved to.
     ///
     /// Every edge, optional or not. Which of them were declared optional is
-    /// `optional` below, and nothing else about an optional edge differs.
+    /// `optional_dependencies` below, and nothing else about an optional edge
+    /// differs.
     pub dependencies: BTreeMap<String, PackageId>,
     /// Which keys of `dependencies` came from `optionalDependencies`.
+    ///
+    /// Spelled out rather than `optional`, because `DeclaredPeer::optional`
+    /// already lives in this module and says something else entirely — that a
+    /// peer may go unsatisfied. Two `.optional`s a few hundred lines apart,
+    /// meaning different things, is a field name that has to be read twice.
     ///
     /// A marker over the edge names rather than a second edge map or a flag on
     /// the edge value, because an optional dependency that is installed is an
@@ -370,7 +376,7 @@ pub struct ResolvedPackage {
     /// of the edge is what lets every existing walker over `dependencies` stay
     /// single-branch and stay right, and leaves the one pass that has the
     /// question — [`ResolvedGraph::for_platform`] — to ask it.
-    pub optional: BTreeSet<String>,
+    pub optional_dependencies: BTreeSet<String>,
     /// What this package published about the machines it runs on.
     ///
     /// Carried rather than evaluated, for the reason `declared_peers` is: the
@@ -711,6 +717,12 @@ impl ResolvedGraph {
     /// from whoever declared it, and so is a resolved peer naming one. Without
     /// the first the plan writes a symlink into a virtual store entry nothing
     /// created.
+    ///
+    /// It clones, and in the common case where nothing is skipped it clones
+    /// the whole graph to change nothing. A `Cow` would save that, and would
+    /// put a deref in front of every reader of a graph for a cost that does
+    /// not register beside one tarball — this runs once per install, against
+    /// the fetch and the unpack that follow it.
     pub fn for_platform(&self, platform: &Platform) -> (Self, Vec<PackageId>) {
         let mut kept: BTreeSet<PackageId> = BTreeSet::new();
         let mut skipped: BTreeSet<PackageId> = BTreeSet::new();
@@ -734,7 +746,7 @@ impl ResolvedGraph {
                 continue;
             };
             for (name, target) in &package.dependencies {
-                let skippable = package.optional.contains(name);
+                let skippable = package.optional_dependencies.contains(name);
                 let admitted = self
                     .packages
                     .get(target)
@@ -760,6 +772,13 @@ impl ResolvedGraph {
             .map(|(id, package)| {
                 let mut package = package.clone();
                 package.dependencies.retain(|_, to| kept.contains(to));
+                // The marker set names keys of `dependencies`, so it has to
+                // follow them out. Nothing downstream reads it today, which is
+                // exactly why leaving it stale would be a field whose own
+                // documentation is false by the time something does.
+                package
+                    .optional_dependencies
+                    .retain(|name| package.dependencies.contains_key(name));
                 package.peers.retain(|_, to| kept.contains(to));
                 (id.clone(), package)
             })
@@ -1420,7 +1439,7 @@ impl PeerPass<'_> {
                     // what the version declared: which of its edges were
                     // optional, and which machines it runs on, are properties
                     // of the publish and not of which peers answered.
-                    optional: source.optional.clone(),
+                    optional_dependencies: source.optional_dependencies.clone(),
                     supports: source.supports.clone(),
                     declared_peers: source.declared_peers.clone(),
                     peers: copy
@@ -2021,7 +2040,7 @@ impl<'a> Walk<'a> {
                 if let Some(package) = self.packages.get_mut(&parent) {
                     package.dependencies.insert(name.clone(), id.clone());
                     if optional {
-                        package.optional.insert(name.clone());
+                        package.optional_dependencies.insert(name.clone());
                     }
                 }
             }
@@ -2090,7 +2109,7 @@ impl<'a> Walk<'a> {
                 dependencies: BTreeMap::new(),
                 // Filled as each edge above is visited, since that is where
                 // the name an edge is recorded under is settled.
-                optional: BTreeSet::new(),
+                optional_dependencies: BTreeSet::new(),
                 supports: PlatformSupport {
                     os: metadata.os.clone(),
                     cpu: metadata.cpu.clone(),

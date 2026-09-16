@@ -380,13 +380,13 @@ pub fn save(graph: &ResolvedGraph, project_dir: &Path) -> Result<(), LockfileErr
                     dependencies: package
                         .dependencies
                         .iter()
-                        .filter(|(name, _)| !package.optional.contains(*name))
+                        .filter(|(name, _)| !package.optional_dependencies.contains(*name))
                         .map(|(name, id)| (name.clone(), edge_value(name, id)))
                         .collect(),
                     optional_dependencies: package
                         .dependencies
                         .iter()
-                        .filter(|(name, _)| package.optional.contains(*name))
+                        .filter(|(name, _)| package.optional_dependencies.contains(*name))
                         .map(|(name, id)| (name.clone(), edge_value(name, id)))
                         .collect(),
                     os: package.supports.os.clone(),
@@ -795,13 +795,13 @@ pub fn load(project_dir: &Path) -> Result<Option<ResolvedGraph>, LockfileError> 
             decoded.remove(&key).expect("every key was decoded above");
 
         // The two blocks flattened back into the one map the graph keeps, with
-        // the section they came from recorded beside it. Built before `entry`
-        // is taken apart below, which is also the order that makes the flatten
-        // read as one statement rather than two halves either side of a move.
+        // the section they came from recorded beside it. Ahead of the
+        // initializer rather than inside it, because `entry` is moved from
+        // there field by field and the flatten reads all of it.
         let dependencies = recorded_edges(&entry)
             .map(|(name, recorded)| (name.clone(), ids[&edge_key(name, recorded)].clone()))
             .collect();
-        let optional = entry.optional_dependencies.keys().cloned().collect();
+        let optional_dependencies = entry.optional_dependencies.keys().cloned().collect();
         let supports = PlatformSupport {
             os: entry.os.clone(),
             cpu: entry.cpu.clone(),
@@ -814,7 +814,7 @@ pub fn load(project_dir: &Path) -> Result<Option<ResolvedGraph>, LockfileError> 
                 resolved: entry.resolved,
                 integrity,
                 dependencies,
-                optional,
+                optional_dependencies,
                 supports,
                 peers: entry
                     .peers

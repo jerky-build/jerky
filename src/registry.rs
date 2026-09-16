@@ -970,6 +970,60 @@ mod tests {
     }
 
     #[test]
+    fn optional_dependencies_and_the_declared_platform_are_read_off_the_abbreviated_packument() {
+        // Verified against the live registry, and the reason no second request
+        // is needed: `esbuild@0.21.5` returns twenty-three
+        // `optionalDependencies` in the abbreviated form jerky already asks
+        // for, and each of the packages they name returns its `os` and `cpu`.
+        //
+        // Two entries name `shared`, which is npm's documented override case
+        // and the one a reader would otherwise have to guess at. Resolving it
+        // is `resolver::declared_edges`'s job rather than this one's: the two
+        // blocks arrive here exactly as published.
+        let raw = r#"{
+            "name": "esbuild", "version": "0.21.5",
+            "dist": { "tarball": "https://r.test/a.tgz" },
+            "dependencies": { "shared": "^1.0.0" },
+            "optionalDependencies": {
+                "@esbuild/darwin-arm64": "0.21.5",
+                "shared": "^2.0.0"
+            }
+        }"#;
+
+        let metadata: VersionMetadata = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            metadata.optional_dependencies["@esbuild/darwin-arm64"],
+            "0.21.5"
+        );
+        assert_eq!(metadata.dependencies["shared"], "^1.0.0");
+        assert_eq!(metadata.optional_dependencies["shared"], "^2.0.0");
+
+        // And what one of those platform packages publishes about itself.
+        let raw = r#"{
+            "name": "@esbuild/darwin-arm64", "version": "0.21.5",
+            "dist": { "tarball": "https://r.test/b.tgz" },
+            "os": ["darwin"], "cpu": ["arm64"]
+        }"#;
+
+        let metadata: VersionMetadata = serde_json::from_str(raw).unwrap();
+        assert_eq!(metadata.os, ["darwin"]);
+        assert_eq!(metadata.cpu, ["arm64"]);
+
+        // A package declaring neither — nearly every package there is —
+        // arrives with both empty rather than absent, which is what lets
+        // `PlatformSupport` admit everything without a case for it.
+        let raw = r#"{
+            "name": "a", "version": "1.0.0",
+            "dist": { "tarball": "https://r.test/c.tgz" }
+        }"#;
+
+        let metadata: VersionMetadata = serde_json::from_str(raw).unwrap();
+        assert!(metadata.os.is_empty());
+        assert!(metadata.cpu.is_empty());
+        assert!(metadata.optional_dependencies.is_empty());
+    }
+
+    #[test]
     fn peer_dependencies_are_read_off_the_abbreviated_packument() {
         // Verified against the live registry: react-dom@18.2.0 returns
         // peerDependencies in the abbreviated form jerky already asks for, so

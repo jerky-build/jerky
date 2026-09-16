@@ -85,7 +85,7 @@ fn an_optional_dependency_this_machine_supports_is_an_ordinary_dependency() {
         .unwrap();
     assert_eq!(host.dependencies["binary"].version, "1.0.0");
     assert!(
-        host.optional.contains("binary"),
+        host.optional_dependencies.contains("binary"),
         "the section it was declared in is recorded"
     );
 
@@ -168,6 +168,51 @@ fn a_package_the_skipped_one_merely_shared_is_kept() {
 }
 
 #[test]
+fn a_package_someone_else_requires_is_kept_however_it_was_skipped() {
+    // The rule the test above is named for, applied to the *skipped node
+    // itself* rather than to something beneath it, which is the case that
+    // actually exercises it: `host` declares `windows-binary` optional and it
+    // is unsupported, while `other` declares the same package outright. One
+    // reason to install it beats any amount of permission not to — and since
+    // the two paths can be discovered in either order, the answer cannot be
+    // taken at the moment of the skip.
+    let registry = FixtureRegistry::new()
+        .with_tree(&[
+            ("host", "1.0.0", &[]),
+            ("other", "1.0.0", &[("windows-binary", "^1.0.0")]),
+            ("windows-binary", "1.0.0", &[("helper", "^1.0.0")]),
+            ("helper", "1.0.0", &[]),
+        ])
+        .with_optional_dependencies("host", "1.0.0", &[("windows-binary", "^1.0.0")])
+        .with_platform("windows-binary", "1.0.0", &["win32"], &[]);
+
+    // Both orders, because which edge the walk reaches first is a property of
+    // the importer's own `BTreeMap` and a rule that held in only one of them
+    // would look correct here and fail on a rename.
+    for order in [
+        [("host", "^1.0.0"), ("other", "^1.0.0")],
+        [("other", "^1.0.0"), ("host", "^1.0.0")],
+    ] {
+        let graph = resolve(&registry, &roots(&order), &no_members()).unwrap();
+        let (installable, skipped) = here(&graph);
+
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(
+            names(&installable),
+            ["helper", "host", "other", "windows-binary"]
+        );
+
+        // And `host` keeps the edge, because the package it names is there.
+        let host = installable
+            .packages
+            .values()
+            .find(|p| p.id.name == "host")
+            .unwrap();
+        assert_eq!(host.dependencies["windows-binary"].version, "1.0.0");
+    }
+}
+
+#[test]
 fn a_required_edge_installs_an_unsupported_package_without_comment() {
     // The constraint is consulted only where a skip is available. Refusing a
     // tree that works is not a stricter kind of correct, and `os` is advisory
@@ -230,7 +275,7 @@ fn a_name_in_both_blocks_is_optional_and_takes_the_optional_range() {
         host.dependencies["binary"].version, "2.0.0",
         "the optional range won"
     );
-    assert!(host.optional.contains("binary"));
+    assert!(host.optional_dependencies.contains("binary"));
 
     let (_, skipped) = here(&graph);
     assert_eq!(
@@ -284,6 +329,90 @@ fn a_corrupt_optional_tarball_is_still_fatal() {
 }
 
 #[test]
+fn a_supported_optional_dependency_is_fetched_and_linked_like_any_other() {
+    // The other half of the skip, and the half nothing else drives to disk:
+    // an optional dependency this machine *does* support gets a virtual store
+    // entry and a link inside its dependent, exactly as a required one does.
+    // A `for_platform` that dropped every optional edge rather than only the
+    // unsupported ones would pass every skip test in this file and fail here.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let workspace = project(
+        work.path(),
+        r#"{"name":"demo","dependencies":{"host":"^1.0.0"}}"#,
+    );
+    let store = Store::new(home.path().join("store"));
+
+    let registry = FixtureRegistry::new()
+        .with_tree(&[
+            ("host", "1.0.0", &[]),
+            ("binary", "1.0.0", &[("helper", "^1.0.0")]),
+            ("helper", "1.0.0", &[]),
+        ])
+        .with_optional_dependencies("host", "1.0.0", &[("binary", "^1.0.0")])
+        .with_platform("binary", "1.0.0", &["linux", "darwin"], &[]);
+
+    let outcome = sync(&workspace, &store, &registry, None, Mode::Develop).unwrap();
+
+    assert!(outcome.skipped.is_empty());
+    assert_eq!(outcome.linked.len(), 3, "and its own subtree came with it");
+    assert!(
+        work.path()
+            .join("node_modules/.jerky/binary@1.0.0/node_modules/binary/package.json")
+            .is_file(),
+        "the tarball was fetched and unpacked"
+    );
+    assert!(
+        work.path()
+            .join("node_modules/.jerky/host@1.0.0/node_modules/binary")
+            .is_symlink(),
+        "and linked where its dependent can import it"
+    );
+}
+
+#[test]
+fn a_peer_answered_by_a_skipped_package_is_left_unlinked() {
+    // The second of the two things `for_platform` does beyond dropping nodes.
+    // A resolved peer is linked like a dependency, so one naming a package
+    // this machine skipped would be a symlink into a virtual store entry
+    // nothing created — the same dangling link a kept dependency edge would
+    // leave, one relation along.
+    let registry = FixtureRegistry::new()
+        .with_tree(&[
+            ("app", "1.0.0", &[("plugin", "^1.0.0")]),
+            ("plugin", "1.0.0", &[]),
+            ("windows-react", "1.0.0", &[]),
+        ])
+        .with_optional_dependencies("app", "1.0.0", &[("windows-react", "^1.0.0")])
+        .with_platform("windows-react", "1.0.0", &["win32"], &[])
+        .with_declared_peers("plugin", "1.0.0", &[("windows-react", ">=1", false)]);
+
+    let graph = resolve(&registry, &roots(&[("app", "^1.0.0")]), &no_members()).unwrap();
+    let (graph, _) = resolve_peers(graph);
+
+    // The peer was satisfied, by the copy `app` supplied.
+    let plugin = graph
+        .packages
+        .values()
+        .find(|p| p.id.name == "plugin")
+        .expect("plugin was resolved");
+    assert_eq!(plugin.peers["windows-react"].version, "1.0.0");
+
+    let (installable, skipped) = here(&graph);
+    assert_eq!(skipped, ["windows-react@1.0.0"]);
+
+    let plugin = installable
+        .packages
+        .values()
+        .find(|p| p.id.name == "plugin")
+        .expect("plugin is still installed");
+    assert!(
+        plugin.peers.is_empty(),
+        "a peer naming a skipped package would be linked into nothing"
+    );
+}
+
+#[test]
 fn a_skipped_package_is_recorded_but_neither_fetched_nor_linked() {
     let home = TempDir::new().unwrap();
     let work = TempDir::new().unwrap();
@@ -302,6 +431,7 @@ fn a_skipped_package_is_recorded_but_neither_fetched_nor_linked() {
 
     assert_eq!(outcome.skipped.len(), 1);
     assert_eq!(outcome.skipped[0].name, "windows-binary");
+    assert_eq!(outcome.skipped[0].version, "1.0.0");
     assert_eq!(
         outcome.linked.len(),
         1,

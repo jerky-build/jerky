@@ -149,6 +149,20 @@ matching the peer warnings and the left-alone warnings. It goes to stdout
 beside `installed N packages across M importers`, because it is a statement
 about what the install did rather than a complaint about it.
 
+**The count is packages this platform ruled out, not everything that fell out
+with them.** A package skipped because its own `os` excluded this machine is
+counted; a package that merely became unreachable when its only dependent was
+skipped is not, even though both are absent from the tree. The line names a
+platform, and "unsupported on linux-x64" is false of a helper that supports
+linux-x64 perfectly well and simply has nobody left to want it. For the shape
+this feature exists for — leaf platform binaries with no dependencies of their
+own — the two readings coincide anyway.
+
+`installed N packages` counts the filtered graph for the same reason: it is a
+statement about what reached disk, and reporting the resolved total would claim
+work that did not happen. That line is not new, but what it counts changes here
+and the change is deliberate.
+
 ## 3. Scope
 
 ### In scope
@@ -163,8 +177,8 @@ about what the install did rather than a complaint about it.
 
 | Deferred | Why |
 |---|---|
-| `libc` | Cannot be answered from `std`; see below |
-| An importer's own `optionalDependencies` | Needs a third `Kind`; see below |
+| `libc` | Cannot be answered from `std`; see below — #119 |
+| An importer's own `optionalDependencies` | Needs a third `Kind`; see below — #120 |
 | `--save-optional`, `--omit=optional` | Policy on top of a resolution, with #41 |
 | Naming the skipped packages in the output | The lockfile already does |
 
@@ -177,14 +191,14 @@ harmless in the other. Not reading it means a musl machine installs the glibc
 build alongside the musl one and the package's own loader picks; guessing wrong
 means the machine installs *neither* and nothing works. An unread field is also
 exactly what an absent `libc` already means today — "any libc" — so the
-behaviour is consistent rather than special-cased. Filed as a follow-up.
+behaviour is consistent rather than special-cased. Filed as #119.
 
 **An importer's own `optionalDependencies` is out of scope.** A workspace
 member declaring one would need `Kind` to grow a third variant, which reaches
 `Importer::matches`, both on-disk importer blocks, the `--production` filter,
 and the CLI's `--save-dev` surface. The population is also different in kind:
 the case this feature exists for is a *library* declaring platform variants,
-and every real instance of it is transitive. Filed as a follow-up.
+and every real instance of it is transitive. Filed as #120.
 
 ## 4. Reading it off the registry
 
@@ -212,8 +226,21 @@ through.
 
 **A name in both `dependencies` and `optionalDependencies` is optional**, at
 the optional range. That is npm's documented rule — "entries in
-optionalDependencies will override entries of the same name in dependencies" —
-and it falls out of queuing the optional block second.
+optionalDependencies will override entries of the same name in dependencies".
+One function, `declared_edges`, yields the union with the shadowed required
+entry filtered out, so the rule holds for a caller reading a sequence as well
+as for one collecting into a map, and the walk never resolves a version it is
+about to discard. The lockfile reads its two blocks back through the same
+shape, for the hand-edited file that records a name in both.
+
+**`Platform::new` is private.** The only machine anything outside the module
+has a question about is the one it is running on.
+
+**`ResolvedPackage` spells the marker `optional_dependencies`, not
+`optional`.** `DeclaredPeer::optional` already lives in the resolver and means
+something else entirely — that a peer may go unsatisfied — and two `.optional`s
+meaning different things in one module is a field name that has to be read
+twice.
 
 ## 5. The platform match
 
@@ -221,7 +248,7 @@ and it falls out of queuing the optional block second.
 confuse and must not be:
 
 ```rust
-/// The machine.
+/// The machine. Constructed by `Platform::current()` and nothing else.
 pub struct Platform { os: String, cpu: String }
 
 /// What a package declared about the machines it runs on.
@@ -230,17 +257,23 @@ pub struct PlatformSupport { pub os: Vec<String>, pub cpu: Vec<String> }
 
 `Platform::current()` maps Rust's `std::env::consts::{OS, ARCH}` onto Node's
 spelling of the same thing, since `os` and `cpu` are published against
-`process.platform` and `process.arch`. The interesting entries are `macos ->
-darwin`, `windows -> win32`, `x86_64 -> x64`, `aarch64 -> arm64` and `x86 ->
-ia32`. A name with no mapping is passed through unchanged, which is right for
-`linux`, `freebsd`, `arm` and `s390x` and is the only honest answer for
-anything not listed: the value is only ever compared for equality, so an
-unmapped name matches a package that names it and matches nothing else.
+`process.platform` and `process.arch`. The map holds only the names that both
+differ *and* can occur on a platform jerky targets: `macos -> darwin` for the
+OS, and `x86_64 -> x64`, `aarch64 -> arm64`, `x86 -> ia32` for the
+architecture. `linux` is already the same word on both sides, so WSL and Linux
+need no entry at all.
 
-This is not a `#[cfg]`. `std::env::consts` is a compile-time constant read at
-runtime through an ordinary `match`, so there is one definition of the mapping
-and every branch of it compiles everywhere — which is what the no-`cfg(windows)`
-invariant is protecting.
+**An entry for `windows` or `solaris` would be a second definition to keep in
+agreement with the first, for a platform nothing runs on** — which is exactly
+what the `#[cfg(windows)]` invariant refuses, spelled as a match arm rather
+than an attribute. A name with no entry passes through unchanged, which is the
+only honest answer for one neither side has heard of: the value is only ever
+compared for equality, so an unmapped name matches a package that names it and
+matches nothing else.
+
+This is not a `#[cfg]` either way. `std::env::consts` is a compile-time
+constant read at runtime through an ordinary `match`, so there is one
+definition of the mapping and every arm of it compiles everywhere.
 
 `PlatformSupport::admits` implements npm's rule exactly, from
 `npm-install-checks`, because this is another place where the correct answer is
@@ -302,6 +335,15 @@ dangling link behind:
   never created.
 - A resolved peer naming a dropped package is dropped the same way, for the
   same reason.
+- `optional_dependencies` names keys of `dependencies`, so it follows them out.
+  Nothing downstream reads it, which is precisely why leaving it stale would be
+  a field whose own documentation is false by the time something does.
+
+It clones, and in the common case where nothing is skipped it clones the whole
+graph to change nothing. A `Cow` would save that and would put a deref in front
+of every reader of a graph, for a cost that does not register beside one
+tarball: this runs once per install, against the fetch and the unpack that
+follow it.
 
 ## 7. The lockfile
 
