@@ -162,15 +162,20 @@ Then, against the diff:
   for it above all, is the bug this rule exists to prevent.
 - At least one test exercises more than one importer. A suite that only ever
   sees `.` is not testing workspaces.
-- `grep -rn 'fs::create_dir' src/` finds the call *outside* a `#[cfg(test)]`
-  module in `src/directory.rs` only. Everything else must be a test building a
-  layout of its own. A second production site is the bug this rule exists to
-  prevent: it is a directory reaching the store or a project at whatever the
-  umask allowed, and the reason the rule needs one owner rather than a grep
-  over four copies. Directories aside, no `unpack` writes a path that reaches
-  the store or a project without an explicit mode set after it. Run the suite
-  under `umask 0` as well as the default — a strict umask hides every
-  directory-mode hole, so the usual run proves nothing about them.
+- `grep -rnE 'fs::create_dir|DirBuilder' src/` finds the call *outside* a
+  `#[cfg(test)]` module in `src/directory.rs` only. Everything else must be a
+  test building a layout of its own. Both spellings, because `directory.rs`
+  itself now makes directories through a `DirBuilder` — that is how it passes
+  `mkdir` a mode instead of taking the umask's and chmodding afterwards — so a
+  grep for `fs::create_dir` alone would no longer see the owner, and would not
+  see a second site that copied it either. A second production site is the bug
+  this rule exists to prevent: it is a directory reaching the store or a
+  project at whatever the umask allowed, and the reason the rule needs one
+  owner rather than a grep over four copies. Directories aside, no `unpack`
+  writes a path that reaches the store or a project without an explicit mode
+  set after it. Run the suite under `umask 0` as well as the default — a strict
+  umask hides every directory-mode hole, so the usual run proves nothing about
+  them.
 - No `#[cfg(windows)]` or `#[cfg(not(unix))]`. jerky targets WSL, Linux and
   macOS; a fallback for a platform nothing runs on is a second definition to
   keep in agreement with the first, for nobody.

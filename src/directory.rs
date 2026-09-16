@@ -13,10 +13,13 @@
 //! project imports. A scope directory in an importer's `node_modules` is the
 //! same hole one level down: write access to it is permission to add a
 //! package there. So every directory jerky creates is `0o755`, and this module
-//! is the one place that says so.
+//! is the one place that says so — to `mkdir` itself rather than in a `chmod`
+//! a moment later, because a directory that is corrected to `0o755` was still
+//! world-writable for the length of a syscall, and with the worker pool
+//! materialising a plan there is somebody else there to notice.
 
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// The mode every directory jerky creates lands with: traversable and
 /// readable by anyone, writable only by its owner.
@@ -28,7 +31,7 @@ const MODE: u32 = 0o755;
 /// it made the directory rather than found it — a staging name, which two
 /// processes must not end up sharing.
 pub(crate) fn create(dir: &Path) -> io::Result<()> {
-    std::fs::create_dir(dir)?;
+    mkdir(dir)?;
     set_mode(dir)
 }
 
@@ -36,9 +39,12 @@ pub(crate) fn create(dir: &Path) -> io::Result<()> {
 ///
 /// The `create_dir_all` of this module, and the one most callers reach for.
 ///
-/// Only the levels that were actually missing are chmodded. A level that was
-/// already there belongs to whoever made it, and rewriting its mode would be
-/// this deciding something about a directory it did not create. It is also
+/// Only the levels this actually created are chmodded, and that holds under
+/// concurrency rather than only on paper: `missing` is a snapshot, so two
+/// workers racing for the same level can both believe they must make it, but
+/// only one `mkdir` succeeds and the loser leaves the mode alone. A level that
+/// was already there belongs to whoever made it, and rewriting its mode would
+/// be this deciding something about a directory it did not create. It is also
 /// what keeps the extractor cheap: from its second entry onwards a tarball's
 /// parent directories all exist, so the common call is answered by one stat
 /// instead of a chmod per ancestor per entry — which on a 93k-file tree is
@@ -48,18 +54,50 @@ pub(crate) fn create_all(dir: &Path) -> io::Result<()> {
         return Ok(());
     }
 
-    let missing: Vec<PathBuf> = dir
+    // `is_dir` rather than `exists`, so a plain file — or a dangling symlink —
+    // partway down is counted as missing and the `mkdir` for it reports the
+    // collision, which is what `create_dir_all` does with the same case. The
+    // empty path terminates a relative path's ancestors and is nobody's
+    // directory to make.
+    let missing: Vec<&Path> = dir
         .ancestors()
-        .take_while(|level| !level.exists())
-        .map(Path::to_path_buf)
+        .take_while(|level| !level.as_os_str().is_empty() && !level.is_dir())
         .collect();
 
-    std::fs::create_dir_all(dir)?;
-
-    for level in missing {
-        set_mode(&level)?;
+    for level in missing.iter().rev() {
+        create_level(level)?;
     }
     Ok(())
+}
+
+/// Make one level, treating a level that arrived while we were deciding to
+/// make it as made.
+///
+/// The `AlreadyExists` arm is the race between the `missing` snapshot and the
+/// `mkdir`, which several workers materialising a plan into one scope
+/// directory run into constantly. It insists on a *directory* having arrived,
+/// so a file in the way is still the error it is under `create_dir_all`.
+fn create_level(dir: &Path) -> io::Result<()> {
+    match mkdir(dir) {
+        Ok(()) => set_mode(dir),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists && dir.is_dir() => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// `mkdir(dir, 0o755)` — the mode the directory is *born* with.
+///
+/// The difference from creating it and chmodding it afterwards is a window,
+/// not an end state: `std::fs::create_dir` passes `0o777`, so under a
+/// permissive umask the directory exists group- and world-writable until the
+/// chmod lands, and a sibling worker that checks for it inside that window
+/// finds a directory anyone can write to and starts filling it. The umask
+/// still applies here, but it can only take bits away, and `set_mode` puts
+/// those back.
+fn mkdir(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    std::fs::DirBuilder::new().mode(MODE).create(dir)
 }
 
 fn set_mode(path: &Path) -> io::Result<()> {
@@ -72,7 +110,15 @@ fn set_mode(path: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt as _;
+    use std::sync::Barrier;
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+    use std::thread;
     use tempfile::TempDir;
+
+    /// Enough threads to lose the race most rounds, without turning the test
+    /// into a benchmark of the machine it runs on.
+    const THREADS: usize = 32;
+    const OBSERVERS: usize = 4;
 
     fn mode_of(path: &Path) -> u32 {
         std::fs::metadata(path).unwrap().permissions().mode() & 0o777
@@ -142,6 +188,111 @@ mod tests {
         let dir = TempDir::new().unwrap();
 
         assert!(create(dir.path()).is_err());
+    }
+
+    #[test]
+    fn a_plain_file_in_the_way_is_an_error_at_any_level() {
+        // Walking the levels by hand means writing the collision check that
+        // `create_dir_all` used to supply, and the arm that forgives an
+        // `AlreadyExists` is exactly where it can go missing. Forgiving a file
+        // would hand the caller success and no directory, and it would find
+        // that out several writes later.
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"").unwrap();
+
+        assert!(
+            create_all(&file).is_err(),
+            "a file answered as its own leaf"
+        );
+        assert!(
+            create_all(&file.join("under")).is_err(),
+            "a file answered as a parent"
+        );
+    }
+
+    #[test]
+    fn several_threads_creating_one_path_all_succeed_and_agree_on_the_mode() {
+        // Materialising a plan fans out over a worker pool, and every
+        // `@types/*` entry in a graph wants the same `.jerky/@types`
+        // directory — so the concurrent call is the ordinary call here, not
+        // the exotic one. The threads race for the same levels, and a thread
+        // that loses the race has still been handed the directory it asked
+        // for: losing must not be an error, and must not leave a level at
+        // anything but 0o755.
+        let dir = TempDir::new().unwrap();
+        let deepest = dir.path().join("a/b/c/d");
+        let start = Barrier::new(THREADS);
+
+        thread::scope(|scope| {
+            for _ in 0..THREADS {
+                scope.spawn(|| {
+                    start.wait();
+                    create_all(&deepest).unwrap();
+                });
+            }
+        });
+
+        let mut level = dir.path().to_path_buf();
+        for name in ["a", "b", "c", "d"] {
+            level = level.join(name);
+            assert_eq!(mode_of(&level), 0o755, "{} is too open", level.display());
+        }
+    }
+
+    #[test]
+    fn a_level_is_never_observed_wider_than_0o755() {
+        // The mode at rest is only half the question. Creating a level at the
+        // umask's mode and chmodding it afterwards leaves a window in which it
+        // exists group- and world-writable, and a sibling worker that passes
+        // its own existence check inside that window starts hard-linking a
+        // package into a directory anyone can write to. The window is
+        // microseconds wide, so this samples for it rather than reasoning
+        // about it: observers spin over every level of the path a creator is
+        // walking down, and record any mode carrying a bit outside 0o755.
+        //
+        // Like every mode assertion here it is load bearing only under
+        // `umask 0`, which the suite runs separately. A strict umask makes
+        // `mkdir`'s mode narrower than 0o755 rather than wider, and narrower
+        // is not the hole.
+        const ROUNDS: usize = 1000;
+
+        let dir = TempDir::new().unwrap();
+        let round = AtomicUsize::new(0);
+        let finished = AtomicBool::new(false);
+        // 0 means nothing wider was ever seen; any other value is the mode
+        // that was, kept so the failure can say what it caught.
+        let widest = AtomicU32::new(0);
+
+        thread::scope(|scope| {
+            for _ in 0..OBSERVERS {
+                scope.spawn(|| {
+                    while !finished.load(Ordering::Relaxed) {
+                        let mut level = dir.path().join(round.load(Ordering::Relaxed).to_string());
+                        for name in ["a", "b", "c", "d"] {
+                            level = level.join(name);
+                            // A level the creator has not reached yet is the
+                            // usual answer, and says nothing either way.
+                            if let Ok(metadata) = std::fs::metadata(&level) {
+                                let mode = metadata.permissions().mode() & 0o777;
+                                if mode & !MODE != 0 {
+                                    widest.store(mode, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+
+            for index in 0..ROUNDS {
+                round.store(index, Ordering::Relaxed);
+                create_all(&dir.path().join(index.to_string()).join("a/b/c/d")).unwrap();
+            }
+            finished.store(true, Ordering::Relaxed);
+        });
+
+        let seen = widest.load(Ordering::Relaxed);
+        assert_eq!(seen, 0, "a level was observed at 0o{seen:o}");
     }
 
     #[test]
