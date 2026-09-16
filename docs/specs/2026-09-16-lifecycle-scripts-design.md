@@ -170,10 +170,24 @@ a warning printed once is a warning nobody sees, because the install that
 matters is the one on a machine that has never run it before. The report names
 each package and says what to add.
 
-The allowlist lives in `package.json` under a `jerky` key and **not** in a
-config file of its own, because there is no config file — #12 is unbuilt. When
-#12 lands it can absorb this, and the spec for it should say what happens to a
-manifest that still carries the key.
+**Where the allowlist lives is #12's decision, and the allowlist is blocked on
+it.** The `jerky.allowedScripts` block above is what this spec needs to *say*
+in order to describe the behaviour; it is not a claim on the manifest. jerky
+has no configuration surface yet, and inventing a one-off key here would settle
+by accident the question #12 exists to settle on purpose — and would leave a
+key to migrate the moment it landed.
+
+This has a consequence worth stating plainly rather than discovering during
+implementation. **No dependency's scripts can run until #12 lands**, because
+until then there is nowhere to name a package. What ships before it is
+everything else in this document: members' own scripts, the runner, the
+ordering, the environment, the failure shapes, and the plumbing that carries
+`hasInstallScript` to the linker. The allowlist is the switch, and the switch
+needs somewhere to live.
+
+That is a sequencing consequence and not a scope reduction — this spec still
+covers both halves, and §7 is unchanged. It does mean that if building native
+packages is the thing that is wanted, **#12 is on the critical path to it**.
 
 ## 5. Reading the declaration
 
@@ -374,7 +388,10 @@ underneath it, so a user's answer is to delete `node_modules`. That is the same
 answer npm gives without `npm rebuild`, and it is bad. It needs to know what a
 build depended on, which is the cache-key problem again from the other side.
 
-**Deciding what happens to `"jerky": { "allowedScripts": ... }` when #12
-lands.** Deliberately left to #12, which is where the config surface gets
-designed. What this spec owes that one is only that the key is namespaced under
-`jerky` so it cannot collide.
+**Choosing where the allowlist is configured.** #12's, entirely. What this
+spec owes that one is the shape of the question rather than an answer to it:
+a list of exact package names, read at the workspace root, that has to be
+readable before the first dependency is materialised — so wherever it lives
+must be loadable without a resolved graph. §4 records why it is names and not
+ranges or patterns, which is a decision about the allowlist and survives
+whatever file it ends up in.
