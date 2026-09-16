@@ -171,6 +171,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **An install that finds the tree already correct now writes nothing to it.**
+  Placing a symlink used to remove and recreate it whether or not it already
+  pointed where the install wanted, so a no-op install still paid one unlink
+  and one symlink for every edge in the graph — every dependency of every
+  package, plus every link in every importer's `node_modules`. Each link is
+  now read first and left alone when it already says the right thing, which is
+  also what stops a no-op install from moving the mtime of a tree nothing
+  changed ([#86](https://github.com/jerky-build/jerky/issues/86)).
+
+- **Packages are materialised into the virtual store in parallel.** Hard-linking
+  a package out of the content store is syscall-bound rather than
+  latency-bound, and the entries are independent of one another, so they now
+  run across as many workers as the machine has cores — the cgroup's share of
+  them inside a container — instead of one at a time. Linking the tree is
+  roughly three to four times faster on a 32-core machine; the rest of the
+  install is unchanged, and convergence and the prune deliberately stay on one
+  thread, since what they do is *remove* files and their proof that jerky wrote
+  what they are removing is not worth re-deriving under concurrency.
+
+  Which package a failing install blames does not become a race: the worker
+  pool reports the failure of the lowest-indexed item, which here is the first
+  entry in the plan's own order, so the same broken package is named on every
+  run.
+
+  Laying out a tree of 2000 packages and ~90k files — the shape of the
+  `alotta-packages` benchmark fixture — went from ~535 ms to ~120–215 ms on a
+  32-core machine, and a second install over the finished tree from ~51 ms to
+  ~20 ms. Those are the linker alone rather than a whole install
+  ([#86](https://github.com/jerky-build/jerky/issues/86)).
+
 - File permissions from a package tarball are no longer applied as recorded.
   Every extracted file becomes `0o644`, or `0o755` when the archive marked it
   owner-executable, and every directory becomes `0o755`; nothing else from the

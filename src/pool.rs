@@ -3,8 +3,11 @@
 //! Two shapes, and the difference between them is whether the work is known
 //! before it starts.
 //!
-//! [`drain`] takes a slice: tarball downloads, where the list is the graph and
-//! the only interesting question is which failure gets reported. [`crawl`]
+//! [`drain`] takes a slice: tarball downloads, and the linker materialising a
+//! plan's entries into the virtual store — a list that is the graph, where the
+//! only interesting question is which failure gets reported. Those two wait on
+//! different things, one on a network and one on a kernel, and are the same
+//! shape of work, which is the shape this takes. [`crawl`]
 //! takes a list its own workers extend as they go: the resolver's metadata
 //! walk, where finishing one packument is what reveals the next ones. They
 //! share a cap and nothing else — a growing list cannot be walked by an index,
