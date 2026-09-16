@@ -9,6 +9,7 @@ use crate::integrity::{Integrity, IntegrityError};
 use crate::linker::{self, LinkError, Unowned};
 use crate::lockfile::{self, LockfileError};
 use crate::manifest::{Manifest, ManifestError};
+use crate::platform::Platform;
 use crate::pool;
 use crate::range::{Range, Version};
 use crate::registry::{MAX_CONCURRENT_FETCHES, RegistryClient, RegistryError};
@@ -210,6 +211,31 @@ pub struct Outcome {
     pub unsatisfied_peers: Vec<UnsatisfiedPeer>,
     /// Present only when there was a request to record.
     pub recorded: Option<Recorded>,
+    /// Optional dependencies this machine does not satisfy, left out of the
+    /// tree.
+    ///
+    /// A list rather than the count that gets printed, for the same reason
+    /// `linked` is one: what the sync did is the outcome's business and how
+    /// much of it to say is the caller's. The names are also on disk — the
+    /// lockfile records every one of these, declared platform and all.
+    pub skipped: Vec<Skipped>,
+    /// The machine that did the skipping, so the caller can name it.
+    ///
+    /// Carried even when nothing was skipped, because a caller that had to
+    /// derive it would be asking the same question `for_platform` already
+    /// answered and could answer it differently.
+    pub platform: Platform,
+}
+
+/// One package left out because its declared `os`/`cpu` rules this machine
+/// out, reached only through `optionalDependencies`.
+///
+/// Not an error and not a failure: the package said which machines it is for,
+/// this is not one of them, and whoever depended on it said that was allowed.
+#[derive(Debug, Clone)]
+pub struct Skipped {
+    pub name: String,
+    pub version: String,
 }
 
 /// Make the workspace match what its manifests declare, plus `request`.
@@ -489,16 +515,29 @@ pub fn sync(
         }
     }
 
+    // What this machine actually materialises, which is the whole graph minus
+    // the optional dependencies its `os`/`cpu` rules out and whatever only
+    // they led to. Two graphs from here down, deliberately: everything that
+    // touches the disk follows `installable`, and the lockfile below records
+    // `graph`, which is what keeps the file the same on every platform.
+    //
+    // After the locked-integrity gate rather than before it. A skipped package
+    // is still recorded, so a republished tarball for one is still a tampered
+    // entry in a committed file, and a gate that ran over the filtered graph
+    // would report it on a Linux machine and stay quiet on a Mac.
+    let platform = Platform::current();
+    let (installable, skipped) = graph.for_platform(&platform);
+
     // Every tarball the store lacks, fetched concurrently. Packages the store
     // already holds cost nothing here and are never downloaded.
-    fetch_missing(&graph, store, registry)?;
+    fetch_missing(&installable, store, registry)?;
 
     // Say what the tree should be, then make it so. The ordering the second
     // half obeys — entries before the links into them, convergence after
     // linking, the prune last — is a property of `apply` rather than of
     // anything written here. This used to be five loops with a comment above
     // each one saying what must not be moved.
-    let left_alone = plan_for(&graph, workspace, store).apply()?;
+    let left_alone = plan_for(&installable, workspace, store).apply()?;
 
     // The lockfile records what the manifest declares, so the specifier it
     // carries for this request is the one about to be written rather than the
@@ -525,11 +564,16 @@ pub fn sync(
         lockfile::save(&graph, workspace.root())?;
     }
 
+    // `installable` and not `graph`, because what is reported is what was
+    // linked and not what was resolved: the two differ by exactly the packages
+    // this machine skipped, and counting the resolved ones would claim work
+    // that did not happen.
+    //
     // A set rather than the keys themselves: peer resolution can put several
     // nodes on one published version, and `installed 3 packages` for two
     // copies of a react-dom and the react they disagree about counts
     // directories rather than packages.
-    let linked: BTreeSet<(String, String)> = graph
+    let linked: BTreeSet<(String, String)> = installable
         .packages
         .keys()
         .map(|id| (id.name.clone(), id.version.clone()))
@@ -543,6 +587,14 @@ pub fn sync(
         left_alone,
         unsatisfied_peers,
         recorded,
+        skipped: skipped
+            .into_iter()
+            .map(|id| Skipped {
+                name: id.name,
+                version: id.version,
+            })
+            .collect(),
+        platform,
     })
 }
 
@@ -1102,6 +1154,7 @@ mod tests {
 
     use crate::integrity::Algo;
     use crate::linker::{ImporterTarget, Plan, VirtualStoreEntry, VirtualStoreRef};
+    use crate::platform::PlatformSupport;
     use crate::resolver::Dependency;
     use std::path::Path;
     use tempfile::TempDir;
@@ -1133,6 +1186,8 @@ mod tests {
                 .iter()
                 .map(|(link, target)| (link.to_string(), target.clone()))
                 .collect(),
+            optional: BTreeSet::new(),
+            supports: PlatformSupport::default(),
             declared_peers: BTreeMap::new(),
             peers: BTreeMap::new(),
         }

@@ -3,9 +3,10 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use jerky::cli::{Cli, Command};
-use jerky::commands::install::Mode;
+use jerky::commands::install::{Mode, Skipped};
 use jerky::error::JerkyError;
 use jerky::linker::{Unowned, UnownedReason};
+use jerky::platform::Platform;
 use jerky::resolver::{ImporterPath, Kind, UnsatisfiedPeer};
 use jerky::workspace::{Warning, Workspace};
 
@@ -85,8 +86,10 @@ fn run(cli: Cli) -> Result<(), JerkyError> {
                     )?;
                     report_unowned(&outcome.left_alone);
                     report_unsatisfied_peers(&outcome.unsatisfied_peers);
+                    report_skipped(&outcome.skipped, &outcome.platform);
                     let added = outcome
                         .recorded
+                        .as_ref()
                         .expect("an install always reports what it recorded");
                     println!("added {}@{} to {importer}", added.name, added.version);
                 }
@@ -103,6 +106,7 @@ fn run(cli: Cli) -> Result<(), JerkyError> {
                         jerky::commands::install::sync(&workspace, &store, &registry, None, mode)?;
                     report_unowned(&outcome.left_alone);
                     report_unsatisfied_peers(&outcome.unsatisfied_peers);
+                    report_skipped(&outcome.skipped, &outcome.platform);
                     // The packages, not the links: two importers on one version
                     // share a store entry, and reporting the link count would
                     // make the same install read differently in a monorepo.
@@ -187,6 +191,29 @@ fn peer_warning(peer: &UnsatisfiedPeer) -> String {
         ),
         None => format!("{dependent} wants peer {name}@{range}, which nothing provides"),
     }
+}
+
+/// Say how many optional dependencies this machine did not take.
+///
+/// A count and the platform, never the names, which is the one place this
+/// deliberately differs from every other report here. A skipped optional
+/// dependency is the mechanism working rather than a problem to fix, and it is
+/// routine at scale: a project using esbuild, rollup and swc skips some
+/// seventy platform variants on every install, forever. Seventy lines of
+/// correct behaviour per run is how a tool teaches people to stop reading its
+/// output. The names are not lost — the lockfile records every one of them,
+/// with the `os` and `cpu` that ruled it out.
+///
+/// stdout rather than stderr, and no `warning:` prefix, because this is a
+/// statement about what the install did rather than a complaint about it.
+fn report_skipped(skipped: &[Skipped], platform: &Platform) {
+    if skipped.is_empty() {
+        return;
+    }
+    println!(
+        "skipped {} unsupported on {platform}",
+        plural(skipped.len(), "optional package")
+    );
 }
 
 /// Which importer the user is standing in.

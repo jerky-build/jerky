@@ -90,13 +90,34 @@ pub struct VersionMetadata {
     /// There is deliberately no `devDependencies` field. A dependency's dev
     /// dependencies must never be followed — doing so pulls in most of the
     /// registry — and a field that exists is a field someone will read.
-    ///
-    /// There is deliberately no `optionalDependencies` field either, for the
-    /// second half of that reason: they ride in the same response, they are
-    /// out of scope for peer support, and leaving them unparsed is what keeps
-    /// them unimplemented rather than half-implemented.
     #[serde(default)]
     pub dependencies: BTreeMap<String, String>,
+    /// Dependencies whose absence is tolerated, as `optionalDependencies`
+    /// publishes them.
+    ///
+    /// A block of its own rather than folded into `dependencies`, because what
+    /// makes one optional is the section it was declared in and nothing else —
+    /// and because a name may appear in both, where npm's documented rule is
+    /// that this one wins. Merging on the way in would lose the rule.
+    ///
+    /// Tolerated is narrower here than in npm: the only thing jerky skips is a
+    /// package whose declared `os`/`cpu` rules this machine out. See
+    /// `docs/specs/2026-09-16-optional-dependencies-design.md` §2.
+    #[serde(default, rename = "optionalDependencies")]
+    pub optional_dependencies: BTreeMap<String, String>,
+    /// The platforms this package says it runs on: `process.platform` values,
+    /// each optionally negated with `!`.
+    ///
+    /// Read verbatim and interpreted in `crate::platform`, because it is
+    /// recorded in the lockfile and the lockfile is platform independent —
+    /// every machine reading the file reaches its own conclusion from the same
+    /// bytes.
+    #[serde(default)]
+    pub os: Vec<String>,
+    /// The architectures this package says it runs on: `process.arch` values.
+    /// Same rule as `os`, and both must admit.
+    #[serde(default)]
+    pub cpu: Vec<String>,
     /// What this package requires of its consumer's environment.
     ///
     /// Not an edge to resolve. `react-dom` declaring `react` here means

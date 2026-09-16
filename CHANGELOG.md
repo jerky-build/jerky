@@ -10,6 +10,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `optionalDependencies` are resolved, and the ones this machine cannot run are
+  skipped. A package declaring an `os` or `cpu` that rules out the machine —
+  every `@esbuild/*`, `@rollup/rollup-*` and `@napi-rs/*` platform variant, and
+  `fsevents` — is left out of the tree when it was reached through an
+  `optionalDependencies` entry, along with anything only it led to. jerky says
+  so in one line rather than one per package, because a project using esbuild,
+  rollup and swc skips some seventy of them on every install:
+
+  ```
+  skipped 23 optional packages unsupported on linux-x64
+  ```
+
+  **A platform mismatch is the only thing that skips.** A fetch error, an
+  integrity mismatch and an unpack failure are fatal on an optional dependency
+  exactly as they are on a required one. npm tolerates all four, because
+  `optionalDependencies` was added for native addons whose `node-gyp` build
+  fails — and jerky runs no lifecycle scripts, so that failure cannot happen
+  here at all. What is left is not failure tolerance but a package saying in
+  advance which machines it is for. Reading `optional: true` as a waiver on the
+  integrity check in particular would let anyone who can serve bad bytes for
+  `fsevents` remove `fsevents` from your tree with no output at all.
+
+  **The lockfile is the same on every platform.** Every optional dependency is
+  resolved and recorded whatever machine writes the file, with the `os` and
+  `cpu` it declared, so a lockfile committed from a Mac installs on Linux
+  without reading as stale — and a `--production` install plans the right tree
+  for the machine it is running on from that one file, resolving nothing
+  ([#107](https://github.com/jerky-build/jerky/issues/107)).
+
 - Registry metadata is cached on disk, in `~/.jerky/cache` beside the store.
   A packument answers from there for **24 hours** without reaching the
   registry at all, so re-resolving a manifest you just edited — the most
