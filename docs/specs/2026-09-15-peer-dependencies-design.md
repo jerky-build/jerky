@@ -155,12 +155,32 @@ It is meaningless rather than malformed, and the registry has published worse.
 pub struct PackageId {
     pub name: String,
     pub version: String,
-    /// The peers this node resolved against, by the name it knows them under.
-    /// Empty for the overwhelming majority of packages, and empty is what
-    /// makes this change invisible to them.
-    pub peers: BTreeMap<String, PackageId>,
+    /// What this node resolved *against*. Empty for the overwhelming majority
+    /// of packages, and empty is what makes this change invisible to them.
+    pub context: BTreeMap<String, PackageId>,
 }
 ```
+
+**A context, not a peer map**, and the distinction is load-bearing. It holds two
+kinds of entry: this node's own resolved peers, and *each dependency that itself
+carries a context*.
+
+The second kind was missed when this spec was first written, and the omission
+was a silent-corruption bug rather than an incompleteness. Consider a `wrapper`
+that declares no peers at all but depends on a `plugin` that peers `react`, with
+two apps above it supplying different reacts. `plugin` correctly becomes two
+nodes — but `wrapper` must point at a different one in each subtree, and with
+only its own peers in the key both copies render `wrapper@1.0.0`. Since
+`ResolvedGraph::packages` is keyed by `PackageId`, the two collide and one
+subtree is dropped with nothing reported. Folding the dependency's context in is
+what gives them different keys:
+
+```
+wrapper@1.0.0(plugin@1.0.0(react@17.0.0))
+wrapper@1.0.0(plugin@1.0.0(react@18.2.0))
+```
+
+This is also why the values are full `PackageId`s: the fold has to nest.
 
 The map value is a full `PackageId`, not a version string, because a peer may
 itself have been duplicated by *its* peers, and two contexts differing only at
@@ -271,11 +291,26 @@ is therefore testable exactly the way `tests/resolve.rs` tests the walk — whic
 is the property `resolver.rs`'s module documentation names as the reason it is
 shaped this way.
 
-**Termination.** The pass memoizes on `(node, peer-context)` and treats a repeat
-as a hit. This is the same novelty gate the main walk uses — `if
-self.packages.contains_key(&id) { return Ok(()) }` — so the design carries one
-termination argument rather than two, and a peer cycle terminates for the same
-reason a dependency cycle does. An iteration cap would be guessing.
+**Termination and identity share one key**, and getting it wrong is subtle. The
+pass memoizes each node and treats a repeat as a hit — the same novelty gate the
+main walk uses, `if self.packages.contains_key(&id) { return Ok(()) }` — so the
+design carries one termination argument rather than two, and a peer cycle
+terminates for the same reason a dependency cycle does. An iteration cap would
+be guessing.
+
+What it keys on is *not* `(node, its own resolved peers)`, which was this spec's
+first answer and is wrong for exactly the `wrapper` case in §5: a node with no
+peers of its own has the same key in every context, so the first copy computed
+comes back for all of them and the duplication never happens. The key is
+`(node, the providers its whole subtree can see)` — every peer name reachable
+from the node, itself included, mapped to whoever currently provides it. Two
+visits agreeing on all of them must produce the same subtree; two differing
+anywhere must not share a node.
+
+That set of names is a least fixed point over the peer-blind graph, computed
+once before the walk down. A fixed point rather than a recursive walk because
+the dependency graph has cycles, and the sets only grow over a finite alphabet,
+so it terminates.
 
 ### Why not fold peers into the walk
 
