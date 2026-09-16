@@ -358,11 +358,14 @@ fn a_shim_npm_wrote_is_left_alone_and_reported() {
         std::fs::symlink_metadata(root.join("node_modules/.bin/other")).is_ok(),
         "jerky deleted a shim another tool wrote"
     );
+    // Compared against the workspace's own root, not the temp directory it was
+    // built in: `discover` canonicalizes, and on macOS `/var` is a symlink to
+    // `/private/var`, so the two spell the same directory differently.
     assert!(
         outcome
             .left_alone
             .iter()
-            .any(|entry| entry.path == root.join("node_modules/.bin/other")),
+            .any(|entry| entry.path == workspace.root().join("node_modules/.bin/other")),
         "the shim jerky kept was not reported: {:?}",
         outcome.left_alone
     );
@@ -568,11 +571,13 @@ fn a_hand_written_shim_pointing_into_the_repository_is_left_alone() {
         std::fs::symlink_metadata(root.join("node_modules/.bin/lint")).is_ok(),
         "an install deleted a shim somebody wrote by hand"
     );
+    // The workspace's own root, for the reason the test above gives: `discover`
+    // canonicalizes and macOS resolves `/var` to `/private/var`.
     assert!(
         outcome
             .left_alone
             .iter()
-            .any(|entry| entry.path == root.join("node_modules/.bin/lint")),
+            .any(|entry| entry.path == workspace.root().join("node_modules/.bin/lint")),
         "the shim jerky kept was not reported: {:?}",
         outcome.left_alone
     );
