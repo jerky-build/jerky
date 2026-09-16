@@ -29,6 +29,7 @@ source benches/lib.sh
 
 FIXTURES=(alotta-files alotta-packages)
 TRIALS=3
+DELAY=0
 WITH_NPM=0
 WITH_PNPM=0
 PIN=0
@@ -50,6 +51,13 @@ usage: ./benches/bench.sh [options]
   --npm            measure npm alongside jerky; see the caveat it prints
   --pnpm           measure pnpm alongside jerky, against the same mirror; see
                    the caveat it prints. Wants a recording taken with --pnpm.
+  --delay MS       make the mirror wait this long before answering each
+                   request, modelling a registry that is not on this machine.
+                   Loopback answers in under a millisecond, so without this
+                   there is no latency present for a change that overlaps or
+                   avoids waiting to remove, and its effect cannot be seen.
+                   Numbers taken with it are not comparable to numbers taken
+                   without it, which is why the table says so.
   --pin            re-resolve each fixture and rewrite its committed
                    jerky-lock.json, then exit without measuring
   --record         install both fixtures against the live registry, writing
@@ -71,6 +79,7 @@ while (($#)); do
     case $1 in
         --fixture) SELECTED+=("$2"); shift 2 ;;
         --trials) TRIALS=$2; shift 2 ;;
+        --delay) DELAY=$2; shift 2 ;;
         --npm) WITH_NPM=1; shift ;;
         --pnpm) WITH_PNPM=1; shift ;;
         --pin) PIN=1; shift ;;
@@ -100,6 +109,11 @@ fi
 
 [[ $TRIALS =~ ^[1-9][0-9]*$ ]] || {
     printf -- '--trials wants a positive integer, got: %s\n' "$TRIALS" >&2
+    exit 2
+}
+
+[[ $DELAY =~ ^[0-9]+(\.[0-9]+)?$ ]] || {
+    printf -- '--delay wants milliseconds, got: %s\n' "$DELAY" >&2
     exit 2
 }
 
@@ -668,7 +682,7 @@ MSG
     done
 fi
 
-mirror_start "$MIRROR" "$MIRROR_LOG"
+mirror_start "$MIRROR" "$MIRROR_LOG" --delay "$DELAY"
 # The whole point of the issue, in one line: jerky is pointed at the mirror,
 # and `main` is the only place that reads this.
 export JERKY_REGISTRY_URL=$MIRROR_URL
@@ -752,7 +766,16 @@ if ((WITH_NPM)); then TOOLS+=(npm); fi
 if ((WITH_PNPM)); then TOOLS+=(pnpm); fi
 
 for fixture in "${FIXTURES[@]}"; do
-    printf '\n## %s (median of %s)\n\n' "$fixture" "$TRIALS"
+    if [[ $DELAY == 0 ]]; then
+        printf '\n## %s (median of %s)\n\n' "$fixture" "$TRIALS"
+    else
+        # In the heading rather than a footnote: a row measured against a
+        # mirror that is pretending to be far away is a different measurement
+        # from one that is not, and the two must never be read side by side as
+        # though they were the same number.
+        printf '\n## %s (median of %s, mirror +%sms per request)\n\n' \
+            "$fixture" "$TRIALS" "$DELAY"
+    fi
     table_header scenario "${TOOLS[@]}"
 
     packages="" links="" dangling=""

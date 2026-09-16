@@ -5,7 +5,7 @@ use jerky::commands::install::{InstallError, Mode, Outcome, Recorded, Request, i
 use jerky::linker::{Unowned, UnownedReason};
 use jerky::resolver::{ImporterPath, Kind, ResolveError};
 use jerky::store::Store;
-use jerky::testing::{FixtureRegistry, TarEntry, build_tarball, mode_of};
+use jerky::testing::{FixtureEntry, FixtureRegistry, TarEntry, build_tarball, mode_of};
 use jerky::workspace::{Workspace, WorkspaceError};
 
 use std::os::unix::fs::MetadataExt as _;
@@ -2987,6 +2987,13 @@ fn tarballs_are_fetched_concurrently() {
     // The rendezvous, not the high-water mark: a serial installer can reach a
     // high-water mark of one and still pass a "> 1" assertion on a loaded
     // machine by never being observed. It cannot satisfy a rendezvous.
+    //
+    // Since #95 the pool this reaches is the *prefetch*, not `fetch_missing`:
+    // four direct dependencies are all reported as candidates at once, so the
+    // downloads happen while resolution is still running. That makes this the
+    // test a serial prefetch fails — its first worker would sit at the gate
+    // waiting for three peers that no other worker exists to provide, time
+    // out, and break the rendezvous before `fetch_missing` ever ran.
     assert!(
         registry.tarballs_met_rendezvous(),
         "four tarball fetches never overlapped, so the install is still serial"
@@ -3007,6 +3014,25 @@ fn concurrency_is_bounded() {
     let registry =
         wide_registry(count).with_tarball_rendezvous(jerky::registry::MAX_CONCURRENT_FETCHES);
     write_manifest(root, &wide_manifest(count));
+
+    // Primed with a lockfile, into a store that is thrown away, so the install
+    // under test resolves nothing — and with nothing to resolve there is
+    // nothing for the prefetch to overlap, which puts every one of these
+    // tarballs in `fetch_missing`'s single pool where this cap is the one in
+    // force. It is also the case the cap was measured on: a cold store and a
+    // matching lockfile is CI, and a fresh clone.
+    //
+    // Without it the work splits across two pools of different widths and
+    // neither reaches a cap, which says nothing about either.
+    let priming = TempDir::new().unwrap();
+    sync(
+        &solo(root),
+        &Store::new(priming.path().join("store")),
+        &wide_registry(count),
+        None,
+        Mode::Develop,
+    )
+    .unwrap();
 
     sync(&solo(root), &store, &registry, None, Mode::Develop).unwrap();
 
@@ -3159,14 +3185,25 @@ fn a_locked_integrity_mismatch_is_caught_before_anything_is_downloaded() {
         matches!(err, InstallError::LockedIntegrityMismatch { ref name, .. } if name == "pkg02"),
         "expected a locked-integrity refusal naming pkg02, got {err:?}"
     );
-    // The gate is worth nothing if it fires after the bytes are already pulled.
-    // Serially it only held for packages ordered after the offending one; with
-    // sixteen workers in flight there is no "after", which is why the check is
-    // now a pass of its own ahead of the pool.
+    // The gate is worth nothing if it fires after the offending bytes are
+    // already pulled. Serially it only held for packages ordered after the
+    // offending one; with sixteen workers in flight there is no "after", which
+    // is why the check is a pass of its own ahead of the pool — and why the
+    // prefetch that now overlaps resolution asks the same question of each
+    // candidate before queueing it.
+    //
+    // The claim is about `pkg02` and no longer about the total, and the
+    // narrowing is deliberate rather than a concession. Downloads now start
+    // while resolution is still running, so by the time anything can know a
+    // mismatch exists, unrelated packages are already in flight — and each of
+    // those verified against its own hash, which is what the content store is
+    // for. What must never happen is that a tarball the lockfile disagrees
+    // with is fetched at all, because that is the one whose bytes are the
+    // attack, and it is what this pins.
     assert_eq!(
-        registry.tarball_calls(),
+        registry.tarball_calls_for("pkg02"),
         0,
-        "tarballs were downloaded before the locked-integrity gate ran"
+        "the tarball the lockfile disagrees with was downloaded anyway"
     );
 }
 
@@ -3920,4 +3957,203 @@ fn a_package_duplicated_by_its_peers_is_downloaded_once() {
     // And what the summary line counts is packages, not the directories they
     // landed in.
     assert_eq!(outcome.linked.len(), 3);
+}
+
+#[test]
+fn a_tarball_is_fetched_before_resolution_has_finished() {
+    // The barrier #95 removes, stated as the one thing that is observable from
+    // outside: `b`'s packument is held until some tarball has been asked for,
+    // and the only tarball that can be asked for that early is `a`'s — a
+    // version the crawl selected while it was still descending. An install
+    // that fetches nothing until the whole graph is resolved cannot open this
+    // gate, waits out the timeout, and fails the assertion below.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    write_manifest(
+        work.path(),
+        r#"{"name":"demo","dependencies":{"a":"^1.0.0"}}"#,
+    );
+    let workspace = solo(work.path());
+    let store = Store::new(home.path().join("store"));
+
+    let registry = FixtureRegistry::new()
+        .with_tree(&[("a", "1.0.0", &[("b", "^1.0.0")]), ("b", "1.0.0", &[])])
+        .with_packument_awaiting_a_tarball(&["b"]);
+
+    sync(&workspace, &store, &registry, None, Mode::Develop).unwrap();
+
+    assert!(
+        registry.packuments_awaited_a_tarball(),
+        "resolution finished before a single tarball was requested"
+    );
+}
+
+#[test]
+fn a_tarball_this_machine_cannot_run_is_not_speculatively_fetched() {
+    // `optionalDependencies` in a real tree is overwhelmingly platform
+    // binaries, so a prefetch that ignored `os` would download every
+    // `@esbuild/*` variant on every cold install and link one. The skip is a
+    // decision about bandwidth and nothing else: `fetch_missing` remains the
+    // authority on what the tree needs.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    write_manifest(
+        work.path(),
+        r#"{"name":"demo","dependencies":{"host":"^1.0.0"}}"#,
+    );
+    let workspace = solo(work.path());
+    let store = Store::new(home.path().join("store"));
+
+    let registry = FixtureRegistry::new()
+        .with_tree(&[("host", "1.0.0", &[]), ("windows-only", "1.0.0", &[])])
+        .with_optional_dependencies("host", "1.0.0", &[("windows-only", "^1.0.0")])
+        .with_platform("windows-only", "1.0.0", &["win32"], &[]);
+
+    sync(&workspace, &store, &registry, None, Mode::Develop).unwrap();
+
+    assert_eq!(
+        registry.tarball_calls(),
+        1,
+        "only `host` should have been downloaded"
+    );
+    assert!(
+        !work
+            .path()
+            .join("node_modules/.jerky/windows-only@1.0.0")
+            .exists()
+    );
+}
+
+#[test]
+fn a_tarball_fetched_for_a_version_the_tree_does_not_contain_is_never_linked() {
+    // The criterion that makes a speculative fetch safe rather than merely
+    // fast. `helper` runs anywhere, so the crawl selects it and the prefetch
+    // downloads it — but the only path to it is through a package this machine
+    // skips, which nothing knows until `for_platform` runs long afterwards. So
+    // its bytes are in the machine-global store and its name is nowhere in the
+    // tree, which is the whole of the distinction between the two.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    write_manifest(
+        work.path(),
+        r#"{"name":"demo","dependencies":{"host":"^1.0.0"}}"#,
+    );
+    let workspace = solo(work.path());
+    let store = Store::new(home.path().join("store"));
+
+    let registry = FixtureRegistry::new()
+        .with_tree(&[
+            ("host", "1.0.0", &[]),
+            ("windows-only", "1.0.0", &[("helper", "^1.0.0")]),
+            ("helper", "1.0.0", &[]),
+        ])
+        .with_optional_dependencies("host", "1.0.0", &[("windows-only", "^1.0.0")])
+        .with_platform("windows-only", "1.0.0", &["win32"], &[]);
+
+    sync(&workspace, &store, &registry, None, Mode::Develop).unwrap();
+
+    assert_eq!(
+        registry.tarball_calls(),
+        2,
+        "`helper` was speculatively fetched, and `windows-only` was not"
+    );
+    for absent in ["helper@1.0.0", "windows-only@1.0.0"] {
+        assert!(
+            !work
+                .path()
+                .join("node_modules/.jerky")
+                .join(absent)
+                .exists(),
+            "{absent} reached the tree"
+        );
+    }
+    assert!(
+        !work.path().join("node_modules/helper").exists(),
+        "and nothing linked it from the importer either"
+    );
+}
+
+#[test]
+fn repeated_installs_of_one_tree_write_byte_identical_lockfiles() {
+    // #95's second criterion, at the level this suite can reach. Downloads now
+    // happen on the crawl's own worker threads, so an install's scheduling is
+    // less predictable than it was — and the lockfile is the one artifact that
+    // must not notice. Two cold installs of the same tree, through the whole
+    // `sync` path with the prefetch running, have to produce the same bytes.
+    //
+    // A tree with enough shape to have an order to get wrong: two versions of
+    // one package, a diamond, and a scoped name.
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    write_manifest(
+        root,
+        r#"{"name":"demo","dependencies":{"app":"^1.0.0","@scope/tool":"^1.0.0"}}"#,
+    );
+
+    let tree: &[FixtureEntry<'_>] = &[
+        ("app", "1.0.0", &[("left", "^1.0.0"), ("right", "^1.0.0")]),
+        ("left", "1.0.0", &[("shared", "^1.0.0")]),
+        ("right", "1.0.0", &[("shared", "^2.0.0")]),
+        ("shared", "1.9.0", &[]),
+        ("shared", "2.1.0", &[]),
+        ("@scope/tool", "1.0.0", &[("shared", "^1.0.0")]),
+    ];
+
+    let mut written = Vec::new();
+    for _ in 0..2 {
+        let home = TempDir::new().unwrap();
+        sync(
+            &solo(root),
+            &Store::new(home.path().join("store")),
+            &FixtureRegistry::new().with_tree(tree),
+            None,
+            Mode::Develop,
+        )
+        .unwrap();
+        written.push(std::fs::read(root.join("jerky-lock.json")).unwrap());
+    }
+
+    assert_eq!(
+        written[0], written[1],
+        "the lockfile varied between installs"
+    );
+    assert!(
+        String::from_utf8_lossy(&written[0]).contains("shared@2.1.0"),
+        "the tree resolved is not the one this test is about"
+    );
+}
+
+#[test]
+fn concurrency_is_bounded_while_resolution_is_still_running() {
+    // The other half of `concurrency_is_bounded`, which primes a lockfile so
+    // that only `fetch_missing` runs. This is the overlapping path: the crawl
+    // and the prefetch are both in flight, and the claim is that the tarballs
+    // among them stay within a cap rather than opening one connection per
+    // package the crawl happens to have reached.
+    //
+    // Necessary but not sufficient, exactly as the peak assertion there is: an
+    // exact peak above the cap is a real failure, but an unbounded pool would
+    // have to be *observed* above it rather than merely be capable of it.
+    let home = TempDir::new().unwrap();
+    let work = TempDir::new().unwrap();
+    let root = work.path();
+    let store = Store::new(home.path().join("store"));
+
+    let count = jerky::registry::MAX_CONCURRENT_FETCHES * 2;
+    let registry = wide_registry(count);
+    write_manifest(root, &wide_manifest(count));
+
+    sync(&solo(root), &store, &registry, None, Mode::Develop).unwrap();
+
+    assert!(
+        registry.peak_concurrent_tarballs() <= jerky::registry::MAX_CONCURRENT_FETCHES,
+        "{} tarball fetches were in flight at once, above the cap of {}",
+        registry.peak_concurrent_tarballs(),
+        jerky::registry::MAX_CONCURRENT_FETCHES
+    );
+    assert_eq!(
+        registry.tarball_calls(),
+        count,
+        "every package should have been downloaded exactly once, across both pools"
+    );
 }

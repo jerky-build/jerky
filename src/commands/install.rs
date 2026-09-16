@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use thiserror::Error;
 
@@ -12,10 +13,12 @@ use crate::manifest::{Manifest, ManifestError};
 use crate::platform::Platform;
 use crate::pool;
 use crate::range::{Range, Version};
-use crate::registry::{MAX_CONCURRENT_FETCHES, RegistryClient, RegistryError};
+use crate::registry::{
+    MAX_CONCURRENT_FETCHES, MAX_SPECULATIVE_FETCHES, RegistryClient, RegistryError,
+};
 use crate::resolver::{
-    self, ALIAS_PROTOCOL, Declared, Importer, ImporterPath, Kind, PackageId, Resolution,
-    ResolveError, ResolvedGraph, ResolvedPackage, UnsatisfiedPeer,
+    self, ALIAS_PROTOCOL, Candidate, Declared, Importer, ImporterPath, Kind, PackageId, Resolution,
+    ResolveError, ResolvedGraph, ResolvedPackage, UnsatisfiedPeer, Watcher,
 };
 use crate::store::{Store, StoreError};
 use crate::workspace::Workspace;
@@ -388,6 +391,23 @@ pub fn sync(
         );
     }
 
+    // The same gate the pass below applies, keyed for the question the
+    // prefetch can ask. A candidate is peer-blind — a tarball belongs to a
+    // published version, and every peer copy of a node shares one — so this is
+    // keyed by the published id where the graph's is keyed by node. Several
+    // nodes collapsing onto one key is the point rather than a collision: they
+    // are copies of one publish and necessarily carry one hash.
+    let locked_tarballs: BTreeMap<PackageId, Integrity> = locked_integrity
+        .iter()
+        .map(|(id, integrity)| (PackageId::plain(&id.name, &id.version), integrity.clone()))
+        .collect();
+
+    // Read before resolution rather than after it, because the prefetch below
+    // needs it: a tarball for a machine this is not has no reason to be
+    // downloaded, and by the time `for_platform` asks the same question it
+    // would already be on disk.
+    let platform = Platform::current();
+
     let mut graph = match (stale.is_empty(), locked) {
         // Nothing to ask: every importer matched, so the lockfile *is* the
         // answer and the registry is never touched.
@@ -397,7 +417,9 @@ pub fn sync(
         }
         .reachable(),
         (_, lock) => {
-            let resolved = resolver::resolve(registry, &stale, &members)?;
+            let resolved = prefetching(store, registry, &platform, &locked_tarballs, |watch| {
+                resolver::resolve_watching(registry, &stale, &members, watch)
+            })?;
 
             // The walk is peer-blind by design, so what it answers with is not
             // the tree yet: a package resolved against peers needs a directory
@@ -534,7 +556,6 @@ pub fn sync(
     // is still recorded, so a republished tarball for one is still a tampered
     // entry in a committed file, and a gate that ran over the filtered graph
     // would report it on a Linux machine and stay quiet on a Mac.
-    let platform = Platform::current();
     let (installable, skipped) = graph.for_platform(&platform);
 
     // Every tarball the store lacks, fetched concurrently. Packages the store
@@ -744,6 +765,115 @@ fn declared_by(manifest: &Manifest) -> BTreeMap<String, Declared> {
     dev.chain(prod).collect()
 }
 
+/// Resolve, downloading the tarballs the resolution discovers as it runs.
+///
+/// **The barrier this removes.** Every packument used to be resolved before
+/// the first tarball was requested, and the two phases wait on completely
+/// different things — one on a few hundred small round trips down a dependency
+/// chain, the other on hundreds of megabytes of body. Running them in sequence
+/// means the network is idle for the duration of whichever one is not
+/// currently happening. The crawl has held each selected version's
+/// `dist.tarball` since #87, at the moment that version's packument lands, so
+/// nothing new has to be discovered to start a download — see
+/// [`resolver::resolve_watching`].
+///
+/// **Everything queued here is speculative, and nothing downstream is allowed
+/// to believe otherwise.** The crawl's ask set is order-dependent, so a
+/// candidate may be a version the resolved graph never contains; a candidate
+/// may also be for a package `for_platform` goes on to skip, or one reachable
+/// only through a package it skips. That is bandwidth, not a correctness
+/// problem, and the reason is worth stating rather than assuming: this writes
+/// **only to the content store**, which is keyed by integrity and is a
+/// machine-global cache of verified bytes. An entry in it is not a claim that
+/// any project wants the package. What decides the tree is `graph.packages`,
+/// which this cannot reach — so a speculative fetch can waste a download and
+/// can do nothing else.
+///
+/// **Failures are dropped**, for the same reason the crawl drops a packument
+/// it could not fetch: [`fetch_missing`] runs afterwards over the real graph
+/// and is the authority on both what is needed and which failure is reported.
+/// A tarball that fails here and is genuinely wanted is requested again there,
+/// in `graph.packages` order, and reported from there — so which error a user
+/// sees stays a property of the graph rather than of which worker lost.
+///
+/// Correctness therefore does not depend on this running at all. Deleting the
+/// pool and calling `resolve` directly changes how long an install takes and
+/// nothing else about it.
+fn prefetching<F>(
+    store: &Store,
+    registry: &dyn RegistryClient,
+    platform: &Platform,
+    locked: &BTreeMap<PackageId, Integrity>,
+    resolve: F,
+) -> Result<ResolvedGraph, ResolveError>
+where
+    F: FnOnce(Watcher<'_>) -> Result<ResolvedGraph, ResolveError>,
+{
+    // One download per *tarball*, as in `fetch_missing` and for the same
+    // reason, with one more of its own: the crawl reports a candidate per
+    // `(name, range)` pair it scouts, so two ranges selecting one version
+    // report it twice.
+    let queued: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
+    pool::alongside(
+        MAX_SPECULATIVE_FETCHES,
+        |candidate: Candidate| {
+            let _ = fetch_one(
+                &candidate.id,
+                &candidate.resolved,
+                &candidate.integrity,
+                store,
+                registry,
+            );
+        },
+        |tarballs| {
+            resolve(&|candidate| {
+                // A decision about this machine's bandwidth, and deliberately
+                // not the one `for_platform` makes later. `optionalDependencies`
+                // in a real tree is overwhelmingly platform binaries —
+                // `@esbuild/*`, `@rollup/rollup-*` — so a prefetch blind to
+                // `os` would download every variant of every one of them on a
+                // cold install and link exactly one. Getting it wrong costs
+                // nothing but a download that `fetch_missing` then makes: a
+                // *required* dependency declaring a foreign platform is
+                // installed anyway, and is simply not prefetched.
+                if !candidate.supports.admits(platform) {
+                    return;
+                }
+                // The locked-integrity gate, asked of a download rather than
+                // of a finished graph. The pass below `sync` is still the
+                // authority — it is what *refuses* the install — but a gate
+                // that fires only after the bytes are already pulled has given
+                // up the property it exists to have. A republished or tampered
+                // tarball must not reach the machine-global store on the
+                // strength of a hash the lockfile disagrees with, whether or
+                // not this install goes on to link it.
+                if locked
+                    .get(&candidate.id)
+                    .is_some_and(|locked| *locked != candidate.integrity)
+                {
+                    return;
+                }
+                if !queued.lock().unwrap().insert(candidate.integrity.to_ssri()) {
+                    return;
+                }
+                // A warm store is the common case for a shared dependency, and
+                // this is what keeps the prefetch free there rather than
+                // merely harmless. Asked mid-flight, which `fetch_missing`
+                // deliberately does not do — the set above is what makes that
+                // safe here, since a candidate is queued at most once however
+                // many times it is reported, so a commit this pool is itself
+                // performing cannot turn into a second download of the same
+                // bytes.
+                if store.contains(&candidate.integrity) {
+                    return;
+                }
+                tarballs.push(candidate);
+            })
+        },
+    )
+}
+
 /// Download, verify and commit every package the store does not already hold.
 ///
 /// Split out of the materialisation loop because it is the only part of an
@@ -793,24 +923,29 @@ fn fetch_missing(
     // project depends on it. What must not happen is a link or a manifest
     // edit, and this function reaches neither.
     pool::drain(&missing, MAX_CONCURRENT_FETCHES, |(id, package)| {
-        fetch_one(id, package, store, registry)
+        fetch_one(id, &package.resolved, &package.integrity, store, registry)
     })
 }
 
 /// One package: fetch, verify, extract into the store.
+///
+/// Takes the three facts a download is made of rather than a resolved node,
+/// because the prefetch has them a whole resolution before it has a node: a
+/// [`Candidate`] is a URL, a hash and a name to blame, which is all this ever
+/// read from a [`ResolvedPackage`] anyway.
 fn fetch_one(
     id: &PackageId,
-    package: &ResolvedPackage,
+    resolved: &str,
+    integrity: &Integrity,
     store: &Store,
     registry: &dyn RegistryClient,
 ) -> Result<(), InstallError> {
-    let tarball = registry.fetch_tarball(&package.resolved)?;
+    let tarball = registry.fetch_tarball(resolved)?;
 
     // Verify the complete buffer before a single byte is extracted. A
     // stream-and-hash design would only detect a mismatch after writing
     // attacker-controlled files to disk.
-    package
-        .integrity
+    integrity
         .verify(&tarball)
         .map_err(|source| InstallError::Integrity {
             name: id.name.clone(),
@@ -822,9 +957,7 @@ fn fetch_one(
     // the key is the content hash. Two workers asked for the same entry —
     // which cannot happen within one install, but can across concurrent
     // processes — both end up correct.
-    store.commit(&package.integrity, |staging| {
-        archive::extract(&tarball, staging)
-    })?;
+    store.commit(integrity, |staging| archive::extract(&tarball, staging))?;
 
     Ok(())
 }

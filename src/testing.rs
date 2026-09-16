@@ -337,13 +337,94 @@ pub struct FixtureRegistry {
     tarballs: HashMap<String, Vec<u8>>,
     metadata_calls: AtomicUsize,
     tarball_calls: AtomicUsize,
+    tarball_calls_by_name: Mutex<BTreeMap<String, usize>>,
     packument_calls: Mutex<BTreeMap<String, usize>>,
     /// `None` until a test asks for one, so every existing fixture is
     /// unaffected.
     tarball_rendezvous: Option<Rendezvous>,
     packument_rendezvous: Option<Rendezvous>,
+    packument_handshake: Option<Handshake>,
     tarballs_in_flight: Mutex<InFlight>,
     packuments_in_flight: Mutex<InFlight>,
+}
+
+/// A one-way gate between two *different* kinds of call.
+///
+/// [`Rendezvous`] proves that several calls of one kind overlapped. This
+/// proves something a rendezvous structurally cannot: that a call of one kind
+/// was in flight while a call of another kind had not yet returned — an
+/// ordering *between* phases rather than a width *within* one. It is what a
+/// test asks when the claim is "the second phase had started before the first
+/// one finished", which is the whole of what an overlapped fetch is.
+///
+/// One side waits and the other opens, and they never swap roles, so there is
+/// no width to satisfy and no possibility of the two sides deadlocking against
+/// each other. The timeout is the same one a rendezvous uses and is there for
+/// the same reason: an implementation that never opens the gate must fail the
+/// test rather than hang the suite.
+#[derive(Debug)]
+struct Handshake {
+    /// The names that wait here. Everything else passes straight through.
+    only: BTreeSet<String>,
+    state: Mutex<HandshakeState>,
+    opened: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct HandshakeState {
+    /// Set by the opening side, and never cleared — the claim is that the two
+    /// were in flight together once, which the first opening settles.
+    open: bool,
+    /// Set when a waiter gives up. What a test reads to tell "the gate was
+    /// opened" from "nobody ever opened it and we carried on".
+    broken: bool,
+}
+
+impl Handshake {
+    fn new(names: &[&str]) -> Self {
+        Self {
+            only: names.iter().map(|name| (*name).to_string()).collect(),
+            state: Mutex::new(HandshakeState::default()),
+            opened: Condvar::new(),
+        }
+    }
+
+    /// Let everyone through, now and from now on.
+    fn open(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.open = true;
+        self.opened.notify_all();
+    }
+
+    /// Block until the gate is opened, if this name waits here at all.
+    fn wait(&self, name: &str) {
+        if !self.only.contains(name) {
+            return;
+        }
+
+        let mut state = self.state.lock().unwrap();
+        if state.open {
+            return;
+        }
+
+        let (guard, timed_out) = self
+            .opened
+            .wait_timeout_while(state, RENDEZVOUS_TIMEOUT, |s| !s.open)
+            .unwrap();
+        state = guard;
+        if timed_out.timed_out() {
+            state.broken = true;
+            // Releases every other waiter too, so an implementation that
+            // never opens the gate pays one timeout for the run rather than
+            // one per held name.
+            state.open = true;
+            self.opened.notify_all();
+        }
+    }
+
+    fn held(&self) -> bool {
+        !self.state.lock().unwrap().broken
+    }
 }
 
 /// Calls currently inside one registry method, and the most there have ever
@@ -786,6 +867,22 @@ impl FixtureRegistry {
         self.tarball_calls.load(Ordering::Relaxed)
     }
 
+    /// How many times one package's tarball was requested.
+    ///
+    /// The counterpart to [`Self::packument_calls_for`], and needed for the
+    /// same reason: once downloads overlap resolution, a total says only that
+    /// *something* was fetched, and the interesting claims are about a
+    /// particular package — that the one a gate refuses was never asked for,
+    /// or that a warm entry was never asked for twice.
+    pub fn tarball_calls_for(&self, name: &str) -> usize {
+        self.tarball_calls_by_name
+            .lock()
+            .unwrap()
+            .get(name)
+            .copied()
+            .unwrap_or(0)
+    }
+
     /// Make every `fetch_tarball` wait until `width` of them are in flight.
     ///
     /// The fixture is what makes parallelism observable at all: the bytes are
@@ -839,6 +936,29 @@ impl FixtureRegistry {
         self
     }
 
+    /// Hold the `packument` calls for these names until *some* tarball has
+    /// been asked for.
+    ///
+    /// The gate an overlapped fetch has to open. Held names sit at a depth the
+    /// crawl can only reach by first resolving something above them, so the
+    /// only tarball that can open the gate is one whose version was selected
+    /// while resolution was still going — which is precisely the thing a
+    /// resolve-then-fetch barrier makes impossible. An installer with that
+    /// barrier waits out the timeout and
+    /// [`Self::packuments_awaited_a_tarball`] then reports false.
+    pub fn with_packument_awaiting_a_tarball(mut self, names: &[&str]) -> Self {
+        self.packument_handshake = Some(Handshake::new(names));
+        self
+    }
+
+    /// Whether the held packuments were released by a tarball rather than by
+    /// the timeout.
+    pub fn packuments_awaited_a_tarball(&self) -> bool {
+        self.packument_handshake
+            .as_ref()
+            .is_some_and(Handshake::held)
+    }
+
     /// Whether the packument rendezvous was satisfied rather than timed out.
     pub fn packuments_met_rendezvous(&self) -> bool {
         self.packument_rendezvous
@@ -866,6 +986,17 @@ impl FixtureRegistry {
             .unwrap_or(0)
     }
 
+    /// Which package a fixture tarball URL belongs to.
+    ///
+    /// Read back out of the registered metadata rather than parsed out of the
+    /// URL, so the two spellings cannot drift apart.
+    fn name_of_tarball(&self, url: &str) -> Option<String> {
+        self.versions
+            .values()
+            .find(|metadata| metadata.dist.tarball == url)
+            .map(|metadata| metadata.name.clone())
+    }
+
     fn knows_package(&self, name: &str) -> bool {
         self.versions.keys().any(|(n, _)| n == name)
     }
@@ -888,6 +1019,9 @@ impl FixtureRegistry {
             && rendezvous.admits(name)
         {
             rendezvous.meet();
+        }
+        if let Some(handshake) = &self.packument_handshake {
+            handshake.wait(name);
         }
 
         // A name with no current view answers the same thing either way, which
@@ -956,6 +1090,17 @@ impl RegistryClient for FixtureRegistry {
 
     fn fetch_tarball(&self, url: &str) -> Result<Vec<u8>, RegistryError> {
         self.tarball_calls.fetch_add(1, Ordering::Relaxed);
+        if let Some(name) = self.name_of_tarball(url) {
+            *self
+                .tarball_calls_by_name
+                .lock()
+                .unwrap()
+                .entry(name)
+                .or_insert(0) += 1;
+        }
+        if let Some(handshake) = &self.packument_handshake {
+            handshake.open();
+        }
         InFlight::enter(&self.tarballs_in_flight);
         if let Some(rendezvous) = &self.tarball_rendezvous {
             rendezvous.meet();

@@ -259,6 +259,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Tarballs now download while resolution is still running.** The two halves
+  of an install used to be separated by a total barrier: every packument in
+  the tree was resolved before the first tarball was requested. They wait on
+  completely different things — one on a few hundred small round trips down a
+  dependency chain, the other on hundreds of megabytes of body — so running
+  them in sequence leaves the network idle for the whole of whichever one is
+  not currently happening. The resolver has known each selected version's
+  tarball URL since the walk became a continuous worklist, at the moment that
+  version's packument lands, so it now reports each one as it is selected and
+  the download starts there
+  ([#95](https://github.com/jerky-build/jerky/issues/95)).
+
+  **What this downloads is a guess, and it is allowed to be wrong.** The
+  crawl's ask set is order-dependent, so a tarball may be fetched for a
+  version the finished tree does not contain — and a package reachable only
+  through an optional dependency this machine skips is fetched before anything
+  knows that. Those bytes land in the content store at `~/.jerky/store`, which
+  is keyed by content hash and shared by every project on the machine, and
+  they are never linked into a project: what a tree contains is decided by the
+  resolved graph, which the download path cannot reach. The cost of a wrong
+  guess is bandwidth and disk, and the store has no garbage collection yet
+  ([#52](https://github.com/jerky-build/jerky/issues/52)).
+
+  Two guesses are declined rather than made. A tarball whose `os` or `cpu`
+  rules out this machine is not prefetched, because `optionalDependencies` in
+  a real tree is overwhelmingly platform binaries and fetching every variant
+  of every one of them would be most of a cold install's bandwidth spent on
+  packages it then skips. And a tarball whose hash the lockfile disagrees with
+  is never requested at all — an install still refuses on a locked-integrity
+  mismatch, and the point of refusing before fetching is that the republished
+  bytes are the thing being refused. Unrelated packages already in flight when
+  the mismatch is discovered do finish and do land in the store; each was
+  verified against its own hash, and none of them is installed.
+
+  **Measured on `alotta-packages`, 2910 packages into a cold store**, against
+  the replay mirror with a 20ms round trip: the cold row goes from **20.70s to
+  17.54s**, and at 50ms from **30.34s to 26.20s**. The part of that install
+  which is tarballs — the cold row less the warm-store row, which resolves
+  identically and fetches nothing — falls from 7.17s to 4.15s at 20ms. The
+  metadata walk itself is unchanged at ~13.2s in every run, which is what says
+  the saving is the barrier going rather than resolution getting faster.
+
+  Against a mirror with **no** delay it measures as nothing at all — 14.55s to
+  14.81s, noise in the wrong direction — because a recording served from
+  loopback out of the page cache has no round trip to hide a download under.
+  That is a fact about the instrument and not about the change, and
+  `bench.sh --delay` now exists so the distinction is measurable rather than
+  argued.
+
+  The saving is bounded by what the prefetch can pull while resolution is
+  still running: at 50ms the tarball phase is longer than the metadata walk,
+  so the part that can hide under it saturates and the rest is fetched at full
+  width afterwards as before.
+
+  **jerky opens more connections than it did.** The metadata crawl keeps its
+  full width of sixteen — it is the critical path, and a chain of ten packages
+  is ten round trips nothing can start early — and the prefetch runs eight
+  alongside it, so a resolving install can now have twenty-four requests in
+  flight where it previously had sixteen. Once resolution is over the prefetch
+  stops and the remaining tarballs are fetched at the full sixteen, as before.
+
 - **An install that finds the tree already correct now writes nothing to it.**
   Placing a symlink used to remove and recreate it whether or not it already
   pointed where the install wanted, so a no-op install still paid one unlink

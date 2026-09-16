@@ -32,13 +32,14 @@
 //! else, so a spurious request adds an entry nobody reads instead of changing
 //! one somebody does.
 //!
-//! **Not done here, and cheap now:** tarball fetching still waits for the
-//! whole of resolution to finish. The crawl already holds each selected
-//! version and its `dist.tarball` at the moment that version's packument
-//! lands, so the information needed to start a download arrives long before
-//! the walk does — overlapping the two phases no longer needs anything
-//! discovered that is not already in hand. The barrier itself lives in
-//! `commands::install`, which is why it is only noted here.
+//! That the crawl holds a selected version's `dist.tarball` a whole
+//! resolution before the walk reaches it is now *used* rather than merely
+//! true: [`resolve_watching`] reports each one as it lands, and
+//! `commands::install` downloads it while this module is still deciding
+//! whether the tree wants it. The report is one-way by construction — a
+//! [`Candidate`] goes out and nothing comes back — so the paragraph above
+//! stands unchanged, and what a watcher does with one is somebody else's
+//! question entirely.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
@@ -935,6 +936,47 @@ fn scheme_of(specifier: &str) -> Option<&str> {
     .then_some(scheme)
 }
 
+/// A version the crawl selected, and what it would take to download it.
+///
+/// Reported by [`resolve_watching`] the moment the packument naming it lands,
+/// which is long before the walk reaches it — that head start is the whole
+/// point of the type. It is **speculative**, in two senses that are worth
+/// keeping apart. The crawl's ask set is order-dependent, so a candidate may
+/// come from a version whose dependencies the resolved graph never contains.
+/// And the graph is not the tree: a caller prunes it — for reachability, and
+/// for the `os`/`cpu` of the machine it is installing onto — long after this
+/// was reported, so a candidate may name a package that is resolved and then
+/// never installed. Nothing here is a claim that the tree wants this package,
+/// only that something asked about it.
+///
+/// The id is peer-blind — `context` is always empty — and that is not a
+/// shortcoming. A tarball is a property of the published version, so every
+/// peer duplicate of a node shares one, and the store is keyed by integrity
+/// rather than by node. The id is here to name the package in an error, not to
+/// find it in a graph.
+#[derive(Debug, Clone)]
+pub struct Candidate {
+    pub id: PackageId,
+    /// The tarball URL, exactly as the packument gave it.
+    pub resolved: String,
+    pub integrity: Integrity,
+    /// What the package published about the machines it runs on.
+    ///
+    /// Carried rather than evaluated, for the reason [`ResolvedPackage`]
+    /// carries it: this module does not know which machine is asking, and a
+    /// watcher that skips what its platform rules out is making a decision
+    /// about its own bandwidth rather than about the graph.
+    pub supports: PlatformSupport,
+}
+
+/// Told about each version the crawl selects, as it is selected.
+///
+/// `Sync` because the crawl calls it from every one of its workers, and there
+/// is deliberately no way for it to answer: a watcher that could refuse a
+/// candidate, or return an error, would be a second thing deciding what gets
+/// resolved. It is told, and the walk goes on regardless.
+pub type Watcher<'a> = &'a (dyn Fn(Candidate) + Sync);
+
 /// Walk the dependency graph from every importer's declared ranges.
 ///
 /// One walk covers the whole workspace rather than one per project, so two
@@ -953,8 +995,38 @@ pub fn resolve(
     roots: &BTreeMap<ImporterPath, BTreeMap<String, Declared>>,
     members: &BTreeMap<String, ImporterPath>,
 ) -> Result<ResolvedGraph, ResolveError> {
+    resolve_watching(registry, roots, members, &|_| {})
+}
+
+/// [`resolve`], reporting each version the crawl selects to `watch` as it is
+/// selected.
+///
+/// The one thing the crawl knows that the walk does not know yet: which
+/// tarballs this resolution is going to want. It learns each one a whole
+/// resolution early — the moment a packument lands — and until now threw it
+/// away. A caller that owns a content store can start downloading from here
+/// instead of waiting for the barrier at the end of resolution, which is
+/// [#95](https://github.com/jerky-build/jerky/issues/95).
+///
+/// **`watch` cannot affect the answer, and the type is what enforces it.** It
+/// takes a [`Candidate`] and returns nothing, so there is no channel through
+/// which what it does — or how long it takes, or whether it fails — can reach
+/// a selection. Run this with a watcher, with a different watcher, or with
+/// none, and the graph is the same bytes; that claim is the whole of why the
+/// overlapped fetch does not have to reason about determinism at all.
+///
+/// The resolver still performs no I/O beyond the [`RegistryClient`], which is
+/// the reason this reports candidates rather than fetching them. A store is a
+/// filesystem, and the pass that decides what a tree contains has no business
+/// knowing where one is.
+pub fn resolve_watching(
+    registry: &dyn RegistryClient,
+    roots: &BTreeMap<ImporterPath, BTreeMap<String, Declared>>,
+    members: &BTreeMap<String, ImporterPath>,
+    watch: Watcher<'_>,
+) -> Result<ResolvedGraph, ResolveError> {
     let mut walk = Walk::seeded(registry, roots, members)?;
-    walk.prefetch();
+    walk.prefetch(watch);
     walk.run()?;
     Ok(walk.into_graph())
 }
@@ -1958,7 +2030,7 @@ impl<'a> Walk<'a> {
     /// half-full memo is one the walk fills in itself, in its own order.
     /// A crawl stopped by a failure the walk never reaches costs some
     /// prefetching and nothing else.
-    fn prefetch(&self) {
+    fn prefetch(&self, watch: Watcher<'_>) {
         // Seeded from the importers' own declarations, which is the same set
         // of edges `run` starts from.
         let mut scouted: HashSet<(String, String)> = HashSet::new();
@@ -1987,6 +2059,24 @@ impl<'a> Walk<'a> {
             let Some(metadata) = packument.versions.get(&version) else {
                 return;
             };
+
+            // Reported before the edges below are scheduled, so that the
+            // first thing to happen after a packument lands is the download
+            // it makes possible. A version whose `dist` carries no usable
+            // hash is simply not reported: there is nothing to verify an
+            // answer against, and the walk reaches the same version in its own
+            // order and raises the error there.
+            if let Ok(integrity) = metadata.dist.integrity() {
+                watch(Candidate {
+                    id: PackageId::plain(asked.name.clone(), version.clone()),
+                    resolved: metadata.dist.tarball.clone(),
+                    integrity,
+                    supports: PlatformSupport {
+                        os: metadata.os.clone(),
+                        cpu: metadata.cpu.clone(),
+                    },
+                });
+            }
 
             // Exactly the edges `visit` reads, through the same function: a
             // dependency's `devDependencies` must never be followed, and

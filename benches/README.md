@@ -214,6 +214,40 @@ Re-pinning and re-recording go together, in that order: `--pin` resolves
 against the live registry by definition, and a mirror recorded before it is a
 recording of the old pin.
 
+### Making the mirror far away
+
+```
+./benches/bench.sh --delay 20
+```
+
+`--delay` makes the mirror wait that many milliseconds before answering each
+request. The heading of every table it produces says so, because a row measured
+against a distant mirror and a row measured against a local one are different
+measurements and must never be read side by side.
+
+**Loopback is not a neutral default, it is an extreme one.** A recording served
+from this machine out of the page cache answers in well under a millisecond, so
+a replay run has essentially no waiting in it — which makes the mirror an
+excellent instrument for anything CPU-bound and a useless one for anything
+whose cost *is* waiting. A change that overlaps two phases, or pipelines them,
+or avoids a round trip altogether has nothing to remove here, and measures as
+noise however well it works against a real registry. #95 is the case that
+forced this: overlapping tarball fetching with resolution moved the
+`alotta-packages` cold row from 14.55s to 14.81s at zero delay, and from 20.70s
+to 17.54s at 20ms.
+
+Latency only, deliberately, and not bandwidth. One number with one meaning, and
+it is the half that separates a design which overlaps its waiting from one that
+does not. Throttling bytes as well would model a real link more closely and
+would make every row depend on a second invented constant — and the recording
+is already a claim about what the registry holds rather than about how fast it
+serves.
+
+What the number should be is a judgement, not a measurement: npm is behind a
+CDN, so a developer near a point of presence sees something like 10-30ms and
+one far from one sees considerably more. Pick a figure, say it in the issue
+next to the table, and use the same one on both sides of a comparison.
+
 ### Tarball URLs
 
 `dist.tarball` in a packument is an **absolute** URL at the upstream registry,
