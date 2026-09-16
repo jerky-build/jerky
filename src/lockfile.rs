@@ -14,7 +14,7 @@ use thiserror::Error;
 use crate::integrity::Integrity;
 use crate::resolver::{
     DeclaredPeer, Dependency, Importer, ImporterPath, Kind, PackageId, Resolution, ResolvedGraph,
-    ResolvedPackage, split_key,
+    ResolvedPackage, context_of, split_key,
 };
 
 pub const LOCKFILE_NAME: &str = "jerky-lock.json";
@@ -71,11 +71,11 @@ pub enum LockfileError {
         entry: String,
         declared: String,
     },
-    #[error("{path} records `{entry}` and `{other}`, which are the same package")]
-    CollidingKeys {
+    #[error("{path} keys `{entry}` but what that entry records identifies `{rebuilt}`")]
+    KeyIdentityMismatch {
         path: PathBuf,
         entry: String,
-        other: String,
+        rebuilt: String,
     },
     #[error("{path} has `{entry}` depending on `{dependency}`, which it does not record")]
     DanglingEdge {
@@ -390,7 +390,7 @@ pub fn save(graph: &ResolvedGraph, project_dir: &Path) -> Result<(), LockfileErr
 
 /// What reading an entry's key and hash settled, so nothing below has to ask
 /// again whether either is well-formed.
-struct Checked {
+struct DecodedEntry {
     name: String,
     integrity: Integrity,
 }
@@ -413,7 +413,7 @@ struct Checked {
 /// of a package declaring no peers at all apart.
 struct Identities<'a> {
     entries: &'a BTreeMap<String, Entry>,
-    checked: &'a BTreeMap<String, Checked>,
+    decoded: &'a BTreeMap<String, DecodedEntry>,
     named: BTreeMap<String, PackageId>,
     /// Keys whose identity is still being built. Re-entering one is a
     /// dependency cycle, and the edge that closed it contributes no context —
@@ -440,12 +440,12 @@ impl<'a> Identities<'a> {
     /// no importer reaches, and it is named rather than quietly skipped.
     fn rebuild(
         entries: &'a BTreeMap<String, Entry>,
-        checked: &'a BTreeMap<String, Checked>,
+        decoded: &'a BTreeMap<String, DecodedEntry>,
         importers: &BTreeMap<String, OnDiskImporter>,
     ) -> BTreeMap<String, PackageId> {
         let mut identities = Identities {
             entries,
-            checked,
+            decoded,
             named: BTreeMap::new(),
             naming: BTreeSet::new(),
         };
@@ -491,9 +491,9 @@ impl<'a> Identities<'a> {
 
         // Copied out so the borrows live as long as the file's own maps rather
         // than as long as `&mut self`.
-        let (entries, checked) = (self.entries, self.checked);
+        let (entries, decoded) = (self.entries, self.decoded);
         let entry = &entries[key];
-        let name = checked[key].name.clone();
+        let name = decoded[key].name.clone();
 
         if !self.naming.insert(key.to_string()) {
             // The cycle-closing edge. Deliberately not remembered: this is a
@@ -501,25 +501,22 @@ impl<'a> Identities<'a> {
             return PackageId::plain(name, entry.version.clone());
         }
 
-        let mut context = BTreeMap::new();
+        let mut own = BTreeMap::new();
         for (declared, provider) in &entry.peers {
-            context.insert(declared.clone(), self.of(provider));
+            own.insert(declared.clone(), self.of(provider));
         }
-        // Folded in *after* the peers, so a package that declares one name as
-        // both a dependency and a peer keys on the copy it ships — which is
-        // the copy the peer pass gave it, own dependencies being the nearest
-        // frame there is.
+        let mut dependencies = Vec::with_capacity(entry.dependencies.len());
         for (declared, recorded) in &entry.dependencies {
-            let id = self.of(&edge_key(declared, recorded));
-            if !id.context.is_empty() {
-                context.insert(declared.clone(), id);
-            }
+            dependencies.push((declared.clone(), self.of(&edge_key(declared, recorded))));
         }
 
         let id = PackageId {
             name,
             version: entry.version.clone(),
-            context,
+            // The fold itself lives in the resolver, beside the pass that
+            // named these nodes in the first place. Spelling it again here is
+            // what would let the two drift.
+            context: context_of(own, dependencies),
         };
         self.naming.remove(key);
         self.named.insert(key.to_string(), id.clone());
@@ -569,7 +566,7 @@ pub fn load(project_dir: &Path) -> Result<Option<ResolvedGraph>, LockfileError> 
 
     // Every key decoded once, before a single edge is followed. Nothing below
     // this loop asks whether a key is well-formed again.
-    let mut checked: BTreeMap<String, Checked> = BTreeMap::new();
+    let mut decoded: BTreeMap<String, DecodedEntry> = BTreeMap::new();
     for (key, entry) in &entries {
         // `split_key`, not `split_name_and_version`: this is a *key*, and a
         // key may carry a peer suffix. What the suffix says is not read back
@@ -599,9 +596,9 @@ pub fn load(project_dir: &Path) -> Result<Option<ResolvedGraph>, LockfileError> 
                 source,
             })?;
 
-        checked.insert(
+        decoded.insert(
             key.clone(),
-            Checked {
+            DecodedEntry {
                 name: name.to_string(),
                 integrity,
             },
@@ -634,19 +631,25 @@ pub fn load(project_dir: &Path) -> Result<Option<ResolvedGraph>, LockfileError> 
         }
     }
 
-    let ids = Identities::rebuild(&entries, &checked, &on_disk.importers);
+    let ids = Identities::rebuild(&entries, &decoded, &on_disk.importers);
 
-    // Two keys that rebuild to one identity are one package wearing two names.
-    // Version 1 could not tell, because it read the name and version off the
-    // key and threw the rest away; version 2 can, and says so rather than
-    // letting `packages` keep one of the two and drop the other's subtree.
-    let mut by_id: BTreeMap<&PackageId, &String> = BTreeMap::new();
+    // The key states the peer context and so do `peers` and `dependencies`, so
+    // the two can disagree — the same shape of problem `KeyVersionMismatch`
+    // above refuses, one field along. Refused rather than arbitrated, and the
+    // key is not the half to trust: a collapsed suffix is a hash and says
+    // nothing a reader can act on, which is why identity is rebuilt from the
+    // records in the first place.
+    //
+    // It also settles the collapse this rebuild exists to prevent, and settles
+    // it by construction: every key renders its own identity, so two keys
+    // cannot name one node without one of them first being caught here.
     for (key, id) in &ids {
-        if let Some(first) = by_id.insert(id, key) {
-            return Err(LockfileError::CollidingKeys {
+        let rebuilt = id.to_string();
+        if &rebuilt != key {
+            return Err(LockfileError::KeyIdentityMismatch {
                 path,
                 entry: key.clone(),
-                other: first.clone(),
+                rebuilt,
             });
         }
     }
@@ -654,7 +657,8 @@ pub fn load(project_dir: &Path) -> Result<Option<ResolvedGraph>, LockfileError> 
     let mut packages = BTreeMap::new();
     for (key, entry) in entries {
         let id = ids[&key].clone();
-        let Checked { integrity, .. } = checked.remove(&key).expect("every key was checked above");
+        let DecodedEntry { integrity, .. } =
+            decoded.remove(&key).expect("every key was decoded above");
 
         packages.insert(
             id.clone(),

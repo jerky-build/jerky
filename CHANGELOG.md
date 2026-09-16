@@ -321,9 +321,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
   A package resolved against peers is keyed `plugin@1.0.0(react@18.2.0)`,
   which is pnpm's spelling, and an edge pointing at one carries the same
-  suffix. Resolved peers are linked into the dependent's own `node_modules`
-  beside its dependencies, which is what makes a peer importable at all when
-  nothing is hoisted ([#103](https://github.com/jerky-build/jerky/issues/103))
+  suffix. Such a package is linked with its peers beside its dependencies in
+  its own `node_modules`, which is what makes a peer importable at all when
+  nothing is hoisted.
+
+  **Only the refusal is observable yet.** Peer resolution does not run during
+  an install until unsatisfied peers are reported
+  ([#105](https://github.com/jerky-build/jerky/issues/105)), so today jerky
+  writes no `peers` block for any tree — this is the format arriving ahead of
+  the pass that fills it
+  ([#103](https://github.com/jerky-build/jerky/issues/103))
 
 ### Removed
 

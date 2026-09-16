@@ -3,6 +3,12 @@
 //! Each maps to one of the four properties #11 asked for: deterministic key
 //! ordering, minimal diff noise, a format version field from day one, and an
 //! integrity hash per package.
+//!
+//! Version 2 adds a fifth, from #103: a node is identified by what it records
+//! rather than by the key it is recorded under. The key carries a peer suffix
+//! now, and a suffix that can be a hash is one nothing can parse back — so the
+//! tests that matter most here are the ones asking whether two keys can land
+//! on one node, and whether a file read back writes itself out unchanged.
 
 use std::collections::BTreeMap;
 
@@ -1167,11 +1173,13 @@ fn a_key_whose_suffix_swallowed_the_version_is_refused() {
 }
 
 #[test]
-fn two_keys_recording_one_identity_are_refused() {
+fn a_key_disagreeing_with_the_peers_it_records_is_refused() {
     // A block copied and its key edited, which is what hand-editing produces.
-    // The suffix is a rendering, not the identity: these two record the same
-    // peers, so they are one package under two names, and a file that cannot
-    // say which of them an edge means is not one to install from.
+    // The file states the peer context twice — once in the key and once in
+    // `peers` — so the two can disagree, exactly as the key and the version
+    // can. Refusing is also what stops the copy landing on the original: two
+    // keys recording one set of peers are one node, and a file that cannot say
+    // which entry an edge means is not one to install from.
     let dir = TempDir::new().unwrap();
     write_raw(
         &dir,
@@ -1187,13 +1195,14 @@ fn two_keys_recording_one_identity_are_refused() {
     );
 
     match lockfile::load(dir.path()) {
-        Err(LockfileError::CollidingKeys { entry, other, .. }) => {
+        Err(LockfileError::KeyIdentityMismatch { entry, rebuilt, .. }) => {
             assert_eq!(
-                (entry.as_str(), other.as_str()),
-                ("plugin@1.0.0(react@18.2.0)", "plugin@1.0.0(react@17.0.2)")
+                (entry.as_str(), rebuilt.as_str()),
+                ("plugin@1.0.0(react@17.0.2)", "plugin@1.0.0(react@18.2.0)"),
+                "the key claims a react the entry itself does not record"
             );
         }
-        other => panic!("expected colliding keys, got {other:?}"),
+        other => panic!("expected a key/identity mismatch, got {other:?}"),
     }
 }
 
