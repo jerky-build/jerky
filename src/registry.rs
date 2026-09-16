@@ -29,6 +29,27 @@ use crate::range::Version;
 /// package is how an install gets an IP rate-limited.
 pub const MAX_CONCURRENT_FETCHES: usize = 16;
 
+/// How many tarballs are downloaded *while resolution is still running*.
+///
+/// A second cap rather than a share of the first, because the two pools are
+/// not competing for the same thing. The metadata crawl is the critical path —
+/// a tree is paced by its longest dependency chain, and every link in it is a
+/// round trip that nothing else can start early — so it keeps its full width
+/// and is never made to wait behind a tarball. The prefetch runs in whatever
+/// capacity is left, and gets the full width back in `fetch_missing` once
+/// resolution is over and there is no longer a critical path to protect.
+///
+/// Eight rather than sixteen for the same reason it exists at all. The peak is
+/// what a registry sees, and this puts it at twenty-four: enough that a
+/// prefetch can keep a link saturated while the crawl is busy, and short of
+/// doubling the number of connections jerky opens in order to overlap two
+/// phases that were previously sequential.
+pub const MAX_SPECULATIVE_FETCHES: usize = 8;
+
+/// The most requests jerky can have in flight at once, which is both pools at
+/// full stretch. The connection pool is sized to it — see [`Client::build`].
+const MAX_CONCURRENT_REQUESTS: usize = MAX_CONCURRENT_FETCHES + MAX_SPECULATIVE_FETCHES;
+
 #[derive(Debug, Error)]
 pub enum RegistryError {
     #[error("package `{0}` was not found in the registry")]
@@ -545,19 +566,24 @@ impl HttpRegistry {
         // handshakes for a cold install of a large tree, which is both slow
         // and the connection-churn pattern registries rate-limit on.
         //
-        // The two limits are the same number on purpose. Only one pool of
-        // `MAX_CONCURRENT_FETCHES` workers runs at a time, so sixteen is every
+        // The two limits are the same number on purpose: it is every
         // connection jerky can have open at once however many hosts they are
-        // spread over: an overall cap below the per-host one would evict
+        // spread over, so an overall cap below the per-host one would evict
         // connections the per-host limit had just agreed to keep.
+        //
+        // It is the sum of both pools rather than either one of them, because
+        // since #95 two pools do run at once — the metadata crawl and the
+        // tarball prefetch overlapping it. Sizing this to one of them would
+        // reintroduce exactly the churn the paragraph above describes, at the
+        // busiest moment of an install rather than at a quiet one.
         //
         // Statuses are left on the response rather than raised as errors
         // because a 429 is only actionable with its headers in hand, and
         // ureq's conversion into `Error::StatusCode` drops them.
         let config = ureq::Agent::config_builder()
             .user_agent(concat!("jerky/", env!("CARGO_PKG_VERSION")))
-            .max_idle_connections(MAX_CONCURRENT_FETCHES)
-            .max_idle_connections_per_host(MAX_CONCURRENT_FETCHES)
+            .max_idle_connections(MAX_CONCURRENT_REQUESTS)
+            .max_idle_connections_per_host(MAX_CONCURRENT_REQUESTS)
             .http_status_as_error(false)
             // Bounding the name lookup costs a thread per *request*, not per
             // connection: ureq resolves before it asks the pool for one, so a

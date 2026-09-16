@@ -6,12 +6,15 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Mutex;
 
 use jerky::registry::Freshness;
 use jerky::registry::MAX_CONCURRENT_FETCHES;
 use jerky::registry::RegistryClient as _;
 use jerky::registry::RegistryError;
-use jerky::resolver::{Declared, ImporterPath, Kind, Resolution, ResolveError, resolve};
+use jerky::resolver::{
+    Declared, ImporterPath, Kind, Resolution, ResolveError, resolve, resolve_watching,
+};
 use jerky::testing::FixtureRegistry;
 
 /// A workspace of one, keyed `.` — the degenerate case of the general input,
@@ -1732,4 +1735,110 @@ mod freshness {
             "a warm entry fetched for a range must not answer a dist-tag"
         );
     }
+}
+
+#[test]
+fn the_crawl_reports_every_version_it_selects_with_what_it_takes_to_download_it() {
+    // The seam the overlapped fetch is built on. The crawl already holds a
+    // selected version's `dist` at the moment its packument lands, and this is
+    // that fact made available to a caller without the resolver learning what
+    // a store is.
+    let registry = FixtureRegistry::new()
+        .with_tree(&[("a", "1.0.0", &[("b", "^1.0.0")]), ("b", "1.0.0", &[])]);
+
+    let seen: Mutex<Vec<(String, String, String)>> = Mutex::new(Vec::new());
+    let graph = resolve_watching(
+        &registry,
+        &roots(&[("a", "^1.0.0")]),
+        &no_members(),
+        &|candidate| {
+            seen.lock().unwrap().push((
+                candidate.id.to_string(),
+                candidate.resolved.clone(),
+                candidate.integrity.to_ssri(),
+            ));
+        },
+    )
+    .unwrap();
+
+    let mut seen = seen.into_inner().unwrap();
+    seen.sort();
+    let names: Vec<&str> = seen.iter().map(|(id, _, _)| id.as_str()).collect();
+    assert_eq!(names, ["a@1.0.0", "b@1.0.0"]);
+
+    // Each candidate carries exactly what a download needs, read off the same
+    // packument the walk reads: the URL to ask for and the hash to check the
+    // answer against.
+    for (id, resolved, integrity) in &seen {
+        let package = graph
+            .packages
+            .values()
+            .find(|package| package.id.to_string() == *id)
+            .expect("the crawl reported a version the graph does not hold");
+        assert_eq!(resolved, &package.resolved);
+        assert_eq!(integrity, &package.integrity.to_ssri());
+    }
+}
+
+#[test]
+fn a_watcher_doing_real_work_changes_nothing_about_the_answer() {
+    // The load-bearing claim behind the overlapped fetch: the watcher is told
+    // things, and tells the resolver nothing.
+    //
+    // Comparing `resolve_watching(.., &|_| {})` against `resolve` would be
+    // comparing a call to itself, since that is how `resolve` is defined. So
+    // the watcher here is the shape the install actually passes — it takes a
+    // lock and allocates on the crawl worker, before that worker schedules the
+    // edges it just found — and the registry underneath is `Jumbled`, so the
+    // packuments land in a different order on every seed. Between them that is
+    // both halves of the hazard: a watcher that perturbs *timing* on the very
+    // threads whose completion order is the thing that must not reach the
+    // lockfile.
+    let roots = roots(&[("r", "^1.0.0"), ("t", "^1.0.0")]);
+
+    let mut lockfiles: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
+    let mut orders = std::collections::BTreeSet::new();
+
+    for seed in 1..=40u64 {
+        let registry = Jumbled::new(window(), seed);
+        let watched = Mutex::new(Vec::new());
+        let graph = resolve_watching(&registry, &roots, &no_members(), &|candidate| {
+            watched.lock().unwrap().push(candidate.id.to_string());
+        })
+        .unwrap();
+
+        assert!(
+            !watched.into_inner().unwrap().is_empty(),
+            "the watcher was never called, so it perturbed nothing"
+        );
+        lockfiles.insert(rendered(&graph));
+        orders.insert(registry.completion_order());
+    }
+
+    // And the same tree with nothing listening at all.
+    lockfiles.insert(rendered(
+        &resolve(&window(), &roots, &no_members()).unwrap(),
+    ));
+
+    assert!(
+        orders.len() > 1,
+        "every run settled in the same order, so the hazard was never \
+         exercised: {orders:?}"
+    );
+    assert_eq!(
+        lockfiles.len(),
+        1,
+        "the lockfile varied depending on what was watching the crawl, across \
+         {} completion orders",
+        orders.len()
+    );
+}
+
+/// A graph as the bytes it would be written as — the form every claim about
+/// two resolutions agreeing is actually about, since two that agree on every
+/// node but disagree on order are not the same answer.
+fn rendered(graph: &jerky::resolver::ResolvedGraph) -> Vec<u8> {
+    let dir = tempfile::TempDir::new().unwrap();
+    jerky::lockfile::save(graph, dir.path()).unwrap();
+    std::fs::read(dir.path().join(jerky::lockfile::LOCKFILE_NAME)).unwrap()
 }

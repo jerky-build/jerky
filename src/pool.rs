@@ -1,7 +1,6 @@
 //! Running a work list across a bounded set of threads.
 //!
-//! Two shapes, and the difference between them is whether the work is known
-//! before it starts.
+//! Three shapes, and what separates them is where the work comes from.
 //!
 //! [`drain`] takes a slice: tarball downloads, and the linker materialising a
 //! plan's entries into the virtual store — a list that is the graph, where the
@@ -13,6 +12,13 @@
 //! share a cap and nothing else — a growing list cannot be walked by an index,
 //! cannot know when it is finished without asking what every worker is doing,
 //! and has no lowest-indexed item for a failure to be attributed to.
+//!
+//! [`alongside`] takes a list a *different* thread fills while the workers
+//! drain it: tarballs being downloaded while resolution is still deciding
+//! which of them the tree wants. Its work is speculative — the producer has
+//! not finished answering the question the work is for — so unlike the other
+//! two it does not run to completion. It stops when the producer does, and
+//! what is left on the list is abandoned rather than drained.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -207,8 +213,134 @@ where
     });
 }
 
+/// A work list one thread fills while others drain it.
+///
+/// Handed to [`alongside`]'s producer, and the only way into a run in
+/// progress. Unlike a [`Worklist`] it has no opinion about when the run is
+/// over: a list nobody has pushed to yet is not a finished one, it is one
+/// whose producer has not got there, so the run ends when the producer says so
+/// and at no other time.
+pub struct Feed<T> {
+    state: Mutex<FeedState<T>>,
+    wake: Condvar,
+}
+
+struct FeedState<T> {
+    queue: Vec<T>,
+    /// Set when the producer returns, and never cleared.
+    done: bool,
+}
+
+impl<T> Feed<T> {
+    /// Add an item, to be taken by whichever worker is free.
+    pub fn push(&self, item: T) {
+        self.state.lock().unwrap().queue.push(item);
+        self.wake.notify_one();
+    }
+
+    /// End the run, abandoning whatever is still on the list.
+    ///
+    /// Abandoning rather than draining is the contract, and it is the whole
+    /// reason this shape is worth having over a channel joined at the end.
+    /// What runs alongside a producer is speculative by construction — the
+    /// producer is still deciding what is actually wanted — so an item still
+    /// queued when the producer finishes is one whose value has just been
+    /// settled by something else. Finishing it is at best duplicated work and
+    /// at worst work on something the producer's answer excludes.
+    fn stop(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.done = true;
+        self.wake.notify_all();
+    }
+
+    /// The next item, or `None` once the run is over.
+    fn take(&self) -> Option<T> {
+        let mut state = self.state.lock().unwrap();
+        loop {
+            // Before the queue, so that `stop` takes effect against a list
+            // that still has items on it — which is the situation it is
+            // always called in.
+            if state.done {
+                return None;
+            }
+            // LIFO, as [`crawl`] is and for a weaker version of the same
+            // reason: a producer discovers work roughly in the order it wants
+            // it, so the most recently pushed item is the one most likely to
+            // still matter by the time the run ends.
+            if let Some(item) = state.queue.pop() {
+                return Some(item);
+            }
+
+            state = self.wake.wait(state).unwrap();
+        }
+    }
+}
+
+/// Run `body` over a list that `produce` fills while it runs, and return what
+/// `produce` returned.
+///
+/// The third shape, and the one whose work is known neither before it starts
+/// nor by the workers themselves: it belongs to the producer, which is doing
+/// something else entirely and pushing what it happens to learn on the way.
+/// That makes the run **speculative**, and everything about the contract
+/// follows from it. There is no error path, because a caller running this for
+/// a side effect has somewhere better to report a failure — the same argument
+/// [`crawl`] makes. There is no join, because [`Feed::stop`] abandons what is
+/// left rather than draining it.
+///
+/// `produce` runs on the calling thread, so the value it returns needs no
+/// channel to get out, and a `?` inside it does what it looks like it does.
+///
+/// Work already claimed when the producer returns still finishes, exactly as
+/// in [`drain`] and [`crawl`]. A body that may block for a long time is
+/// therefore a body the producer will wait on at the end, which bounds how
+/// long this can hold up its caller to one item per worker.
+pub fn alongside<T, R, F, P>(workers: usize, body: F, produce: P) -> R
+where
+    T: Send,
+    F: Fn(T) + Sync,
+    P: FnOnce(&Feed<T>) -> R,
+{
+    let workers = workers.max(1);
+    let feed = Feed {
+        state: Mutex::new(FeedState {
+            queue: Vec::new(),
+            done: false,
+        }),
+        wake: Condvar::new(),
+    };
+
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                while let Some(item) = feed.take() {
+                    body(item);
+                }
+            });
+        }
+
+        // A guard rather than a call after `produce`, because `thread::scope`
+        // joins on the unwind path too: a producer that panics would otherwise
+        // leave every worker parked on a list nobody will ever close, turning
+        // a panic into a hang.
+        let _stop = StopOnDrop(&feed);
+        produce(&feed)
+    })
+}
+
+/// Ends a [`Feed`]'s run however its producer left.
+struct StopOnDrop<'a, T>(&'a Feed<T>);
+
+impl<T> Drop for StopOnDrop<'_, T> {
+    fn drop(&mut self) {
+        self.0.stop();
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use super::*;
 
     #[test]
@@ -401,5 +533,102 @@ mod tests {
         });
 
         assert!(*seen.lock().unwrap() >= 4);
+    }
+
+    #[test]
+    fn a_producer_feeds_workers_that_are_already_running() {
+        let seen = Mutex::new(Vec::new());
+        let done = AtomicUsize::new(0);
+
+        let produced = alongside(
+            4,
+            |item: usize| {
+                seen.lock().unwrap().push(item);
+                done.fetch_add(1, Ordering::SeqCst);
+            },
+            |feed| {
+                for item in 0..100 {
+                    feed.push(item);
+                }
+                // The producer waits for the workers rather than returning
+                // straight away, which is what makes this a test that they run
+                // *alongside* it: nothing has closed the list, so if the pool
+                // only started draining once the producer was done, nothing
+                // would ever arrive. Bounded, so that a pool which never
+                // starts fails the assertion below instead of hanging.
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while done.load(Ordering::SeqCst) < 100 && Instant::now() < deadline {
+                    std::thread::yield_now();
+                }
+                "produced"
+            },
+        );
+
+        assert_eq!(produced, "produced");
+        let mut seen = seen.into_inner().unwrap();
+        seen.sort_unstable();
+        assert_eq!(seen, (0..100).collect::<Vec<usize>>());
+    }
+
+    #[test]
+    fn what_is_still_queued_when_the_producer_returns_is_abandoned() {
+        // A timing assertion, and deliberately one. The producer's return
+        // *is* the stop, so whether a worker claims one more item at that
+        // exact instant is a race nothing outside the pool can observe — but
+        // the scale is not a race. Draining this list takes a hundred
+        // seconds; abandoning it takes one item's worth of sleep, and four
+        // orders of magnitude is not something a scheduler decides.
+        let seen = AtomicUsize::new(0);
+        let started = Instant::now();
+
+        alongside(
+            1,
+            |_: usize| {
+                std::thread::sleep(Duration::from_millis(10));
+                seen.fetch_add(1, Ordering::SeqCst);
+            },
+            |feed| {
+                for item in 0..10_000 {
+                    feed.push(item);
+                }
+            },
+        );
+
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the run drained its list instead of abandoning it, after {:?} and {} items",
+            started.elapsed(),
+            seen.load(Ordering::SeqCst)
+        );
+    }
+
+    #[test]
+    fn a_producer_that_panics_ends_the_run_rather_than_hanging() {
+        // `thread::scope` joins on the unwind path as well as the normal one,
+        // so a producer that panics without closing the list would leave every
+        // worker parked on the condvar and turn the panic into a hang. Run on
+        // a thread of its own and waited for with a deadline, so that a
+        // regression fails this test instead of stopping the suite.
+        let (finished, panicked) = std::sync::mpsc::channel();
+
+        std::thread::spawn(move || {
+            let outcome = std::panic::catch_unwind(|| {
+                alongside(
+                    4,
+                    |_: usize| {},
+                    |feed| {
+                        feed.push(1);
+                        panic!("the producer gave up");
+                    },
+                )
+            });
+            let _ = finished.send(outcome.is_err());
+        });
+
+        assert_eq!(
+            panicked.recv_timeout(Duration::from_secs(10)),
+            Ok(true),
+            "a panicking producer left the workers parked"
+        );
     }
 }
