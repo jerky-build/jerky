@@ -124,17 +124,165 @@ pub enum ResolveError {
     },
 }
 
-/// A node in the resolved graph: one concrete version of one package.
+/// The longest a rendered [`PackageId`] may be before its peer context is
+/// replaced by a hash.
+///
+/// The rendered form is a directory name, and a single path component cannot
+/// exceed 255 bytes on the filesystems jerky targets. 200 leaves headroom
+/// rather than sitting on the limit. Hashing costs readability — a lockfile of
+/// hashed keys is one nobody can review — so it is a fallback and never the
+/// default.
+const MAX_KEY_BYTES: usize = 200;
+
+/// How much of the digest a collapsed peer suffix keeps. Eight bytes is
+/// sixteen hex characters — short enough to stay readable in a key, wide
+/// enough that two contexts colliding is not a thing that happens.
+const PEER_HASH_BYTES: usize = 8;
+
+/// A node in the resolved graph: one concrete version of one package, resolved
+/// against a particular set of peers.
+///
+/// The peer context is part of the identity because it has to be. With no
+/// ambient hoisting, `react-dom@18.2.0` given `react@18.2.0` and the same
+/// `react-dom@18.2.0` given `react@17.0.2` need different directories — the
+/// link at `node_modules/react` inside each differs — so one `name@version`
+/// cannot address both.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PackageId {
     pub name: String,
     pub version: String,
+    /// The peers this node resolved against, keyed by the name the dependent
+    /// declared them under.
+    ///
+    /// Values are full `PackageId`s rather than version strings: a peer may
+    /// itself have been duplicated by *its* peers, and two contexts differing
+    /// only at that depth are different contexts.
+    ///
+    /// Empty for the overwhelming majority of packages, and empty is what
+    /// makes this field invisible to them.
+    pub peers: BTreeMap<String, PackageId>,
+}
+
+impl PackageId {
+    /// A package resolved against no peers — every node the walk produces,
+    /// before the peer pass has anything to say about it.
+    pub fn plain(name: impl Into<String>, version: impl Into<String>) -> Self {
+        PackageId {
+            name: name.into(),
+            version: version.into(),
+            peers: BTreeMap::new(),
+        }
+    }
+
+    /// The peer suffix alone, rendered in full: `(react@18.2.0)`, nested.
+    ///
+    /// Parenthesised rather than delimited because the context nests, and a
+    /// flat separator cannot say whether the third name is a peer of the first
+    /// or a peer of the second.
+    ///
+    /// The recursion terminates unconditionally: `peers` owns its values, so
+    /// the structure is necessarily a finite tree. A *graph* of peers can hold
+    /// a cycle, and breaking it is the job of whatever builds these ids — it
+    /// cannot be represented here to begin with.
+    fn render_peers(&self, out: &mut String) {
+        // Sorted by the name the dependent declared, which is `BTreeMap`'s
+        // iteration order, so two machines render identically.
+        for peer in self.peers.values() {
+            out.push('(');
+            // A scoped peer's `/` would open a directory level. The base name
+            // is allowed one — the linker already expects `@types/node@20.0.0`
+            // to be two components — but the suffix must stay inside the last.
+            out.push_str(&peer.name.replace('/', "+"));
+            out.push('@');
+            out.push_str(&peer.version);
+            peer.render_peers(out);
+            out.push(')');
+        }
+    }
+
+    /// A stable short hash of an already-rendered peer suffix.
+    ///
+    /// Takes the rendering rather than re-deriving it, so there is one walk
+    /// and no way for the hashed context and the readable one to drift.
+    fn peer_hash(suffix: &str) -> String {
+        use sha2::Digest as _;
+
+        let digest = sha2::Sha512::digest(suffix.as_bytes());
+        use std::fmt::Write as _;
+        digest[..PEER_HASH_BYTES]
+            .iter()
+            .fold(String::new(), |mut out, byte| {
+                let _ = write!(out, "{byte:02x}");
+                out
+            })
+    }
 }
 
 impl std::fmt::Display for PackageId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}@{}", self.name, self.version)
+        // The no-peer spelling is byte-identical to what this rendered before
+        // peers existed. That is a requirement, not a coincidence: it is what
+        // keeps the format change invisible to every package without peers.
+        if self.peers.is_empty() {
+            return write!(f, "{}@{}", self.name, self.version);
+        }
+
+        let mut suffix = String::new();
+        self.render_peers(&mut suffix);
+
+        let rendered = format!("{}@{}{}", self.name, self.version, suffix);
+        if rendered.len() <= MAX_KEY_BYTES {
+            return f.write_str(&rendered);
+        }
+
+        // `_` marks a collapsed suffix. It cannot be confused with the
+        // readable form, which always opens with `(`, and a version carries no
+        // `_` of its own.
+        write!(
+            f,
+            "{}@{}_{}",
+            self.name,
+            self.version,
+            Self::peer_hash(&suffix)
+        )
     }
+}
+
+/// Split a rendered [`PackageId`] key into its name and version, discarding
+/// any peer suffix.
+///
+/// The suffix is dropped rather than returned because nothing reads it: it
+/// exists only to keep two peer resolutions of one version apart, and what
+/// those peers were is recorded in a field of its own. That is also what lets
+/// the collapsed form be an opaque hash at all.
+///
+/// Delegates to [`split_name_and_version`] rather than splitting again, so the
+/// crate keeps one decoder to match its one encoder. That function is shared
+/// with `alias_target` and deliberately knows nothing about peers; all this
+/// adds is finding where the suffix begins.
+pub(crate) fn split_key(key: &str) -> Option<(&str, &str)> {
+    // A readable suffix always opens `(`, and a package name may not contain
+    // one. A collapsed suffix is `_` and a fixed run of hex at the very end —
+    // anchored there because a name *may* contain `_`, so nothing earlier in
+    // the key can be assumed to be the marker.
+    let head = match key.find('(') {
+        Some(open) => &key[..open],
+        None => strip_collapsed_suffix(key),
+    };
+
+    split_name_and_version(head)
+}
+
+/// `p@1.0.0_0123456789abcdef` -> `p@1.0.0`, and anything else unchanged.
+fn strip_collapsed_suffix(key: &str) -> &str {
+    let Some((head, tail)) = key.rsplit_once('_') else {
+        return key;
+    };
+
+    let collapsed =
+        tail.len() == PEER_HASH_BYTES * 2 && tail.bytes().all(|byte| byte.is_ascii_hexdigit());
+
+    if collapsed { head } else { key }
 }
 
 #[derive(Debug, Clone)]
@@ -1013,10 +1161,11 @@ impl<'a> Walk<'a> {
         }
 
         let version = choose(&packument, name, range)?;
-        let id = PackageId {
-            name: name.to_string(),
-            version,
-        };
+        // Peer-free by construction. The walk resolves versions and nothing
+        // else; peers are settled afterwards, over the finished graph, which
+        // is sound precisely because a peer is satisfied only from what is
+        // already resolved and so can never change a selection.
+        let id = PackageId::plain(name, version);
         self.selections.insert(key, id.clone());
         Ok((id, packument))
     }
@@ -1108,6 +1257,192 @@ fn local_path(importer: &ImporterPath, member: &ImporterPath) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A registry package with no peers, which is nearly all of them.
+    fn plain(name: &str, version: &str) -> PackageId {
+        PackageId::plain(name, version)
+    }
+
+    fn with_peers(name: &str, version: &str, peers: &[PackageId]) -> PackageId {
+        PackageId {
+            name: name.to_string(),
+            version: version.to_string(),
+            peers: peers
+                .iter()
+                .map(|peer| (peer.name.clone(), peer.clone()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn an_empty_peer_context_renders_as_name_at_version() {
+        // The requirement the rest of the format rests on. Nearly every
+        // package has no peers, so this is what keeps the change invisible to
+        // them and keeps every key already asserted elsewhere asserting the
+        // same string.
+        assert_eq!(plain("lodash", "4.17.21").to_string(), "lodash@4.17.21");
+        assert_eq!(
+            plain("@types/node", "20.0.0").to_string(),
+            "@types/node@20.0.0"
+        );
+    }
+
+    #[test]
+    fn a_single_peer_renders_in_parentheses() {
+        let id = with_peers("react-dom", "18.2.0", &[plain("react", "18.2.0")]);
+        assert_eq!(id.to_string(), "react-dom@18.2.0(react@18.2.0)");
+    }
+
+    #[test]
+    fn peers_render_sorted_whatever_the_insertion_order() {
+        // Two machines resolving the same tree must serialize identically,
+        // which is the same reason the graph uses BTreeMap throughout.
+        let forwards = with_peers("p", "1.0.0", &[plain("a", "1.0.0"), plain("b", "2.0.0")]);
+        let backwards = with_peers("p", "1.0.0", &[plain("b", "2.0.0"), plain("a", "1.0.0")]);
+        assert_eq!(forwards.to_string(), "p@1.0.0(a@1.0.0)(b@2.0.0)");
+        assert_eq!(forwards.to_string(), backwards.to_string());
+    }
+
+    #[test]
+    fn a_scoped_peer_stays_inside_one_path_component() {
+        // The rendered id is a directory name. The base name's `/` already
+        // makes two components and the linker knows it; a peer's must not add
+        // a third, so it is written `+`.
+        let id = with_peers("p", "1.0.0", &[plain("@babel/core", "7.24.0")]);
+        assert_eq!(id.to_string(), "p@1.0.0(@babel+core@7.24.0)");
+    }
+
+    #[test]
+    fn a_peer_carrying_its_own_peers_renders_nested() {
+        // Nesting is why the suffix is parenthesised rather than delimited: a
+        // flat separator cannot say whether the third name is a peer of the
+        // first or of the second.
+        let inner = with_peers("b", "2.0.0", &[plain("c", "3.0.0")]);
+        let id = with_peers("a", "1.0.0", &[inner, plain("d", "4.0.0")]);
+        assert_eq!(id.to_string(), "a@1.0.0(b@2.0.0(c@3.0.0))(d@4.0.0)");
+    }
+
+    #[test]
+    fn a_long_peer_context_collapses_to_a_hash() {
+        let peers: Vec<PackageId> = (0..40)
+            .map(|n| plain(&format!("a-rather-long-peer-name-{n}"), "1.0.0"))
+            .collect();
+        let id = with_peers("p", "1.0.0", &peers);
+        let rendered = id.to_string();
+
+        assert!(
+            rendered.len() <= MAX_KEY_BYTES,
+            "a key must fit a path component, got {} bytes",
+            rendered.len()
+        );
+        assert!(rendered.starts_with("p@1.0.0_"), "got {rendered}");
+        assert!(
+            !rendered.contains('('),
+            "the suffix collapsed, got {rendered}"
+        );
+    }
+
+    #[test]
+    fn distinct_long_contexts_hash_differently() {
+        let long = |extra: &str| {
+            let mut peers: Vec<PackageId> = (0..40)
+                .map(|n| plain(&format!("a-rather-long-peer-name-{n}"), "1.0.0"))
+                .collect();
+            peers.push(plain(extra, "1.0.0"));
+            with_peers("p", "1.0.0", &peers).to_string()
+        };
+        assert_ne!(long("x"), long("y"));
+    }
+
+    #[test]
+    fn a_key_splits_into_its_name_and_version() {
+        assert_eq!(split_key("lodash@4.17.21"), Some(("lodash", "4.17.21")));
+        assert_eq!(
+            split_key("@types/node@20.0.0"),
+            Some(("@types/node", "20.0.0")),
+            "a scope's leading @ is not the separator"
+        );
+        assert_eq!(
+            split_key("react-dom@18.2.0(react@18.2.0)"),
+            Some(("react-dom", "18.2.0")),
+            "the peer suffix is not part of the version"
+        );
+        assert_eq!(
+            split_key("a@1.0.0(b@2.0.0(c@3.0.0))(d@4.0.0)"),
+            Some(("a", "1.0.0")),
+            "however deeply the suffix nests"
+        );
+        assert_eq!(
+            split_key("p@1.0.0_0123456789abcdef"),
+            Some(("p", "1.0.0")),
+            "a collapsed suffix is still a suffix"
+        );
+        assert_eq!(split_key("nope"), None);
+        assert_eq!(split_key("@scope/only"), None);
+    }
+
+    #[test]
+    fn an_underscore_in_a_package_name_is_not_a_collapsed_suffix() {
+        // npm permits `_` in a name, so the collapsed marker is recognised
+        // only at the very end of the key and only as a fixed run of hex.
+        // Anything laxer eats part of a legitimate name.
+        assert_eq!(split_key("my_pkg@1.0.0"), Some(("my_pkg", "1.0.0")));
+        assert_eq!(
+            split_key("a_0123456789abcdef@1.0.0"),
+            Some(("a_0123456789abcdef", "1.0.0")),
+            "hex in the name, but the key does not end with it"
+        );
+        assert_eq!(
+            split_key("my_pkg@1.0.0_0123456789abcdef"),
+            Some(("my_pkg", "1.0.0")),
+            "a real suffix on a name that also carries an underscore"
+        );
+        assert_eq!(
+            split_key("p@1.0.0_nothex0123456"),
+            Some(("p", "1.0.0_nothex0123456")),
+            "not hex, so not a suffix — and the version keeps it"
+        );
+    }
+
+    #[test]
+    fn every_rendered_key_splits_back_to_its_name_and_version() {
+        for id in [
+            plain("lodash", "4.17.21"),
+            plain("@types/node", "20.0.0"),
+            with_peers("react-dom", "18.2.0", &[plain("react", "18.2.0")]),
+            with_peers(
+                "@storybook/react",
+                "7.6.0",
+                &[plain("@babel/core", "7.24.0"), plain("react", "18.2.0")],
+            ),
+            with_peers(
+                "a",
+                "1.0.0",
+                &[with_peers("b", "2.0.0", &[plain("c", "3.0.0")])],
+            ),
+        ] {
+            let rendered = id.to_string();
+            assert_eq!(
+                split_key(&rendered),
+                Some((id.name.as_str(), id.version.as_str())),
+                "{rendered} did not split back"
+            );
+        }
+    }
+
+    #[test]
+    fn splitting_an_alias_target_is_unchanged_by_peers() {
+        // `split_name_and_version` is shared with `alias_target`, which must
+        // not learn about peers. It is left alone; `split_key` is the new one.
+        assert_eq!(
+            split_name_and_version("string-width@^4.0.0"),
+            Some(("string-width", "^4.0.0"))
+        );
+        assert_eq!(
+            alias_target("npm:safe-execa@0.3.0"),
+            Some(("safe-execa", "0.3.0"))
+        );
+    }
 
     #[test]
     fn the_root_importer_is_dot_and_has_no_depth() {

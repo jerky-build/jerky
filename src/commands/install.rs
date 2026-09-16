@@ -1009,10 +1009,7 @@ mod tests {
     }
 
     fn id(name: &str, version: &str) -> PackageId {
-        PackageId {
-            name: name.to_string(),
-            version: version.to_string(),
-        }
+        PackageId::plain(name, version)
     }
 
     /// Distinct per package, because the store path a plan carries is derived
