@@ -48,9 +48,9 @@ use thiserror::Error;
 
 use crate::integrity::{Integrity, IntegrityError};
 use crate::pool;
-use crate::range::{Range, RangeError};
+use crate::range::{Range, RangeError, Version};
 use crate::registry::{
-    Freshness, MAX_CONCURRENT_FETCHES, Packument, RegistryClient, RegistryError,
+    Freshness, MAX_CONCURRENT_FETCHES, Packument, RegistryClient, RegistryError, VersionMetadata,
 };
 
 /// The protocol marking a dependency as a workspace member rather than a
@@ -151,16 +151,28 @@ const PEER_HASH_BYTES: usize = 8;
 pub struct PackageId {
     pub name: String,
     pub version: String,
-    /// The peers this node resolved against, keyed by the name the dependent
-    /// declared them under.
+    /// What this node resolved *against* — the whole of what distinguishes it
+    /// from another copy of the same published version.
     ///
-    /// Values are full `PackageId`s rather than version strings: a peer may
-    /// itself have been duplicated by *its* peers, and two contexts differing
-    /// only at that depth are different contexts.
+    /// Two kinds of entry, for one reason. The first is this node's own
+    /// resolved peers, keyed by the name it declared them under. The second is
+    /// each dependency that itself carries a context, keyed by the name this
+    /// node calls it.
+    ///
+    /// The second kind is what makes a peer-less node duplicable at all. A
+    /// package that declares no peers but depends on one that does must still
+    /// become two nodes when its dependency does — otherwise both copies key
+    /// the same and `ResolvedGraph::packages` silently keeps one, dropping a
+    /// whole subtree. Folding the dependency's context in is what gives the
+    /// two copies different keys, and it is why this is a *context* and not a
+    /// peer map.
+    ///
+    /// Values are full `PackageId`s rather than version strings, so two
+    /// contexts differing only deep inside are still different contexts.
     ///
     /// Empty for the overwhelming majority of packages, and empty is what
     /// makes this field invisible to them.
-    pub peers: BTreeMap<String, PackageId>,
+    pub context: BTreeMap<String, PackageId>,
 }
 
 impl PackageId {
@@ -170,11 +182,11 @@ impl PackageId {
         PackageId {
             name: name.into(),
             version: version.into(),
-            peers: BTreeMap::new(),
+            context: BTreeMap::new(),
         }
     }
 
-    /// The peer suffix alone, rendered in full: `(react@18.2.0)`, nested.
+    /// The context suffix alone, rendered in full: `(react@18.2.0)`, nested.
     ///
     /// Parenthesised rather than delimited because the context nests, and a
     /// flat separator cannot say whether the third name is a peer of the first
@@ -184,10 +196,10 @@ impl PackageId {
     /// the structure is necessarily a finite tree. A *graph* of peers can hold
     /// a cycle, and breaking it is the job of whatever builds these ids — it
     /// cannot be represented here to begin with.
-    fn render_peers(&self, out: &mut String) {
+    fn render_context(&self, out: &mut String) {
         // Sorted by the name the dependent declared, which is `BTreeMap`'s
         // iteration order, so two machines render identically.
-        for peer in self.peers.values() {
+        for peer in self.context.values() {
             out.push('(');
             // A scoped peer's `/` would open a directory level. The base name
             // is allowed one — the linker already expects `@types/node@20.0.0`
@@ -195,16 +207,16 @@ impl PackageId {
             out.push_str(&peer.name.replace('/', "+"));
             out.push('@');
             out.push_str(&peer.version);
-            peer.render_peers(out);
+            peer.render_context(out);
             out.push(')');
         }
     }
 
-    /// A stable short hash of an already-rendered peer suffix.
+    /// A stable short hash of an already-rendered context suffix.
     ///
     /// Takes the rendering rather than re-deriving it, so there is one walk
     /// and no way for the hashed context and the readable one to drift.
-    fn peer_hash(suffix: &str) -> String {
+    fn context_hash(suffix: &str) -> String {
         use sha2::Digest as _;
 
         let digest = sha2::Sha512::digest(suffix.as_bytes());
@@ -223,12 +235,12 @@ impl std::fmt::Display for PackageId {
         // The no-peer spelling is byte-identical to what this rendered before
         // peers existed. That is a requirement, not a coincidence: it is what
         // keeps the format change invisible to every package without peers.
-        if self.peers.is_empty() {
+        if self.context.is_empty() {
             return write!(f, "{}@{}", self.name, self.version);
         }
 
         let mut suffix = String::new();
-        self.render_peers(&mut suffix);
+        self.render_context(&mut suffix);
 
         let rendered = format!("{}@{}{}", self.name, self.version, suffix);
         if rendered.len() <= MAX_KEY_BYTES {
@@ -243,9 +255,35 @@ impl std::fmt::Display for PackageId {
             "{}@{}_{}",
             self.name,
             self.version,
-            Self::peer_hash(&suffix)
+            Self::context_hash(&suffix)
         )
     }
+}
+
+/// Read a version's published peers into the graph's own shape.
+///
+/// `peerDependenciesMeta` may name a peer that `peerDependencies` does not
+/// declare. That is meaningless rather than malformed — the registry has
+/// published worse — so the declaration drives the pairing and a meta entry
+/// with nothing to flag is simply never read.
+fn declared_peers(metadata: &VersionMetadata) -> BTreeMap<String, DeclaredPeer> {
+    metadata
+        .peer_dependencies
+        .iter()
+        .map(|(name, range)| {
+            let optional = metadata
+                .peer_dependencies_meta
+                .get(name)
+                .is_some_and(|meta| meta.optional);
+            (
+                name.clone(),
+                DeclaredPeer {
+                    range: range.clone(),
+                    optional,
+                },
+            )
+        })
+        .collect()
 }
 
 /// Split a rendered [`PackageId`] key into its name and version, discarding
@@ -293,6 +331,38 @@ pub struct ResolvedPackage {
     pub integrity: Integrity,
     /// What this package calls a dependency -> the node it resolved to.
     pub dependencies: BTreeMap<String, PackageId>,
+    /// What this package requires of its consumer, exactly as published.
+    ///
+    /// Carried rather than resolved by the walk, because a peer is not an edge
+    /// to follow: it is a constraint answered by whoever installs this package,
+    /// and the walk has no idea who that is. The peer pass does.
+    ///
+    /// Recorded even for packages whose peers all turn out to be satisfied, so
+    /// that a diagnostic can be recomputed later from the graph alone.
+    pub declared_peers: BTreeMap<String, DeclaredPeer>,
+    /// What this node's own peers resolved to, by the name it declared them
+    /// under. Empty until the peer pass has run, and empty for every package
+    /// that declares none.
+    ///
+    /// Not derivable from `id.context`, which also holds the dependencies
+    /// folded in to keep two copies apart — and a name can legitimately appear
+    /// in both. The lockfile records what a package resolved *as a peer*, so
+    /// the graph has to keep the two apart.
+    pub peers: BTreeMap<String, PackageId>,
+}
+
+/// One `peerDependencies` entry, with the flag `peerDependenciesMeta` carries
+/// for it.
+///
+/// A pair rather than two parallel maps, because a range with no optionality
+/// and an optionality with no range are both meaningless, and keeping them
+/// together means no consumer can read one and forget the other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredPeer {
+    pub range: String,
+    /// `peerDependenciesMeta[name].optional`. An unsatisfied optional peer is
+    /// silent; an unsatisfied required one is a diagnostic.
+    pub optional: bool,
 }
 
 /// A workspace-relative directory that declares dependencies. `.` is the
@@ -711,6 +781,412 @@ pub fn resolve(
     Ok(walk.into_graph())
 }
 
+/// A required peer that nothing in the dependent's environment satisfies.
+///
+/// Produced here and printed elsewhere: the resolver has no business writing to
+/// a terminal, and the install command already returns its warnings for `main`
+/// to render.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct UnsatisfiedPeer {
+    /// The package that declared the peer, as published — no peer context, so
+    /// one complaint reads the same however many copies of the package the
+    /// duplication produced.
+    pub dependent: PackageId,
+    /// The name it declared, and the range it asked of it.
+    pub peer: String,
+    pub range: String,
+    /// The version of the provider that was found, when one was found at all.
+    ///
+    /// `None` is "nothing provides this"; `Some` is "something does, and it is
+    /// the wrong version". The two are different problems and read as different
+    /// sentences, which is why this is an `Option` and not a bool saying it
+    /// went wrong.
+    pub found: Option<String>,
+}
+
+/// Resolve every package's peers, duplicating nodes whose answers differ.
+///
+/// A pure graph-to-graph pass. It fetches nothing and touches no filesystem,
+/// which is what lets it be tested exactly the way the walk is — and it is
+/// sound *only* because jerky never fabricates an edge: a peer is satisfied
+/// from what is already resolved, so peer resolution can never cause a new
+/// version to be selected, and can therefore run after selection is finished.
+///
+/// Takes the graph by value so no caller is left holding the peer-blind one,
+/// which is a different graph with confusingly similar contents.
+pub fn resolve_peers(graph: ResolvedGraph) -> (ResolvedGraph, Vec<UnsatisfiedPeer>) {
+    let mut pass = PeerPass {
+        source: &graph,
+        needed: peer_names_needed(&graph),
+        instances: BTreeMap::new(),
+        identities: BTreeMap::new(),
+        identifying: BTreeSet::new(),
+        unsatisfied: BTreeMap::new(),
+    };
+
+    // Stage one: discover which *instances* exist — one per (package, the
+    // environment its subtree can see) — without giving any of them a name.
+    let mut importers = graph.importers.clone();
+    let mut roots = Vec::new();
+    for (path, importer) in &importers {
+        // The importer's own dependencies are the outermost frame: the last
+        // place a peer looks, and the only one a top-level package has.
+        let provided: BTreeMap<String, PackageId> = importer
+            .dependencies
+            .iter()
+            .filter_map(|(name, dependency)| match &dependency.resolution {
+                Resolution::Registry(id) => Some((name.clone(), id.clone())),
+                Resolution::Local(_) => None,
+            })
+            .collect();
+
+        for (name, dependency) in &importer.dependencies {
+            if let Resolution::Registry(id) = &dependency.resolution {
+                let instance = pass.discover(id, &[&provided]);
+                roots.push((path.clone(), name.clone(), instance));
+            }
+        }
+    }
+
+    // Stage two: name them. Separate from discovery because a node's name
+    // depends on its dependencies' names, which is a question that cannot be
+    // answered while still finding out what the dependencies are.
+    for (.., instance) in &roots {
+        pass.identify(instance);
+    }
+
+    // Stage three: emit. Every reachable instance has a name by now, so every
+    // edge names a node that exists — including the edges that close a cycle,
+    // which is the property the two-stage split buys.
+    let packages = pass.emit();
+
+    for (path, name, instance) in roots {
+        let id = pass.identities[&instance].clone();
+        if let Some(dependency) = importers
+            .get_mut(&path)
+            .and_then(|importer| importer.dependencies.get_mut(&name))
+        {
+            dependency.resolution = Resolution::Registry(id);
+        }
+    }
+
+    let unsatisfied = pass.unsatisfied.into_values().collect();
+
+    (
+        ResolvedGraph {
+            importers,
+            packages,
+        },
+        unsatisfied,
+    )
+}
+
+/// One copy of a package: the version the walk selected, plus the environment
+/// its subtree can see.
+///
+/// The environment is what tells two copies apart, and it has to name every
+/// peer the *subtree* can ask about rather than only the ones this package
+/// declares. A package with no peers of its own is still duplicated by one
+/// deeper down, so keying on its own peers would give it a single instance and
+/// silently collapse the copies.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct Instance {
+    package: PackageId,
+    environment: BTreeMap<String, PackageId>,
+}
+
+/// What one instance resolved, before anything has been named.
+#[derive(Debug, Clone)]
+struct Copy_ {
+    /// This package's own peers, and what answered them.
+    own: BTreeMap<String, PackageId>,
+    /// What it depends on, as instances rather than ids.
+    dependencies: BTreeMap<String, Instance>,
+}
+
+/// The peer pass's working state.
+struct PeerPass<'a> {
+    source: &'a ResolvedGraph,
+    /// Every peer name each node's subtree can ask about, itself included.
+    needed: BTreeMap<PackageId, BTreeSet<String>>,
+    instances: BTreeMap<Instance, Copy_>,
+    identities: BTreeMap<Instance, PackageId>,
+    /// Instances whose name is still being computed. Re-entering one is a
+    /// cycle, and the edge that closed it is left out of the name — see
+    /// [`PeerPass::identify`].
+    identifying: BTreeSet<Instance>,
+    /// Keyed by what a reader would consider one complaint, so a package
+    /// duplicated eleven ways reports its unmet peer once.
+    unsatisfied: BTreeMap<(PackageId, String), UnsatisfiedPeer>,
+}
+
+impl PeerPass<'_> {
+    /// Find every instance reachable from one edge, resolving peers as it goes.
+    ///
+    /// `providers` runs outermost-first: the importer, then each package on the
+    /// path down, ending with this node's own dependencies.
+    fn discover(&mut self, id: &PackageId, providers: &[&BTreeMap<String, PackageId>]) -> Instance {
+        // Copied out so the borrow lives as long as the source graph rather
+        // than as long as `&mut self`.
+        let source = self.source;
+
+        let Some(package) = source.packages.get(id) else {
+            // Nothing a walk produces, but a hand-written lockfile can name an
+            // edge it does not record. Returning a bare instance lets the
+            // lockfile's own validation report that, rather than this pass
+            // panicking on it first.
+            let instance = Instance {
+                package: id.clone(),
+                environment: BTreeMap::new(),
+            };
+            self.instances.entry(instance.clone()).or_insert(Copy_ {
+                own: BTreeMap::new(),
+                dependencies: BTreeMap::new(),
+            });
+            return instance;
+        };
+
+        let mut chain: Vec<&BTreeMap<String, PackageId>> = providers.to_vec();
+        chain.push(&package.dependencies);
+
+        let environment = self
+            .needed
+            .get(id)
+            .into_iter()
+            .flatten()
+            .filter_map(|name| provider_of(name, &chain).map(|found| (name.clone(), found)))
+            .collect();
+        let instance = Instance {
+            package: id.clone(),
+            environment,
+        };
+
+        if self.instances.contains_key(&instance) {
+            return instance;
+        }
+        // Recorded before descending, so a dependency cycle finds it present
+        // and stops. Overwritten with the real answer below.
+        self.instances.insert(
+            instance.clone(),
+            Copy_ {
+                own: BTreeMap::new(),
+                dependencies: BTreeMap::new(),
+            },
+        );
+
+        let own = self.own_peers(package, &chain);
+        let mut dependencies = BTreeMap::new();
+        for (name, dependency) in &package.dependencies {
+            dependencies.insert(name.clone(), self.discover(dependency, &chain));
+        }
+
+        self.instances
+            .insert(instance.clone(), Copy_ { own, dependencies });
+
+        instance
+    }
+
+    /// Give one instance its name, and every instance beneath it.
+    ///
+    /// The name is the package's own resolved peers plus each dependency that
+    /// itself carries a context. That second half is what duplicates a package
+    /// declaring no peers at all: without it two copies pointing at different
+    /// subtrees would key the same, and `ResolvedGraph::packages` would keep
+    /// one and drop the other's subtree with nothing reported.
+    ///
+    /// Returns `None` when the instance is already being named further up —
+    /// the edge that closes a cycle. That edge is left out of the *name* and
+    /// kept in `dependencies`, which is the only honest split available: a name
+    /// is finite and owns its parts, so a cycle cannot be spelled out inside
+    /// one, while the edge itself is real and must still point somewhere.
+    fn identify(&mut self, instance: &Instance) -> Option<PackageId> {
+        if let Some(id) = self.identities.get(instance) {
+            return Some(id.clone());
+        }
+        if self.identifying.contains(instance) {
+            return None;
+        }
+        self.identifying.insert(instance.clone());
+
+        let copy = self.instances[instance].clone();
+        let mut context = copy.own;
+        for (name, dependency) in &copy.dependencies {
+            if let Some(id) = self.identify(dependency)
+                && !id.context.is_empty()
+            {
+                context.insert(name.clone(), id);
+            }
+        }
+
+        let id = PackageId {
+            name: instance.package.name.clone(),
+            version: instance.package.version.clone(),
+            context,
+        };
+
+        self.identifying.remove(instance);
+        self.identities.insert(instance.clone(), id.clone());
+        Some(id)
+    }
+
+    /// Build the re-keyed package map from the named instances.
+    fn emit(&self) -> BTreeMap<PackageId, ResolvedPackage> {
+        let mut packages = BTreeMap::new();
+
+        for (instance, copy) in &self.instances {
+            // An instance with no name was never reached from an importer.
+            let Some(id) = self.identities.get(instance) else {
+                continue;
+            };
+            let Some(source) = self.source.packages.get(&instance.package) else {
+                continue;
+            };
+
+            let dependencies = copy
+                .dependencies
+                .iter()
+                .filter_map(|(name, dependency)| {
+                    Some((name.clone(), self.identities.get(dependency)?.clone()))
+                })
+                .collect();
+
+            packages.insert(
+                id.clone(),
+                ResolvedPackage {
+                    id: id.clone(),
+                    resolved: source.resolved.clone(),
+                    integrity: source.integrity.clone(),
+                    dependencies,
+                    declared_peers: source.declared_peers.clone(),
+                    peers: copy.own.clone(),
+                },
+            );
+        }
+
+        packages
+    }
+
+    /// Which provider answers each of this package's declared peers.
+    ///
+    /// The chain already has the package's own dependencies as its innermost
+    /// frame, so "own dependencies first, then nearest ancestor, then the
+    /// importer" is just walking it backwards. Own-first matters: a package
+    /// declaring the same name in both `dependencies` and `peerDependencies` is
+    /// saying "I will take yours, but I ship a fallback", and its own copy is
+    /// the one it gets.
+    fn own_peers(
+        &mut self,
+        package: &ResolvedPackage,
+        chain: &[&BTreeMap<String, PackageId>],
+    ) -> BTreeMap<String, PackageId> {
+        let mut own = BTreeMap::new();
+
+        for (name, declared) in &package.declared_peers {
+            let Some(provider) = provider_of(name, chain) else {
+                if !declared.optional {
+                    self.report(package, name, declared, None);
+                }
+                continue;
+            };
+
+            if satisfies(&provider.version, &declared.range) {
+                own.insert(name.clone(), provider);
+                continue;
+            }
+
+            // Out of range is a complaint even for an optional peer: `optional`
+            // says the peer may be *absent*, not that any version of it will
+            // do. The peer is also left out of `own`, so the package links
+            // nothing rather than linking a version it rejected.
+            let found = provider.version.clone();
+            self.report(package, name, declared, Some(found));
+        }
+
+        own
+    }
+
+    fn report(
+        &mut self,
+        package: &ResolvedPackage,
+        peer: &str,
+        declared: &DeclaredPeer,
+        found: Option<String>,
+    ) {
+        self.unsatisfied
+            .entry((package.id.clone(), peer.to_string()))
+            .or_insert_with(|| UnsatisfiedPeer {
+                dependent: package.id.clone(),
+                peer: peer.to_string(),
+                range: declared.range.clone(),
+                found,
+            });
+    }
+}
+
+/// Find who provides `name`, nearest frame first.
+///
+/// `chain` runs outermost-first — importer, then each package down the path —
+/// so walking it in reverse walks back up the tree from nearest to furthest.
+fn provider_of(name: &str, chain: &[&BTreeMap<String, PackageId>]) -> Option<PackageId> {
+    chain
+        .iter()
+        .rev()
+        .find_map(|frame| frame.get(name))
+        .cloned()
+}
+
+/// Every peer name each node's subtree can ask about, itself included.
+///
+/// This is what an instance is keyed on, and the reason it has to exist: a
+/// package declaring no peers of its own is still duplicated by one deeper
+/// down, so "what did *this* node resolve" cannot tell two copies apart. What
+/// separates them is what the subtree beneath them resolved, and this names the
+/// only part of the environment that can affect it.
+///
+/// A least fixed point rather than a recursive walk, because the dependency
+/// graph has cycles. The sets only grow over a finite alphabet, so it settles.
+fn peer_names_needed(graph: &ResolvedGraph) -> BTreeMap<PackageId, BTreeSet<String>> {
+    let mut needed: BTreeMap<PackageId, BTreeSet<String>> = graph
+        .packages
+        .iter()
+        .map(|(id, package)| (id.clone(), package.declared_peers.keys().cloned().collect()))
+        .collect();
+
+    loop {
+        let mut changed = false;
+
+        for (id, package) in &graph.packages {
+            let mut grown = needed[id].clone();
+            for dependency in package.dependencies.values() {
+                if let Some(below) = needed.get(dependency) {
+                    grown.extend(below.iter().cloned());
+                }
+            }
+
+            if grown != needed[id] {
+                needed.insert(id.clone(), grown);
+                changed = true;
+            }
+        }
+
+        if !changed {
+            return needed;
+        }
+    }
+}
+
+/// Does this version satisfy this range?
+///
+/// An unparseable range fails closed, and is reported as unsatisfied. A peer
+/// range is whatever the publisher typed, and treating nonsense as satisfied
+/// would silently record a peer resolution nobody asked for.
+fn satisfies(version: &str, range: &str) -> bool {
+    match (Version::parse(version), Range::parse(range)) {
+        (Ok(version), Ok(range)) => range.matches(&version),
+        _ => false,
+    }
+}
+
 /// One question for the registry: which package, and how current the answer
 /// has to be.
 ///
@@ -1108,6 +1584,9 @@ impl<'a> Walk<'a> {
                 resolved,
                 integrity,
                 dependencies: BTreeMap::new(),
+                declared_peers: declared_peers(metadata),
+                // Filled by the peer pass. The walk is peer-blind by design.
+                peers: BTreeMap::new(),
             },
         );
 
@@ -1267,7 +1746,7 @@ mod tests {
         PackageId {
             name: name.to_string(),
             version: version.to_string(),
-            peers: peers
+            context: peers
                 .iter()
                 .map(|peer| (peer.name.clone(), peer.clone()))
                 .collect(),
